@@ -50,6 +50,8 @@ class PostGradPassManager(CustomGraphPass):
         self.fix_functionalization(graph)
 
     def configure(self, config: VllmConfig):
+        # Save a copy of the entire configuration to allow serialization of the entire state.
+        self.vllm_config_copy = config
         self.pass_config = config.compilation_config.pass_config
         if self.pass_config.enable_noop:
             self.passes += [NoOpEliminationPass(config)]
@@ -84,3 +86,16 @@ class PostGradPassManager(CustomGraphPass):
             state["passes"].append(pass_.uuid())
         state["passes"].append(self.fix_functionalization.uuid())
         return InductorPass.hash_dict(state)
+
+    # Pickle customization
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # Remove non-picklable fields
+        del state["passes"]
+        del state["fix_functionalization"]
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self.passes = []
+        self.configure(self.vllm_config_copy)
