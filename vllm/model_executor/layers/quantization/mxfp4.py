@@ -33,7 +33,7 @@ if (envs.VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8
     from flashinfer import (mxfp8_quantize, shuffle_matrix_a,
                             shuffle_matrix_sf_a, trtllm_fp4_block_scale_moe)
 
-if current_platform.is_rocm():
+if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER_FUSED_MOE_A16W4:
     import aiter
     from aiter.fused_moe import fused_topk, moe_sorting
     from aiter.ops.shuffle import shuffle_mxfp4_weight, shuffle_mxfp4_scale
@@ -374,7 +374,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             else:
                 num_warps = 8
 
-            if current_platform.is_rocm():
+            if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER_FUSED_MOE_A16W4:
                 w13_aiter_weight = layer.w13_weight.contiguous()
                 w13_aiter_scale = layer.w13_weight_scale.contiguous()
                 w2_aiter_weight = layer.w2_weight.contiguous()
@@ -542,7 +542,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )[0]
             return trtllm_gen_output
         else:
-            if current_platform.is_rocm():
+            if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER_FUSED_MOE_A16W4:
                 token_num = x.shape[0]
                 BLOCKM = 16 if token_num < 2048 else 32
                 topk_weights, topk_ids = fused_topk(x, router_logits, top_k, True)
@@ -566,8 +566,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     sorted_expert_ids,
                     num_valid_ids,
                     top_k,
-                    0, # n_pad_zeros
-                    0, # k_pad_zeros
+                    192, # n_pad_zeros
+                    128, # k_pad_zeros
                     None, # sorted_weights
                     None,
                     self.w13_scale_aiter_tensor,
@@ -582,8 +582,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     sorted_expert_ids,
                     num_valid_ids,
                     top_k,
-                    0, # n_pad_zeros
-                    0, # k_pad_zeros
+                    192, # n_pad_zeros
+                    128, # k_pad_zeros
                     sorted_weights, # sorted_weights
                     None,
                     self.w2_scale_aiter_tensor,
