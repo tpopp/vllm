@@ -33,13 +33,11 @@ if (envs.VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8
     from flashinfer import (mxfp8_quantize, shuffle_matrix_a,
                             shuffle_matrix_sf_a, trtllm_fp4_block_scale_moe)
 
-if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER_FUSED_MOE_A16W4:
+if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_FUSED_MOE_A16W4:
     import aiter
     from aiter.fused_moe import fused_topk, moe_sorting
     from aiter.ops.shuffle import shuffle_mxfp4_weight, shuffle_mxfp4_scale
     
-    aiter_quant = aiter.get_torch_quant(aiter.QuantType.per_1x32)
-
 class Mxfp4Config(QuantizationConfig):
 
     def __init__(self, ignored_layers: Optional[list[str]] = None):
@@ -360,7 +358,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                                       requires_grad=False)
         else:
             from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
-            
             w13_bias = layer.w13_bias.to(torch.float32)
             w2_bias = layer.w2_bias.to(torch.float32)
 
@@ -542,7 +539,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )[0]
             return trtllm_gen_output
         else:
-            if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER_FUSED_MOE_A16W4:
+            if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_FUSED_MOE_A16W4:
                 token_num = x.shape[0]
                 BLOCKM = 16 if token_num < 2048 else 32
                 topk_weights, topk_ids = fused_topk(x, router_logits, top_k, True)
