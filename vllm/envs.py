@@ -182,6 +182,8 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_TRITON_FUSED_ADD_RMSNORM_PAD: bool = True
     VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM: bool = True
     ROCM_TRITON_MOE_PRESHUFFLE_SCALES: bool = True
+    VLLM_ROCM_USE_AITER_FUSED_MOE_A16W4: bool = False
+
 def get_default_cache_root():
     return os.getenv(
         "XDG_CACHE_HOME",
@@ -1028,6 +1030,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # BF16 (activation) x MXFP4 (weight) MoE backend.
     "VLLM_USE_FLASHINFER_MOE_MXFP4_BF16":
     lambda: bool(int(os.getenv("VLLM_USE_FLASHINFER_MOE_MXFP4_BF16", "0"))),
+    
+    "VLLM_ROCM_USE_AITER_FUSED_MOE_A16W4":
+    lambda: bool(int(os.getenv("VLLM_ROCM_USE_AITER_FUSED_MOE_A16W4", "0"))),
 
     # Control the cache sized used by the xgrammar compiler. The default
     # of 512 MB should be enough for roughly 1000 JSON schemas.
