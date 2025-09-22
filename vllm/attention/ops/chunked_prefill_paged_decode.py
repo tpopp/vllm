@@ -25,48 +25,47 @@ def cdiv_fn(x, y):
 
 @triton.jit
 def kernel_paged_attention_2d(
-    output_ptr,  # [num_tokens, num_query_heads, head_size]
-    query_ptr,  # [num_tokens, num_query_heads, head_size]
-    key_cache_ptr,  # [num_blks, num_kv_heads, head_size // x, blk_size, x]
-    value_cache_ptr,  # [num_blks, num_kv_heads, head_size, blk_size]
-    sink_ptr,  # [num_query_heads]
-    block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
-    seq_lens_ptr,  # [num_seqs]
-    alibi_slopes_ptr,  # [num_query_heads]
-    scale,  # float32
-    k_scale,  # float32
-    v_scale,  # float32
-    out_scale,
-    num_query_heads: tl.constexpr,  # int
-    num_queries_per_kv: tl.constexpr,  # int
-    num_queries_per_kv_padded: tl.constexpr,  # int
-    block_table_stride: tl.int64,  # int
-    query_stride_0: tl.int64,  # int
-    query_stride_1: tl.int64,  # int, should be equal to head_size
-    output_stride_0: tl.int64,  # int
-    output_stride_1: tl.int64,  # int, should be equal to head_size
-    BLOCK_SIZE: tl.constexpr,  # int
-    HEAD_SIZE: tl.constexpr,  # int
-    HEAD_SIZE_PADDED: tl.constexpr,  # int, must be power of 2
-    USE_ALIBI_SLOPES: tl.constexpr,  # bool
-    SLIDING_WINDOW: tl.constexpr,  # int
-    x: tl.constexpr,  # int
-    stride_k_cache_0: tl.int64,  # int
-    stride_k_cache_1: tl.int64,  # int
-    stride_k_cache_2: tl.int64,  # int
-    stride_k_cache_3: tl.int64,  # int
-    stride_k_cache_4: tl.int64,  # int
-    stride_v_cache_0: tl.int64,  # int
-    stride_v_cache_1: tl.int64,  # int
-    stride_v_cache_2: tl.int64,  # int
-    stride_v_cache_3: tl.int64,  # int
-    filter_by_query_len: tl.constexpr,  # bool
-    query_start_len_ptr,  # [num_seqs+1]
-    USE_FP8: tl.constexpr,
-    USE_SINKS: tl.constexpr,  # bool
-    FP8_MIN: tl.constexpr = float8_info.min,
-    FP8_MAX: tl.constexpr = float8_info.max,
-):
+        output_ptr,  # [num_tokens, num_query_heads, head_size]
+        query_ptr,  # [num_tokens, num_query_heads, head_size]
+        key_cache_ptr,  # [num_blks, num_kv_heads, head_size // x, blk_size, x]
+        value_cache_ptr,  # [num_blks, num_kv_heads, head_size, blk_size]
+        sink_ptr,  # [num_query_heads]
+        block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
+        seq_lens_ptr,  # [num_seqs]
+        alibi_slopes_ptr,  # [num_query_heads]
+        scale,  # float32
+        k_scale,  # float32
+        v_scale,  # float32
+        out_scale_inv,
+        num_query_heads: tl.constexpr,  # int
+        num_queries_per_kv: tl.constexpr,  # int
+        num_queries_per_kv_padded: tl.constexpr,  # int
+        block_table_stride: tl.int64,  # int
+        query_stride_0: tl.int64,  # int
+        query_stride_1: tl.int64,  # int, should be equal to head_size
+        output_stride_0: tl.int64,  # int
+        output_stride_1: tl.int64,  # int, should be equal to head_size
+        BLOCK_SIZE: tl.constexpr,  # int
+        HEAD_SIZE: tl.constexpr,  # int
+        HEAD_SIZE_PADDED: tl.constexpr,  # int, must be power of 2
+        USE_ALIBI_SLOPES: tl.constexpr,  # bool
+        SLIDING_WINDOW: tl.constexpr,  # int
+        x: tl.constexpr,  # int
+        stride_k_cache_0: tl.int64,  # int
+        stride_k_cache_1: tl.int64,  # int
+        stride_k_cache_2: tl.int64,  # int
+        stride_k_cache_3: tl.int64,  # int
+        stride_k_cache_4: tl.int64,  # int
+        stride_v_cache_0: tl.int64,  # int
+        stride_v_cache_1: tl.int64,  # int
+        stride_v_cache_2: tl.int64,  # int
+        stride_v_cache_3: tl.int64,  # int
+        filter_by_query_len: tl.constexpr,  # bool
+        query_start_len_ptr,  # [num_seqs+1]
+        USE_SINKS: tl.constexpr,  # bool
+        USE_FP8: tl.constexpr,
+        FP8_MIN: tl.constexpr = float8_info.min,
+        FP8_MAX: tl.constexpr = float8_info.max):
     seq_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
 
@@ -211,7 +210,7 @@ def kernel_paged_attention_2d(
     # epilogue
     acc = acc / L[:, None]
     if USE_FP8:
-        acc = acc / tl.load(out_scale)
+        acc = acc * tl.load(out_scale_inv)
         acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
 
     output_offset = (cur_batch_in_all_start_index * output_stride_0 +
@@ -374,7 +373,8 @@ def chunked_prefill_paged_decode(
             scale=sm_scale,
             k_scale=k_scale,
             v_scale=v_scale,
-            out_scale=output_scale,
+            out_scale_inv=1.0 /
+            output_scale if output_scale is not None else 1.0,
             num_query_heads=num_query_heads,
             num_queries_per_kv=num_queries_per_kv,
             num_queries_per_kv_padded=num_queries_per_kv_padded,
@@ -400,6 +400,6 @@ def chunked_prefill_paged_decode(
             stride_v_cache_3=value_cache.stride(3),
             filter_by_query_len=True,
             query_start_len_ptr=query_start_loc,
-            USE_FP8=output_scale is not None,
             USE_SINKS=sinks is not None,
+            USE_FP8=output_scale is not None,
         )

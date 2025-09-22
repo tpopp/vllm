@@ -221,10 +221,11 @@ void fused_add_rms_norm(torch::Tensor& out,           // [..., hidden_size]
   constexpr int req_alignment_bytes =
       vector_width * 2;  // vector_width * sizeof(bfloat16 or float16) (float32
                          // falls back to non-vectorized version anyway)
-  bool ptrs_are_aligned =
-      out_ptr % 16 == 0 && inp_ptr % req_alignment_bytes == 0 &&
-      res_out_ptr % 16 == 0 && res_ptr % req_alignment_bytes == 0 &&
-      wt_ptr % req_alignment_bytes == 0;
+  bool ptrs_are_aligned = inp_ptr % req_alignment_bytes == 0 &&
+                          out_ptr % req_alignment_bytes == 0 &&
+                          res_ptr % req_alignment_bytes == 0 &&
+                          res_out_ptr % req_alignment_bytes == 0 &&
+                          wt_ptr % req_alignment_bytes == 0;
   bool offsets_are_multiple_of_vector_width =
       hidden_size % vector_width == 0 && input_stride % vector_width == 0;
   if (ptrs_are_aligned && offsets_are_multiple_of_vector_width) {

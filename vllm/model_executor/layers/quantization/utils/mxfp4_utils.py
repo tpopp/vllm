@@ -7,6 +7,7 @@ import torch
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils import direct_register_custom_op, is_torch_equal_or_newer
+import vllm.envs as envs
 
 logger = init_logger(__name__)
 
@@ -45,10 +46,7 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
             if torch.cuda.get_device_capability()[0] == 10:
                 scale_layout = BlackwellMXScaleLayout
         else:
-            import os
-            use_scale_preshuffling = os.environ.get(
-                "TRITON_HIP_PRESHUFFLE_SCALES", "0") == "1"
-            if use_scale_preshuffling:
+            if envs.ROCM_TRITON_MOE_PRESHUFFLE_SCALES:
                 scale_layout = GFX950MXScaleLayout
     else:
         """ weight swizzle for mxfp4 moe, used for OAI mxfp4 kernel
@@ -92,16 +90,15 @@ def _can_support_mxfp4(use_grouped_topk: bool = False,
                        e_score_correction_bias: Optional[torch.Tensor] = None,
                        apply_router_weight_on_input: bool = False,
                        scoring_func: str = "softmax",
-                       activation: str = "swiglu_oai",
+                       activation: str = "swigluoai",
                        expert_load_view: Optional[torch.Tensor] = None,
                        logical_to_physical_map: Optional[torch.Tensor] = None,
                        logical_replica_count: Optional[torch.Tensor] = None):
     return not (use_grouped_topk or topk_group or num_expert_group
-                or expert_map or custom_routing_function
-                or e_score_correction_bias or apply_router_weight_on_input
-                or scoring_func != "softmax" or activation != "swiglu_oai"
-                or expert_load_view or logical_to_physical_map
-                or logical_replica_count)
+                or custom_routing_function or e_score_correction_bias
+                or apply_router_weight_on_input or scoring_func != "softmax"
+                or activation != "swigluoai" or expert_load_view
+                or logical_to_physical_map or logical_replica_count)
 
 
 def _dequant_mxfp4(x: torch.Tensor, scale: torch.Tensor,

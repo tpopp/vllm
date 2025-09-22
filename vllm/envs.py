@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import hashlib
+import json
 import os
 import sys
 import tempfile
@@ -39,10 +40,10 @@ if TYPE_CHECKING:
     VLLM_LOGGING_PREFIX: str = ""
     VLLM_LOGGING_CONFIG_PATH: Optional[str] = None
     VLLM_LOGITS_PROCESSOR_THREADS: Optional[int] = None
+    VLLM_LOG_STATS_INTERVAL: float = 10.
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_ATTENTION_BACKEND: Optional[str] = None
     VLLM_USE_FLASHINFER_SAMPLER: Optional[bool] = None
-    VLLM_FLASHINFER_FORCE_TENSOR_CORES: bool = False
     VLLM_PP_LAYER_PARTITION: Optional[str] = None
     VLLM_CPU_KVCACHE_SPACE: Optional[int] = 0
     VLLM_CPU_OMP_THREADS_BIND: str = ""
@@ -96,11 +97,11 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_PAGED_ATTN: bool = False
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_CK_TILE_LINEAR: bool = True
+    VLLM_ROCM_USE_AITER_TRITON_LINEAR: bool = False
     VLLM_ROCM_USE_AITER_MOE: bool = True
-    VLLM_ROCM_USE_AITER_RMSNORM: bool = True
+    VLLM_ROCM_USE_AITER_RMSNORM: bool = False
     VLLM_ROCM_USE_AITER_MLA: bool = True
     VLLM_ROCM_USE_AITER_MHA: bool = True
-    VLLM_USE_AITER_TRITON_SILU_MUL: bool = False
     VLLM_TRITON_FP4_GEMM_USE_ASM: bool = False
     VLLM_USE_AITER_TRITON_ROPE: bool = False
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
@@ -135,7 +136,9 @@ if TYPE_CHECKING:
     VLLM_TPU_USING_PATHWAYS: bool = False
     VLLM_USE_DEEP_GEMM: bool = False
     VLLM_USE_DEEP_GEMM_E8M0: bool = True
+    VLLM_USE_DEEP_GEMM_E8M0_HOPPER: bool = False
     VLLM_SKIP_DEEP_GEMM_WARMUP: bool = False
+    VLLM_USE_FUSED_MOE_GROUPED_TOPK: bool = True
     VLLM_USE_FLASHINFER_MOE_FP8: bool = False
     VLLM_USE_FLASHINFER_MOE_FP4: bool = False
     VLLM_FLASHINFER_MOE_BACKEND: str = "throughput"
@@ -163,12 +166,23 @@ if TYPE_CHECKING:
     VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE: bool = False
     VLLM_ENABLE_RESPONSES_API_STORE: bool = False
     VLLM_USE_TRTLLM_ATTENTION: Optional[str] = None
+    VLLM_HAS_FLASHINFER_CUBIN: bool = False
     VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8: bool = False
     VLLM_USE_FLASHINFER_MOE_MXFP4_BF16: bool = False
+    VLLM_ALLREDUCE_USE_SYMM_MEM: bool = False
     VLLM_TUNED_CONFIG_FOLDER: Optional[str] = None
-    VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE: bool = False
+    VLLM_DISABLE_PAD_FOR_CUDAGRAPH: bool = False
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT: bool = True
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_MUL_ADD: bool = True
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE: bool = True
+    VLLM_ROCM_USE_AITER_TRITON_FP8_BMM: bool = True
+    VLLM_ROCM_USE_AITER_TRITON_FP8_BMM_MAX_BATCH_SIZE: int = 256
+    VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP4_QUANT: bool = False
+    VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT: bool = True
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_ADD_RMSNORM_PAD: bool = True
+    VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM: bool = True
+    ROCM_TRITON_MOE_PRESHUFFLE_SCALES: bool = True
     VLLM_ROCM_USE_AITER_FUSED_MOE_A16W4: bool = False
-
 
 def get_default_cache_root():
     return os.getenv(
@@ -352,7 +366,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the unified triton kernel.
     "VLLM_V1_USE_PREFILL_DECODE_ATTENTION":
     lambda:
-    (os.getenv("VLLM_V1_USE_PREFILL_DECODE_ATTENTION", "False").lower() in
+    (os.getenv("VLLM_V1_USE_PREFILL_DECODE_ATTENTION", "True").lower() in
      ("true", "1")),
 
     # Use AITER triton unified attention for V1 attention
@@ -448,6 +462,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: int(os.getenv("VLLM_LOGITS_PROCESSOR_THREADS", "0"))
     if "VLLM_LOGITS_PROCESSOR_THREADS" in os.environ else None,
 
+    # If set, vllm will log stats at this interval in seconds
+    # If not set, vllm will log stats every 10 seconds.
+    "VLLM_LOG_STATS_INTERVAL":
+    lambda: val if (val := float(os.getenv("VLLM_LOG_STATS_INTERVAL", "10.")))
+        > 0. else 10.,
+
     # Trace function calls
     # If set to 1, vllm will trace function calls
     # Useful for debugging
@@ -469,11 +489,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_FLASHINFER_SAMPLER":
     lambda: bool(int(os.environ["VLLM_USE_FLASHINFER_SAMPLER"]))
     if "VLLM_USE_FLASHINFER_SAMPLER" in os.environ else None,
-
-    # If set, vllm will force flashinfer to use tensor cores;
-    # otherwise will use heuristic based on model architecture.
-    "VLLM_FLASHINFER_FORCE_TENSOR_CORES":
-    lambda: bool(int(os.getenv("VLLM_FLASHINFER_FORCE_TENSOR_CORES", "0"))),
 
     # Pipeline stage partition strategy
     "VLLM_PP_LAYER_PARTITION":
@@ -672,11 +687,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_LORA_RESOLVER_CACHE_DIR":
     lambda: os.getenv("VLLM_LORA_RESOLVER_CACHE_DIR", None),
 
-    # Enables torch profiler if set. Path to the directory where torch profiler
-    # traces are saved. Note that it must be an absolute path.
+    # Enables torch profiler if set.
+    # Both AsyncLLM's CPU traces as well as workers'
+    # traces (CPU & GPU) will be saved under this directory.
+    # Note that it must be an absolute path.
     "VLLM_TORCH_PROFILER_DIR":
     lambda: (None if os.getenv("VLLM_TORCH_PROFILER_DIR", None) is None else os
-             .path.expanduser(os.getenv("VLLM_TORCH_PROFILER_DIR", "."))),
+             .path.abspath(os.path.expanduser(os.getenv(
+        "VLLM_TORCH_PROFILER_DIR", ".")))),
 
     # Enable torch profiler to record shapes if set
     # VLLM_TORCH_PROFILER_RECORD_SHAPES=1. If not set, torch profiler will
@@ -752,6 +770,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_USE_AITER_LINEAR":
     lambda: (os.getenv("VLLM_ROCM_USE_AITER_LINEAR", "True").lower() in
              ("true", "1")),
+    "VLLM_ROCM_USE_AITER_TRITON_LINEAR":
+    lambda: (os.getenv("VLLM_ROCM_USE_AITER_TRITON_LINEAR", "True").lower() in
+             ("true", "1")),
 
     "VLLM_ROCM_USE_AITER_CK_TILE_LINEAR":
     lambda: (os.getenv("VLLM_ROCM_USE_AITER_CK_TILE_LINEAR", "True").lower() in
@@ -765,7 +786,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
 
     # use aiter rms norm op if aiter ops are enabled.
     "VLLM_ROCM_USE_AITER_RMSNORM":
-    lambda: (os.getenv("VLLM_ROCM_USE_AITER_RMSNORM", "True").lower() in
+    lambda: (os.getenv("VLLM_ROCM_USE_AITER_RMSNORM", "False").lower() in
              ("true", "1")),
 
     # Whether to use aiter mla ops.
@@ -778,12 +799,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # By default is enabled.
     "VLLM_ROCM_USE_AITER_MHA":
     lambda: (os.getenv("VLLM_ROCM_USE_AITER_MHA", "True").lower() in
-             ("true", "1")),
-
-    # Whether to use aiter silu mul.
-    # By default is disabled.
-    "VLLM_USE_AITER_TRITON_SILU_MUL":
-    lambda: (os.getenv("VLLM_USE_AITER_TRITON_SILU_MUL", "False").lower() in
              ("true", "1")),
 
     # Whether to use aiter fp4 gemm asm.
@@ -980,9 +995,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: bool(int(os.getenv("VLLM_USE_DEEP_GEMM", "0"))),
 
     # Whether to use E8M0 scaling when DeepGEMM is used on Blackwell GPUs.
-    # E8M0 is faster on B200 but may reduce accuracy.
     "VLLM_USE_DEEP_GEMM_E8M0":
     lambda: bool(int(os.getenv("VLLM_USE_DEEP_GEMM_E8M0", "1"))),
+    # TODO(wentao): unify the two E8M0 flags after verifying the correctness.
+    # Whether to use E8M0 scaling when DeepGEMM is used on Hopper GPUs.
+    "VLLM_USE_DEEP_GEMM_E8M0_HOPPER":
+    lambda: bool(int(os.getenv("VLLM_USE_DEEP_GEMM_E8M0_HOPPER", "0"))),
     # DeepGemm JITs the kernels on-demand. The warmup attempts to make DeepGemm
     # JIT all the required kernels before model execution so there is no
     # JIT'ing in the hot-path. However, this warmup increases the engine
@@ -990,6 +1008,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Set `VLLM_SKIP_DEEP_GEMM_WARMUP` to disable the warmup.
     "VLLM_SKIP_DEEP_GEMM_WARMUP":
     lambda: bool(int(os.getenv("VLLM_SKIP_DEEP_GEMM_WARMUP", "0"))),
+
+    # Whether to use fused grouped_topk used for MoE expert selection.
+    "VLLM_USE_FUSED_MOE_GROUPED_TOPK":
+    lambda: bool(int(os.getenv("VLLM_USE_FUSED_MOE_GROUPED_TOPK", "1"))),
 
     # Allow use of FlashInfer MoE kernels for fused moe ops.
     "VLLM_USE_FLASHINFER_MOE_FP8":
@@ -1072,6 +1094,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MAX_TOKENS_PER_EXPERT_FP4_MOE":
     lambda: int(os.getenv("VLLM_MAX_TOKENS_PER_EXPERT_FP4_MOE", "163840")),
 
+    # Specifies the thresholds of the communicated tensor sizes under which
+    # vllm should use flashinfer fused allreduce. The variable should be a
+    # JSON with the following format:
+    #     { <world size>: <max size in mb> }
+    # Unspecified world sizes will fallback to
+    #     { 2: 64, 4: 1, <everything else>: 0.5 }
+    "VLLM_FLASHINFER_ALLREDUCE_FUSION_THRESHOLDS_MB":
+    lambda: json.loads(os.getenv(
+        "VLLM_FLASHINFER_ALLREDUCE_FUSION_THRESHOLDS_MB", "{}")),
+
     # MoE routing strategy selector.
     # See `RoutingSimulator.get_available_strategies()` # for available
     # strategies.
@@ -1138,11 +1170,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_TRTLLM_ATTENTION":
     lambda: os.getenv("VLLM_USE_TRTLLM_ATTENTION", None),
 
+    # If set, it means we pre-downloaded cubin files and flashinfer will
+    # read the cubin files directly.
+    "VLLM_HAS_FLASHINFER_CUBIN":
+    lambda: os.getenv("VLLM_HAS_FLASHINFER_CUBIN", False),
+
+    # If set to 1, force the use of TRTLLM FP4 GEMM backend in flashinfer.
+    # Otherwise, uses the first available of: flashinfer cutlass GEMM,
+    # vllm cutlass GEMM, marlin GEMM.
+    "VLLM_USE_TRTLLM_FP4_GEMM":
+    lambda: bool(int(os.getenv("VLLM_USE_TRTLLM_FP4_GEMM", "0"))),
+
     # Controls garbage collection during CUDA graph capture.
     # If set to 0 (default), enables GC freezing to speed up capture time.
     # If set to 1, allows GC to run during capture.
     "VLLM_ENABLE_CUDAGRAPH_GC":
     lambda: bool(int(os.getenv("VLLM_ENABLE_CUDAGRAPH_GC", "0"))),
+
+    # Disable padding to CUDA graph capture batch sizes.
+    # TODO(wentao): https://github.com/vllm-project/vllm/issues/23378
+    # After the issue is fixed, we can remove this flag.
+    "VLLM_DISABLE_PAD_FOR_CUDAGRAPH":
+    lambda: bool(int(os.getenv("VLLM_DISABLE_PAD_FOR_CUDAGRAPH", "0"))),
 
     # Used to force set up loopback IP
     "VLLM_LOOPBACK_IP":
@@ -1177,14 +1226,51 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ENABLE_RESPONSES_API_STORE":
     lambda: bool(int(os.getenv("VLLM_ENABLE_RESPONSES_API_STORE", "0"))),
 
+    # Whether to use pytorch symmetric memory for allreduce
+    "VLLM_ALLREDUCE_USE_SYMM_MEM":
+    lambda: bool(int(os.getenv("VLLM_ALLREDUCE_USE_SYMM_MEM", "0"))),
+
     # Allows vllm to find tuned config under customized folder
     "VLLM_TUNED_CONFIG_FOLDER":
     lambda: os.getenv("VLLM_TUNED_CONFIG_FOLDER", None),
 
+    # Use AITER Triton fused RMSNORM + Quantization
+    "VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT":
+    lambda: bool(int(os.getenv("VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT", "1"))),
+
+    # Use AITER Triton fused elementwise multiply + elementwise addtion
+    "VLLM_ROCM_USE_AITER_TRITON_FUSED_MUL_ADD":
+    lambda: bool(int(os.getenv("VLLM_ROCM_USE_AITER_TRITON_FUSED_MUL_ADD", "1"))),
+
     # Use AITER Triton fused rope + zeros + reshape_and_cache
     "VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE":
-    lambda: bool(int(os.getenv("VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE", "0"))),
+    lambda: bool(int(os.getenv("VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE", "1"))),
+    
+    # Use AITER Triton fused FP8 per-token group quant + FP8 batched GEMM
+    "VLLM_ROCM_USE_AITER_TRITON_FP8_BMM":
+    lambda: bool(int(os.getenv("VLLM_ROCM_USE_AITER_TRITON_FP8_BMM", "1"))),
+    "VLLM_ROCM_USE_AITER_TRITON_FP8_BMM_MAX_BATCH_SIZE":
+    lambda: int(os.getenv("VLLM_ROCM_USE_AITER_TRITON_FP8_BMM_MAX_BATCH_SIZE", 256)),
 
+    # Use AITER Triton fused SiLU Mul + FP4 per-token group quant
+    "VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP4_QUANT":
+    lambda: bool(int(os.getenv("VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP4_QUANT", "0"))),
+
+    # Use AITER Triton fused SiLU Mul + FP8 per-token group quant
+    "VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT":
+    lambda: bool(int(os.getenv("VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT", "1"))),
+
+    # Use AITER Triton fused add + rmsnorm + padding
+    "VLLM_ROCM_USE_AITER_TRITON_FUSED_ADD_RMSNORM_PAD":
+    lambda: bool(int(os.getenv("VLLM_ROCM_USE_AITER_TRITON_FUSED_ADD_RMSNORM_PAD", "1"))),
+
+    # Use AITER Triton BF16 GEMM kernels
+    "VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM":
+    lambda: bool(int(os.getenv("VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM", "1"))),
+
+    # Apply preshuffling for mxfp4 scales for ROCm backend
+    "ROCM_TRITON_MOE_PRESHUFFLE_SCALES":
+    lambda: bool(int(os.getenv("ROCM_TRITON_MOE_PRESHUFFLE_SCALES", "1"))),
 }
 
 # --8<-- [end:env-vars-definition]
@@ -1227,14 +1313,6 @@ def compute_hash() -> str:
     affect the choice of different kernels or attention backends should
     also be included in the factors list.
     """
-    factors: list[Any] = []
-
-    # summarize environment variables
-    def factorize(name: str):
-        if __getattr__(name):
-            factors.append(__getattr__(name))
-        else:
-            factors.append("None")
 
     # The values of envs may affects the computation graph.
     # TODO(DefTruth): hash all environment variables?
@@ -1249,10 +1327,47 @@ def compute_hash() -> str:
         "VLLM_DP_SIZE",
         "VLLM_USE_STANDALONE_COMPILE",
         "VLLM_FUSED_MOE_CHUNK_SIZE",
+        "VLLM_FLASHINFER_MOE_BACKEND",
+        "VLLM_V1_USE_PREFILL_DECODE_ATTENTION",
+        "VLLM_USE_AITER_UNIFIED_ATTENTION",
+        "VLLM_ATTENTION_BACKEND",
+        "VLLM_USE_FLASHINFER_SAMPLER",
+        "VLLM_DISABLED_KERNELS",
+        "VLLM_USE_DEEP_GEMM",
+        "VLLM_USE_DEEP_GEMM_E8M0",
+        "VLLM_USE_DEEP_GEMM_E8M0_HOPPER",
+        "VLLM_USE_TRTLLM_FP4_GEMM",
+        "VLLM_USE_FUSED_MOE_GROUPED_TOPK",
+        "VLLM_USE_FLASHINFER_MOE_FP8",
+        "VLLM_USE_FLASHINFER_MOE_FP4",
+        "VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8",
+        "VLLM_USE_FLASHINFER_MOE_MXFP4_BF16",
+        "VLLM_USE_CUDNN_PREFILL",
+        "VLLM_USE_TRTLLM_ATTENTION",
+        "VLLM_ROCM_USE_AITER",
+        "VLLM_ROCM_USE_AITER_PAGED_ATTN",
+        "VLLM_ROCM_USE_AITER_LINEAR",
+        "VLLM_ROCM_USE_AITER_MOE",
+        "VLLM_ROCM_USE_AITER_RMSNORM",
+        "VLLM_ROCM_USE_AITER_MLA",
+        "VLLM_ROCM_USE_AITER_MHA",
+        "VLLM_ROCM_USE_SKINNY_GEMM",
+        "VLLM_ROCM_FP8_PADDING",
+        "VLLM_ROCM_MOE_PADDING",
+        "VLLM_ROCM_CUSTOM_PAGED_ATTN",
+        "VLLM_ROCM_QUICK_REDUCE_QUANTIZATION",
+        "VLLM_ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16",
+        "VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB",
     ]
     for key in environment_variables_to_hash:
-        if key in environment_variables:
-            factorize(key)
+        # if this goes out of sync with environment_variables,
+        # it's not a user error, it's a bug
+        assert key in environment_variables, \
+            "Please update environment_variables_to_hash in envs.py"
+
+    factors = [
+        environment_variables[key]() for key in environment_variables_to_hash
+    ]
 
     hash_str = hashlib.md5(str(factors).encode(),
                            usedforsecurity=False).hexdigest()

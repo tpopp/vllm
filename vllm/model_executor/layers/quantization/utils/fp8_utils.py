@@ -19,8 +19,9 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     CUTLASS_BLOCK_FP8_SUPPORTED)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.utils import cdiv, direct_register_custom_op, has_deep_gemm
-from vllm.utils.deep_gemm import is_blackwell_deep_gemm_e8m0_used
+from vllm.utils import cdiv, direct_register_custom_op
+from vllm.utils.deep_gemm import (is_deep_gemm_e8m0_used,
+                                  should_use_deepgemm_for_fp8_linear)
 
 logger = init_logger(__name__)
 
@@ -54,11 +55,11 @@ def rocm_aiter_gemm_w8a8_blockscale_impl(
     block_size: list[int],
     output_dtype: torch.dtype = torch.float16,
 ) -> torch.Tensor:
-    # import aiter as rocm_aiter
-
-    # return rocm_aiter.gemm_a8w8_blockscale(A, B, As, Bs, dtype=output_dtype)
-    from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale
-
+    # MI300's fp8nuz should be enough to detect if we call ck vs triton
+    if current_platform.is_fp8_fnuz() or not envs.VLLM_ROCM_USE_AITER_TRITON_LINEAR:
+        from aiter import gemm_a8w8_blockscale
+    else:
+        from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale
     return gemm_a8w8_blockscale(A, B, As, Bs, dtype=output_dtype)
 
 
@@ -163,19 +164,6 @@ def dispatch_w8a8_blockscale_func(
     return w8a8_block_fp8_matmul
 
 
-def should_use_deepgemm(output_dtype: torch.dtype, weight: torch.Tensor):
-    """
-    Check if DeepGEMM should be used based on the output dtype and weight shape.
-    DeepGEMM is only supported for bfloat16 output dtype and weights with shape
-    divisible by 128.
-    """
-
-    return (current_platform.is_cuda()
-            and current_platform.is_device_capability(90) and has_deep_gemm()
-            and envs.VLLM_USE_DEEP_GEMM and output_dtype == torch.bfloat16
-            and weight.shape[0] % 128 == 0 and weight.shape[1] % 128 == 0)
-
-
 # TODO fix ROCm->Triton custom path:
 #  https://github.com/vllm-project/vllm/issues/14397
 def apply_w8a8_block_fp8_linear(
@@ -188,6 +176,7 @@ def apply_w8a8_block_fp8_linear(
     cutlass_block_fp8_supported: bool = CUTLASS_BLOCK_FP8_SUPPORTED,
     use_aiter_and_is_supported: bool = False,
     use_ck_tile_and_is_supported: bool = False,
+    input_quant_scale: torch.Tensor = None,
 ) -> torch.Tensor:
     assert input_scale is None
     # View input as 2D matrix for fp8 methods
@@ -195,7 +184,7 @@ def apply_w8a8_block_fp8_linear(
     output_shape = [*input.shape[:-1], weight.shape[0]]
     output_dtype = input.dtype
 
-    if should_use_deepgemm(output_dtype, weight):
+    if should_use_deepgemm_for_fp8_linear(output_dtype, weight):
 
         input_2d = input.view(-1, input.shape[-1])
         output_shape = [*input.shape[:-1], weight.shape[0]]
@@ -206,7 +195,9 @@ def apply_w8a8_block_fp8_linear(
             column_major_scales=True,
         )
 
+        # ensure DeepGEMM-backed custom op is registered before use
         import vllm.model_executor.layers.quantization.deepgemm  # noqa: F401
+
         output = torch.ops.vllm.w8a8_block_fp8_matmul_deepgemm(
             q_input,
             weight,
@@ -241,7 +232,11 @@ def apply_w8a8_block_fp8_linear(
                                       block_size, input.dtype)
 
     else:
-        if use_aiter_and_is_supported and current_platform.is_fp8_fnuz():
+        if input_quant_scale is not None:
+            q_input = input
+            x_scale = input_quant_scale
+            output_dtype = torch.bfloat16
+        elif use_aiter_and_is_supported and current_platform.is_fp8_fnuz():
             q_input, x_scale = aiter_per1x128_quant(
                 input_2d.contiguous(), quant_dtype=rocm_aiter.dtypes.fp8)
         else:
@@ -249,11 +244,11 @@ def apply_w8a8_block_fp8_linear(
                 input_2d, block_size[1], column_major_scales=use_cutlass)
 
         output = w8a8_blockscale_func(q_input, weight, x_scale, weight_scale,
-                                      block_size, input.dtype)
+                                      block_size, output_dtype)
 
     if bias is not None:
         output = output + bias
-    return output.to(dtype=input.dtype).view(*output_shape)
+    return output.to(dtype=output_dtype).view(*output_shape)
 
 
 def apply_w8a8_block_fp8_linear_fake(
@@ -266,9 +261,13 @@ def apply_w8a8_block_fp8_linear_fake(
     cutlass_block_fp8_supported: bool = CUTLASS_BLOCK_FP8_SUPPORTED,
     use_aiter_and_is_supported: bool = False,
     use_ck_tile_and_is_supported: bool = False,
+    input_quant_scale: torch.Tensor = None,
 ) -> torch.Tensor:
     output_shape = [*input.shape[:-1], weight.shape[0]]
-    return torch.empty(output_shape, dtype=input.dtype, device=input.device)
+    output_dtype = input.dtype
+    if input_quant_scale is not None:
+        output_dtype = torch.bfloat16
+    return torch.empty(output_shape, dtype=output_dtype, device=input.device)
 
 
 if not current_platform.is_cpu():
@@ -452,7 +451,7 @@ def per_token_group_quant_fp8(
         scaling factor.
     """
     if use_ue8m0 is None:
-        use_ue8m0 = is_blackwell_deep_gemm_e8m0_used()
+        use_ue8m0 = is_deep_gemm_e8m0_used()
     dtype = current_platform.fp8_dtype() if dtype is None else dtype
     assert (x.shape[-1] % group_size == 0), (
         f"the last dimension of `x` {x.shape[-1]} must be divisible "

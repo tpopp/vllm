@@ -15,8 +15,59 @@ from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.utils import LazyDict
+from vllm.utils import direct_register_custom_op
 
+from vllm.logger import init_logger
+logger = init_logger(__name__)
 
+if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
+    VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP4_QUANT = envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP4_QUANT
+    VLLM_TRITON_FP4_GEMM_USE_ASM = envs.VLLM_ROCM_USE_AITER and envs.VLLM_TRITON_FP4_GEMM_USE_ASM
+    
+    if VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP4_QUANT:
+        from aiter.ops.triton.activation import act_mul_and_mxfp4_quant
+
+    VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT = envs.VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT
+
+    if VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT:
+        logger.info("[Aiter] VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT=1")
+        from aiter.ops.triton.activation import act_mul_and_fp8_group_quant
+        import aiter as rocm_aiter
+        rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
+        rocm_aiter_fp8_quant_group_size = 128
+        
+        def act_mul_and_fp8_group_quant_impl(
+            x: torch.Tensor,        
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            return act_mul_and_fp8_group_quant(x, activation="silu", group_size=rocm_aiter_fp8_quant_group_size, dtype_quant=rocm_aiter_fp8_dtype)
+        
+        def act_mul_and_fp8_group_quant_fake(
+            x: torch.Tensor,        
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            M, N = x.shape
+            assert N % 2 == 0
+            N_half = N // 2
+            x_fp8 = torch.empty((M, N_half), dtype=rocm_aiter_fp8_dtype, device=x.device)
+            out_bs = torch.empty((M, (N_half + rocm_aiter_fp8_quant_group_size - 1) // rocm_aiter_fp8_quant_group_size), dtype=torch.float32, device=x.device)
+            return x_fp8, out_bs
+        
+        direct_register_custom_op(
+            op_name="act_mul_and_fp8_group_quant",
+            op_func=act_mul_and_fp8_group_quant_impl,
+            mutates_args=[],
+            fake_impl=act_mul_and_fp8_group_quant_fake,
+            dispatch_key=current_platform.dispatch_key,
+        )
+
+else:
+    VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP4_QUANT = False
+    VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT = False
+    VLLM_TRITON_FP4_GEMM_USE_ASM = False
+
+logger.info(f"[Aiter] {VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP4_QUANT=}")
+logger.info(f"[Aiter] {VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT=}")
+logger.info(f"[Aiter] {VLLM_TRITON_FP4_GEMM_USE_ASM=}")
+    
 @CustomOp.register("fatrelu_and_mul")
 class FatreluAndMul(CustomOp):
     """An activation function for FATReLU.
@@ -67,10 +118,8 @@ class SiluAndMul(CustomOp):
     def __init__(self):
         super().__init__()
 
-        if current_platform.is_rocm() and envs.VLLM_USE_AITER_TRITON_SILU_MUL:
-            import aiter.ops.triton.activation as ops
-            self.op = lambda x, shuffle: \
-                ops.act_mul_and_mxfp4_quant(x, "silu", shuffle=shuffle)
+        if VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP4_QUANT:
+            self.op = lambda x, shuffle: act_mul_and_mxfp4_quant(x, "silu", shuffle=shuffle)
         elif current_platform.is_cuda_alike():
             self.op = torch.ops._C.silu_and_mul
         elif current_platform.is_xpu():
@@ -87,8 +136,8 @@ class SiluAndMul(CustomOp):
     def forward_cuda(self,
                      x: torch.Tensor,
                      scale: Optional[torch.Tensor] = None) -> torch.Tensor:
-        if envs.VLLM_USE_AITER_TRITON_SILU_MUL:
-            shuffle = envs.VLLM_TRITON_FP4_GEMM_USE_ASM and x.shape[0] >= 32
+        if VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP4_QUANT:
+            shuffle = VLLM_TRITON_FP4_GEMM_USE_ASM and x.shape[0] >= 32
             out, out_scales = self.op(x, shuffle)
             return out, out_scales
         else:
@@ -252,6 +301,35 @@ class GeluAndMul(CustomOp):
         return f'approximate={repr(self.approximate)}'
 
 
+@CustomOp.register("swigluoai_and_mul")
+class SwigluOAIAndMul(CustomOp):
+    # https://github.com/huggingface/transformers/blob/v4.55.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L106-L110
+    def __init__(self, alpha: float = 1.702, limit: float = 7.0):
+        super().__init__()
+        self.alpha = alpha
+        self.limit = limit
+
+    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
+        """PyTorch-native implementation equivalent to forward()."""
+
+        gate, up = x[..., ::2], x[..., 1::2]
+        gate = gate.clamp(min=None, max=self.limit)
+        up = up.clamp(min=-self.limit, max=self.limit)
+        glu = gate * torch.sigmoid(gate * self.alpha)
+        gated_output = (up + 1) * glu
+        return gated_output
+
+    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        d = x.shape[-1] // 2
+        output_shape = (x.shape[:-1] + (d, ))
+        out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+        torch.ops._C.swigluoai_and_mul(out, x, self.alpha, self.limit)
+        return out
+
+    def extra_repr(self) -> str:
+        return f"alpha={repr(self.alpha)}, limit={repr(self.limit)}"
+
+
 @CustomOp.register("gelu_new")
 class NewGELU(CustomOp):
 
@@ -343,6 +421,7 @@ class ReLUSquaredActivation(CustomOp):
         return torch.square(F.relu(x))
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        #TODO : implement cuda kenrels
         return self.forward_native(x)
 
 
@@ -405,12 +484,23 @@ _ACTIVATION_REGISTRY = LazyDict({
     lambda: nn.SiLU(),
     "quick_gelu":
     lambda: QuickGELU(),
+    "tanh":
+    lambda: nn.Tanh(),
+    "sigmoid":
+    lambda: nn.Sigmoid(),
 })
 
 
 def get_act_fn(act_fn_name: str) -> nn.Module:
     """Get an activation function by name."""
     act_fn_name = act_fn_name.lower()
+
+    if act_fn_name.startswith("torch.nn.modules."):
+        activation_name = act_fn_name.split(".")[-1]
+        if activation_name == "identity":
+            return nn.Identity()
+        act_fn_name = activation_name
+
     if act_fn_name not in _ACTIVATION_REGISTRY:
         raise ValueError(
             f"Activation function {act_fn_name!r} is not supported.")
@@ -419,9 +509,14 @@ def get_act_fn(act_fn_name: str) -> nn.Module:
 
 
 _ACTIVATION_AND_MUL_REGISTRY = LazyDict({
-    "gelu": lambda: GeluAndMul(),
-    "silu": lambda: SiluAndMul(),
-    "geglu": lambda: GeluAndMul(),
+    "gelu":
+    lambda: GeluAndMul(),
+    "silu":
+    lambda: SiluAndMul(),
+    "geglu":
+    lambda: GeluAndMul(),
+    "swigluoai":
+    lambda *args, **kwargs: SwigluOAIAndMul(*args, **kwargs),
 })
 
 

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with AiterFlashAttention."""
 from dataclasses import dataclass
-from typing import ClassVar, Optional
+from typing import Optional
 
 import torch
 
@@ -11,7 +11,8 @@ from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
-from vllm.v1.attention.backends.utils import (AttentionMetadataBuilder,
+from vllm.v1.attention.backends.utils import (AttentionCGSupport,
+                                              AttentionMetadataBuilder,
                                               CommonAttentionMetadata)
 from vllm.v1.kv_cache_interface import AttentionSpec
 
@@ -88,9 +89,17 @@ if current_platform.is_rocm():
             tl.store(k_values_ptr + kv_values_off, k_vals, mask=block_mask)
             tl.store(v_values_ptr + kv_values_off, v_vals, mask=block_mask)
 
-    def vllm_layout_trans(b_query_lens_loc, b_seq_lens_loc, block_table,
-                          k_cache, v_cache, max_seq_len, k_scale, v_scale,
-                          output_dtype, total_tokens):
+    @torch.inference_mode()
+    def vllm_layout_trans(b_query_lens_loc,
+                          b_seq_lens_loc,
+                          block_table,
+                          k_cache,
+                          v_cache,
+                          max_seq_len,
+                          k_scale,
+                          v_scale,
+                          output_dtype,
+                          total_tokens):
         H_KV = v_cache.shape[2]
         D = v_cache.shape[3]
         BLOCK_SIZE = v_cache.shape[1]
@@ -231,7 +240,7 @@ class AiterFlashAttentionMetadata:
 
 class AiterFlashAttentionMetadataBuilder(
         AttentionMetadataBuilder[AiterFlashAttentionMetadata]):
-    full_cudagraph_supported: ClassVar[bool] = True
+    cudagraph_support = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
 
     def __init__(self, kv_cache_spec: AttentionSpec, layer_names: list[str],
                  vllm_config: VllmConfig, device: torch.device):
@@ -239,6 +248,7 @@ class AiterFlashAttentionMetadataBuilder(
         self.model_config = vllm_config.model_config
         self.parallel_config = vllm_config.parallel_config
         self.cache_config = vllm_config.cache_config
+        self.compilation_config = vllm_config.compilation_config
         self.device = device
 
         self.num_heads_q = self.model_config.get_num_attention_heads(
@@ -266,10 +276,10 @@ class AiterFlashAttentionMetadataBuilder(
               common_prefix_len: int,
               common_attn_metadata: CommonAttentionMetadata,
               fast_build: bool = False) -> 'AiterFlashAttentionMetadata':
-
+        
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         max_query_len = common_attn_metadata.max_query_len
-        max_seq_len = int(common_attn_metadata.seq_lens_cpu.max())
+        max_seq_len = common_attn_metadata.max_seq_len
         query_start_loc = common_attn_metadata.query_start_loc
         seq_lens = common_attn_metadata.seq_lens
         block_table_tensor = common_attn_metadata.block_table_tensor
@@ -306,11 +316,6 @@ class AiterFlashAttentionMetadataBuilder(
             total_tokens=self.total_tokens,
         )
         return attn_metadata
-
-    def can_run_in_cudagraph(
-            self, common_attn_metadata: CommonAttentionMetadata) -> bool:
-        # Full CUDA Graph always supported (FA2 support checked separately)
-        return True
 
     def use_cascade_attention(self, *args, **kwargs) -> bool:
         return False
@@ -412,6 +417,8 @@ class AiterFlashAttentionImpl(AttentionImpl):
                                       "are not implemented for "
                                       "FlashAttentionImpl")
         self.sinks = sinks
+        if self.sinks is not None:
+            raise NotImplementedError("Sinks are not supported for ROCM AITER")
 
     def forward(
         self,
@@ -423,6 +430,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
         attn_metadata: AiterFlashAttentionMetadata,
         output: Optional[torch.Tensor] = None,
         output_scale: Optional[torch.Tensor] = None,
+        output_block_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass with AiterFlashAttention.
 
@@ -430,7 +438,8 @@ class AiterFlashAttentionImpl(AttentionImpl):
             query: shape = [num_tokens, num_heads, head_size]
             key: shape = [num_tokens, num_kv_heads, head_size]
             value: shape = [num_tokens, num_kv_heads, head_size]
-            kv_cache = [2, num_blocks, block_size, num_kv_heads, head_size]
+            kv_cache: shape =
+                [2, num_blocks, block_size, num_kv_heads, head_size]
             attn_metadata: Metadata for attention.
         Returns:
             shape = [num_tokens, num_heads * head_size]
@@ -440,7 +449,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
         """
         assert output is not None, "Output tensor must be provided."
 
-        if output_scale is not None:
+        if output_scale is not None or output_block_scale is not None:
             raise NotImplementedError(
                 "fused output quantization is not yet supported"
                 " for FlashAttentionImpl")
@@ -480,8 +489,12 @@ class AiterFlashAttentionImpl(AttentionImpl):
             )
 
         if self.kv_cache_dtype.startswith("fp8"):
-            key_cache = key_cache.view(torch.float8_e4m3fnuz)
-            value_cache = value_cache.view(torch.float8_e4m3fnuz)
+            if current_platform.is_fp8_fnuz():
+                key_cache = key_cache.view(torch.float8_e4m3fnuz)
+                value_cache = value_cache.view(torch.float8_e4m3fnuz)
+            else:
+                key_cache = key_cache.view(torch.float8_e4m3fn)
+                value_cache = value_cache.view(torch.float8_e4m3fn)
 
         if not attn_metadata.use_cascade:
             cu_seqlens_q = attn_metadata.query_start_loc

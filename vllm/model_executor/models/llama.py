@@ -32,6 +32,7 @@ from transformers import LlamaConfig
 
 import vllm.envs as envs
 from vllm.attention import Attention, AttentionType
+from vllm.attention.layers.encoder_only_attention import EncoderOnlyAttention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
@@ -57,8 +58,18 @@ from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
                     maybe_prefix)
 
 from vllm.platforms import current_platform
-if current_platform.is_rocm():
-    VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE
+from vllm.logger import init_logger
+logger = init_logger(__name__)
+
+if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
+    from vllm.model_executor.layers.activation import VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE and not envs.VLLM_ROCM_USE_AITER_MHA
+else:
+    VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT = False
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = False
+
+VLLM_ROCM_USE_AITER_MHA = envs.VLLM_ROCM_USE_AITER_MHA
+logger.info(f"[Aiter] {VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE=} {VLLM_ROCM_USE_AITER_MHA=}")
 
 class LlamaMLP(nn.Module):
 
@@ -88,19 +99,25 @@ class LlamaMLP(nn.Module):
             reduce_results=reduce_results,
             prefix=f"{prefix}.down_proj",
         )
+
         if hidden_act != "silu":
             raise ValueError(f"Unsupported activation: {hidden_act}. "
                              "Only silu is supported for now.")
+        self.block_quant = hasattr(quant_config, "weight_block_size") and quant_config.weight_block_size is not None
+        if VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT and not self.block_quant:
+            logger.info("[Aiter] [WARNING] VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT will not be activated because this model is not using blocked quantization")
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
         x, _ = self.gate_up_proj(x)
-        if envs.VLLM_USE_AITER_TRITON_SILU_MUL:
-            x, x_scales = self.act_fn(x)
-            x, _ = self.down_proj(x, x_scales)
+        if VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT and self.block_quant:
+            x = torch.ops.vllm.act_mul_and_fp8_group_quant(x)
         else:
             x = self.act_fn(x)
-            x, _ = self.down_proj(x)
+        x_quant_scales = None
+        if isinstance(x, tuple):
+            x, x_quant_scales = x
+        x, _ = self.down_proj(x, x_quant_scales=x_quant_scales)
         return x
 
 
@@ -181,7 +198,10 @@ class LlamaAttention(nn.Module):
             if is_sliding:
                 sliding_window = config.sliding_window
 
-        self.attn = Attention(
+        attn_cls = (EncoderOnlyAttention
+                    if attn_type == AttentionType.ENCODER_ONLY else Attention)
+
+        self.attn = attn_cls(
             self.num_heads,
             self.head_dim,
             self.scaling,
@@ -191,6 +211,7 @@ class LlamaAttention(nn.Module):
             per_layer_sliding_window=sliding_window,
             attn_type=attn_type,
             prefix=f"{prefix}.attn",
+            rotary_emb=self.rotary_emb if VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE else None,
         )
 
     def forward(
@@ -202,8 +223,7 @@ class LlamaAttention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         if VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE:
-            attn_output = self.attn(q, k, v,
-                positions=positions, cos_sin_cache=self.rotary_emb.cos_sin_cache, is_neox=self.rotary_emb.is_neox_style)
+            attn_output = self.attn(q, k, v, positions=positions)
         else:
             q, k = self.rotary_emb(positions, q, k)
             attn_output = self.attn(q, k, v)
@@ -363,7 +383,7 @@ class LlamaModel(nn.Module):
         else:
             self.norm = PPMissingLayer()
 
-        self.aux_hidden_state_layers: tuple[int] = tuple()
+        self.aux_hidden_state_layers = tuple[int, ...]()
 
         self.make_empty_intermediate_tensors = (
             make_empty_intermediate_tensors_factory(
@@ -563,10 +583,10 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors)
 
-    def set_aux_hidden_state_layers(self, layers: tuple[int]) -> None:
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
         self.model.aux_hidden_state_layers = layers
 
-    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int]:
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
         num_layers = len(self.model.layers)
         return (2, num_layers // 2, num_layers - 3)
 

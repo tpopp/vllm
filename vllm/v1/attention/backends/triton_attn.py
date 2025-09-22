@@ -16,6 +16,8 @@ from vllm.attention.ops.chunked_prefill_paged_decode import (
 from vllm.attention.ops.paged_attn import PagedAttention
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    QuantKey, kFp8StaticTensorSym)
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
 from vllm.v1.attention.backends.utils import (AttentionCGSupport,
@@ -25,10 +27,17 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
 
-if current_platform.is_rocm():
-    VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE
+if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = (
+        envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE
+    )
+    VLLM_USE_AITER_TRITON_ROPE = envs.VLLM_USE_AITER_TRITON_ROPE
     if VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE:
         from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
+else:
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = False
+    VLLM_USE_AITER_TRITON_ROPE = False
+
 
 @dataclass
 class TritonAttentionMetadata:
@@ -62,8 +71,7 @@ class TritonAttentionMetadata:
 
 class TritonAttentionMetadataBuilder(
         AttentionMetadataBuilder[TritonAttentionMetadata]):
-    attn_cudagraph_support: ClassVar[AttentionCGSupport] = \
-        AttentionCGSupport.ALWAYS
+    cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
 
     def __init__(self, kv_cache_spec: AttentionSpec, layer_names: list[str],
                  vllm_config: VllmConfig, device: torch.device):
@@ -95,7 +103,7 @@ class TritonAttentionMetadataBuilder(
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         max_query_len = common_attn_metadata.max_query_len
 
-        max_seq_len = int(common_attn_metadata.seq_lens_cpu.max())
+        max_seq_len = common_attn_metadata.max_seq_len
         query_start_loc = common_attn_metadata.query_start_loc
         seq_lens = common_attn_metadata.seq_lens
         block_table_tensor = common_attn_metadata.block_table_tensor
@@ -135,11 +143,6 @@ class TritonAttentionMetadataBuilder(
             prefix_scheduler_metadata=prefix_scheduler_metadata,
         )
         return attn_metadata
-
-    def can_run_in_cudagraph(
-            self, common_attn_metadata: CommonAttentionMetadata) -> bool:
-        # Full CUDA Graph always supported
-        return True
 
 
 class TritonAttentionBackend(AttentionBackend):
@@ -208,10 +211,8 @@ def use_aiter_unified_attention() -> bool:
 
 class TritonAttentionImpl(AttentionImpl):
 
-    def fused_output_quant_supported(self, dtype: torch.dtype, static: bool,
-                                     group_shape: tuple[int, int]):
-        return dtype == current_platform.fp8_dtype(
-        ) and static and group_shape == (-1, -1)  # per-tensor
+    def fused_output_quant_supported(self, quant_key: QuantKey):
+        return quant_key == kFp8StaticTensorSym
 
     def __init__(
         self,
@@ -256,24 +257,25 @@ class TritonAttentionImpl(AttentionImpl):
                                       "TritonAttentionImpl")
 
         self.fp8_dtype = current_platform.fp8_dtype()
-        self.force_prefill_decode_attn = \
-            envs.VLLM_V1_USE_PREFILL_DECODE_ATTENTION
 
-        if not self.force_prefill_decode_attn:
-            # If not using prefill decode attention, we use the Triton
-            # unified attention implementation.
-            if use_aiter_unified_attention():
-                logger.info_once(
-                    "Using aiter unified attention for TritonAttentionImpl")
-                from aiter.ops.triton.unified_attention import (
-                    unified_attention)
-                self.unified_attention = unified_attention
-            else:
-                logger.info_once(
-                    "Using vllm unified attention for TritonAttentionImpl")
-                from vllm.attention.ops.triton_unified_attention import (
-                    unified_attention)
-                self.unified_attention = unified_attention
+        # If not using prefill decode attention, we use the Triton
+        # unified attention implementation.
+        if use_aiter_unified_attention():
+            logger.info_once(
+                "Using aiter unified attention for TritonAttentionImpl")
+            from aiter.ops.triton.unified_attention import unified_attention
+
+            self.unified_attention = unified_attention
+        elif not envs.VLLM_V1_USE_PREFILL_DECODE_ATTENTION:
+            logger.info_once(
+                "Using vllm unified attention for TritonAttentionImpl")
+            from vllm.attention.ops.triton_unified_attention import (
+                unified_attention)
+            self.unified_attention = unified_attention
+        else:
+            logger.info_once(
+                "Using vllm split prefill decode attention for TritonAttentionImpl"
+            )
 
         self.sinks = sinks
         if sinks is not None:
@@ -295,6 +297,7 @@ class TritonAttentionImpl(AttentionImpl):
         positions: torch.Tensor = None,
         cos_sin_cache: torch.Tensor = None,
         is_neox: bool = False,
+        output_block_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass with FlashAttention.
 
@@ -302,12 +305,19 @@ class TritonAttentionImpl(AttentionImpl):
             query: shape = [num_tokens, num_heads, head_size]
             key: shape = [num_tokens, num_kv_heads, head_size]
             value: shape = [num_tokens, num_kv_heads, head_size]
-            kv_cache = [2, num_blocks, block_size, num_kv_heads, head_size]
+            kv_cache: shape =
+                [2, num_blocks, block_size, num_kv_heads, head_size]
             attn_metadata: Metadata for attention.
         Returns:
             shape = [num_tokens, num_heads * head_size]
         """
         assert output is not None, "Output tensor must be provided."
+
+        if output_block_scale is not None:
+            raise NotImplementedError(
+                "fused block_scale output quantization is not yet supported"
+                " for TritonAttentionImpl"
+            )
 
         if attn_metadata is None:
             # Profiling run.
@@ -324,34 +334,66 @@ class TritonAttentionImpl(AttentionImpl):
         # Whenever making a change in this method, please benchmark the
         # performance to make sure it does not introduce any overhead.
 
-        use_prefill_decode_attn = self.force_prefill_decode_attn
+        use_prefill_decode_attn = (
+            envs.VLLM_V1_USE_PREFILL_DECODE_ATTENTION
+            and not use_aiter_unified_attention()
+        )
         num_actual_tokens = attn_metadata.num_actual_tokens
 
         if use_prefill_decode_attn:
             key_cache, value_cache = PagedAttention.split_kv_cache(
-                kv_cache, self.num_kv_heads, self.head_size)
+                kv_cache, self.num_kv_heads, self.head_size
+            )
         else:
             key_cache, value_cache = kv_cache.unbind(0)
-        
-        if VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE:
-            assert self.kv_sharing_target_layer_name is None, "self.kv_sharing_target_layer_name error"      
-            cos, sin = cos_sin_cache.chunk(2, dim = -1)
+
+        # positions is not None entails that Q and K are not RoPE embedded yet, therefore, either fused_qk_rope_reshape_and_cache or self.rotary_emb is called
+        if positions is not None and query.shape[0] <= 256:
+            assert (
+                self.kv_sharing_target_layer_name is None
+            ), "self.kv_sharing_target_layer_name cannot be None"
+            assert hasattr(self, "rotary_emb"), f"rotary_emb not found in {self}"
+            cos_sin_cache = self.rotary_emb.cos_sin_cache
+            is_neox = self.rotary_emb.is_neox_style
+            cos, sin = cos_sin_cache.chunk(2, dim=-1)
             is_fp8_kv_cache = self.kv_cache_dtype.startswith("fp8")
             if is_fp8_kv_cache:
                 key_cache_og_dtype = key_cache.dtype
                 value_cache_og_dtype = value_cache.dtype
                 key_cache = key_cache.view(self.fp8_dtype)
                 value_cache = value_cache.view(self.fp8_dtype)
-            query, key, key_cache, value_cache, output = fused_qk_rope_reshape_and_cache(
-                query, key, value, key_cache, value_cache, attn_metadata.slot_mapping, 
-                positions, cos, sin, 
-                layer._k_scale, layer._v_scale,
-                is_neox, 
-                flash_layout=(not use_prefill_decode_attn), apply_scale=is_fp8_kv_cache, offs=None, q_out=query, k_out=key, output_zeros=True, zeros_out=output)
+            query, key, key_cache, value_cache, output = (
+                fused_qk_rope_reshape_and_cache(
+                    query,
+                    key,
+                    value,
+                    key_cache,
+                    value_cache,
+                    attn_metadata.slot_mapping,
+                    positions,
+                    cos,
+                    sin,
+                    layer._k_scale,
+                    layer._v_scale,
+                    is_neox,
+                    flash_layout=(not use_prefill_decode_attn),
+                    apply_scale=is_fp8_kv_cache,
+                    offs=None,
+                    q_out=query,
+                    k_out=key,
+                    output_zeros=True,
+                    zeros_out=output,
+                )
+            )
             if is_fp8_kv_cache:
                 key_cache = key_cache.view(key_cache_og_dtype)
                 value_cache = value_cache.view(value_cache_og_dtype)
         else:
+            if positions is not None:
+                if VLLM_USE_AITER_TRITON_ROPE:
+                    query, key = self.rotary_emb.forward_cuda(positions, query, key)
+                else:
+                    query, key = self.rotary_emb(positions, query, key)
             if self.kv_sharing_target_layer_name is None:
                 # Reshape the input keys and values and store them in the cache.
                 # Skip this if sharing KV cache with an earlier attention layer.
@@ -382,15 +424,16 @@ class TritonAttentionImpl(AttentionImpl):
             key_cache = key_cache.view(self.fp8_dtype)
             value_cache = value_cache.view(self.fp8_dtype)
             num_tokens, num_heads, head_size = query.shape
-            assert layer._q_scale_float == 1.0, \
-                "A non 1.0 q_scale is not currently supported."
+            assert (
+                layer._q_scale_float == 1.0
+            ), "A non 1.0 q_scale is not currently supported."
             if not current_platform.is_rocm():
                 # Skip Q quantization on ROCm, since dequantizing back to
                 # f32 in the attention kernel is not supported.
                 query, _ = ops.scaled_fp8_quant(
-                    query.reshape(
-                        (num_tokens, num_heads * head_size)).contiguous(),
-                    layer._q_scale)
+                    query.reshape((num_tokens, num_heads * head_size)).contiguous(),
+                    layer._q_scale,
+                )
                 query = query.reshape((num_tokens, num_heads, head_size))
 
         cu_seqlens_q = attn_metadata.query_start_loc
@@ -445,6 +488,7 @@ class TritonAttentionImpl(AttentionImpl):
                 k_descale=layer._k_scale.expand(descale_shape),
                 v_descale=layer._v_scale.expand(descale_shape),
                 sinks=self.sinks,
-                output_scale=output_scale)
+                output_scale=output_scale,
+            )
 
         return output

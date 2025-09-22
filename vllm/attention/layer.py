@@ -18,6 +18,7 @@ from vllm.distributed.kv_transfer import (get_kv_transfer_group,
                                           is_v1_kv_transfer_group)
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig)
@@ -28,8 +29,12 @@ from vllm.utils import direct_register_custom_op
 logger = init_logger(__name__)
 USE_XFORMERS_OPS = None
 
-if current_platform.is_rocm():
-    VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE
+if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE
+else:
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = False
+
+logger.info(f"[Aiter] {VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE=}")
 
 def check_xformers_availability():
     global USE_XFORMERS_OPS
@@ -56,7 +61,7 @@ def check_xformers_availability():
     return USE_XFORMERS_OPS
 
 
-class Attention(nn.Module):
+class Attention(nn.Module, AttentionLayerBase):
     """Attention layer.
 
     This class takes query, key, and value tensors as input. The input tensors
@@ -84,6 +89,7 @@ class Attention(nn.Module):
         attn_type: str = AttentionType.DECODER,
         kv_sharing_target_layer_name: Optional[str] = None,
         attn_backend: Optional[type[AttentionBackend]] = None,
+        rotary_emb: Optional[nn.Module] = None,
         **extra_impl_args,
     ) -> None:
         """
@@ -135,10 +141,16 @@ class Attention(nn.Module):
         # during graph capture. Otherwise asserts are triggeting HIP error
         self._q_scale_float = 1.0
 
-        # We also keep the float32 versions of k/v_scale for attention
-        # backends that don't support tensors (Flashinfer)
+        # We also keep q/k/v_scale on host (cpu) memory for attention
+        # backends that require the scales to be on host instead of on device.
+        # e.g. Flashinfer
+        self._q_scale_float = 1.0
         self._k_scale_float = 1.0
         self._v_scale_float = 1.0
+
+        # The output scale on host memory. This should be the input scale of
+        # the quant op after this attention layer.
+        self._o_scale_float: Optional[float] = None
 
         self.use_mla = use_mla
         self.num_heads = num_heads
@@ -183,6 +195,7 @@ class Attention(nn.Module):
                              alibi_slopes, sliding_window, kv_cache_dtype,
                              logits_soft_cap, attn_type,
                              kv_sharing_target_layer_name, **extra_impl_args)
+        self.impl.rotary_emb = rotary_emb
         self.backend = backend_name_to_enum(self.attn_backend.get_name())
         self.dtype = dtype
 
@@ -190,8 +203,7 @@ class Attention(nn.Module):
         # torch.compile works by registering the attention as one giant
         # opaque custom op. For other platforms, we directly call them
         # and let torch.compile handle them.
-        self.use_direct_call = not current_platform.is_cuda_alike(
-        ) and not current_platform.is_cpu()
+        self.use_direct_call = not current_platform.opaque_attention_op()
 
         self.use_output = self.attn_backend.accept_output_buffer
         compilation_config = get_current_vllm_config().compilation_config
@@ -231,8 +243,6 @@ class Attention(nn.Module):
         # definition specify the output tensor shape.
         output_shape: Optional[torch.Size] = None,
         positions: torch.Tensor = None,
-        cos_sin_cache: torch.Tensor = None,
-        is_neox: bool = False,
     ) -> torch.Tensor:
         """
         The KV cache is stored inside this class and is accessed via
@@ -250,7 +260,7 @@ class Attention(nn.Module):
         if self.use_output:
             output_shape = (output_shape
                             if output_shape is not None else query.shape)
-            if VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE:
+            if positions is not None:
                 output = torch.empty(output_shape,
                                     dtype=query.dtype,
                                     device=query.device)
@@ -287,12 +297,8 @@ class Attention(nn.Module):
                                 attn_metadata,
                                 output=output)
             else:
-                if VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE:
-                    torch.ops.vllm.unified_attention_with_output(
-                        query, key, value, output, self.layer_name, None, positions, cos_sin_cache, True)
-                else:
-                    torch.ops.vllm.unified_attention_with_output(
-                        query, key, value, output, self.layer_name)
+                torch.ops.vllm.unified_attention_with_output(
+                    query, key, value, output, self.layer_name, None, positions=positions)
             return output.view(-1, hidden_size)
         else:
             if self.use_direct_call:
@@ -328,6 +334,15 @@ class Attention(nn.Module):
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         if hasattr(self.impl, "process_weights_after_loading"):
             self.impl.process_weights_after_loading(act_dtype)
+
+        # FlashInfer requires attention sinks to be float32
+        if (self.backend == _Backend.FLASHINFER_VLLM_V1
+                and hasattr(self.impl, 'sinks')):
+            from vllm.v1.attention.backends.flashinfer import FlashInferImpl
+            assert isinstance(self.impl, FlashInferImpl)
+            if (self.impl.sinks is not None
+                    and self.impl.sinks.dtype != torch.float32):
+                self.impl.sinks = self.impl.sinks.to(torch.float32)
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.attn_backend
@@ -501,8 +516,7 @@ def unified_attention_with_output(
     layer_name: str,
     output_scale: Optional[torch.Tensor] = None,
     positions:  Optional[torch.Tensor] = None,
-    cos_sin_cache: Optional[torch.Tensor] = None,
-    is_neox: bool = False,
+    output_block_scale: Optional[torch.Tensor] = None,
 ) -> None:
     wait_for_kv_layer_from_connector(layer_name)
     forward_context: ForwardContext = get_forward_context()
@@ -512,10 +526,11 @@ def unified_attention_with_output(
     self = forward_context.no_compile_layers[layer_name]
     kv_cache = self.kv_cache[forward_context.virtual_engine]
 
-    if VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE:
-        from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
-        assert isinstance(self.impl, TritonAttentionImpl), f"Expect attention implementation = TritonAttentionImpl for VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE=1 but got {self.impl=}"
-        assert self.impl.kv_sharing_target_layer_name is None, "kv_sharing_target_layer_name error"
+    from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
+    from vllm.v1.attention.backends.mla.rocm_aiter_mla import AiterMLAImpl
+    if VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE and (isinstance(self.impl, TritonAttentionImpl) or isinstance(self.impl, AiterMLAImpl)):
+        # fusing RoPE with flushing kv_cache operation
+        assert hasattr(self.impl, "rotary_emb") and self.impl.rotary_emb is not None and positions is not None, f"rotary_emb not found in {self.impl=} and positions cannot be None"
         self.impl.forward(self,
                         query,
                         key,
@@ -524,8 +539,9 @@ def unified_attention_with_output(
                         attn_metadata,
                         output=output,
                         output_scale=output_scale,
-                        positions=positions, cos_sin_cache=cos_sin_cache, is_neox=is_neox)
+                        positions=positions)
     else:
+        assert positions is None, f"positions must be None {positions=}"
         self.impl.forward(self,
                         query,
                         key,
@@ -546,8 +562,7 @@ def unified_attention_with_output_fake(
     layer_name: str,
     output_scale: Optional[torch.Tensor] = None,
     positions:  Optional[torch.Tensor] = None,
-    cos_sin_cache: Optional[torch.Tensor] = None,
-    is_neox: bool = False,
+    output_block_scale: Optional[torch.Tensor] = None,
 ) -> None:
     return
 
@@ -555,7 +570,7 @@ def unified_attention_with_output_fake(
 direct_register_custom_op(
     op_name="unified_attention_with_output",
     op_func=unified_attention_with_output,
-    mutates_args=["output"],
+    mutates_args=["output", "output_block_scale"],
     fake_impl=unified_attention_with_output_fake,
     dispatch_key=current_platform.dispatch_key,
 )
