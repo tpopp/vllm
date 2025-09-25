@@ -194,6 +194,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         self.intermediate_size = intermediate_size_per_partition_after_pad
         self.hidden_size = hidden_size
+        self.intermediate_pad = (intermediate_size_per_partition_after_pad - intermediate_size_per_partition)
         # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(
             torch.zeros(
@@ -708,7 +709,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     sorted_expert_ids,
                     num_valid_ids,
                     top_k,
-                    192, # n_pad_zeros
+                    self.intermediate_pad // 64 * 64 * 2,
                     128, # k_pad_zeros
                     None, # sorted_weights
                     None,
@@ -725,7 +726,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     num_valid_ids,
                     top_k,
                     192, # n_pad_zeros
-                    128, # k_pad_zeros
+                    self.intermediate_pad // 128 * 128,
                     sorted_weights, # sorted_weights
                     None,
                     self.w2_scale_aiter_tensor,
