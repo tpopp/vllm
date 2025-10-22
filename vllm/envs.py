@@ -184,6 +184,7 @@ if TYPE_CHECKING:
     ROCM_TRITON_MOE_PRESHUFFLE_SCALES: bool = True
     VLLM_ROCM_USE_AITER_FUSED_MOE_A16W4: bool = False
     VLLM_ROCM_USE_AITER_TRITON_FUSED_SHARED_EXPERTS: bool = True
+    VLLM_ROCM_USE_AITER_TRITON_MLA: bool = False
 
 def get_default_cache_root():
     return os.getenv(
@@ -1277,6 +1278,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_USE_AITER_TRITON_FUSED_SHARED_EXPERTS":
     lambda: bool(int(os.getenv("VLLM_ROCM_USE_AITER_TRITON_FUSED_SHARED_EXPERTS", "1"))),
     
+
+    # Use AITER Triton MLA
+    "VLLM_ROCM_USE_AITER_TRITON_MLA":
+    lambda: bool(int(os.getenv("VLLM_ROCM_USE_AITER_TRITON_MLA", "0"))),
 }
 
 # --8<-- [end:env-vars-definition]
