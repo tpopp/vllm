@@ -209,10 +209,12 @@ class Llama4Attention(nn.Module):
         extra_args = {}
         if use_chunked_local_attn:
             extra_args["attention_chunk_size"] = config.attention_chunk_size
+        # Use the rotary_emb in attention only when it's supported
         self.use_fused_rope = (
             VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE
             and self.rotary_emb is not None
             and self.qk_norm is None
+            and not self.attn_temperature_tuning
         )
         if self.use_fused_rope:
             extra_args["rotary_emb"] = self.rotary_emb
@@ -240,10 +242,10 @@ class Llama4Attention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        # For limited cases that match Llama3's behavior, use fused RoPE
+        # rotary_emb is fused into self.attn in this case
         if self.use_fused_rope:
             assert not (
-                self.attn_temperature_tuning and self.nope
+                self.attn_temperature_tuning
             ), f"{self.attn_temperature_tuning=} and {self.nope=} must be False with {VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE=}"
             attn_output = self.attn(q, k, v, positions=positions)
             output, _ = self.o_proj(attn_output)

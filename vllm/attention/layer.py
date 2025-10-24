@@ -532,7 +532,7 @@ def unified_attention_with_output(
     # Not all layers can use RoPE fusing, so check that they were given all
     # needed inputs along with the environment variable to enable this.
     if (
-        VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE
+        
         and hasattr(self.impl, "rotary_emb")
         and self.impl.rotary_emb is not None
         and positions is not None
@@ -542,6 +542,7 @@ def unified_attention_with_output(
             or isinstance(self.impl, AiterMLAImpl)
         )
     ):
+        assert VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE, f"Only expecting rotary_emb and positions when VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE is True."
         # fusing RoPE with flushing kv_cache operation
         self.impl.forward(self,
                         query,
