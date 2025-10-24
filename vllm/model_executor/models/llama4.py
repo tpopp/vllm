@@ -45,12 +45,10 @@ from .llama import LlamaForCausalLM, LlamaMLP, LlamaModel
 from .utils import (AutoWeightsLoader, extract_layer_index, fast_topk,
                     is_pp_missing_parameter)
 
-
 VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = (
-    current_platform.is_rocm()
-    and envs.VLLM_ROCM_USE_AITER
-    and envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE
-)
+    current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER
+    and envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE)
+
 
 class Llama4MoE(nn.Module):
 
@@ -212,21 +210,18 @@ class Llama4Attention(nn.Module):
         # Use the rotary_emb in attention only when it's supported
         self.use_fused_rope = (
             VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE
-            and self.rotary_emb is not None
-            and self.qk_norm is None
-            and not self.attn_temperature_tuning
-        )
+            and self.rotary_emb is not None and self.qk_norm is None
+            and not self.attn_temperature_tuning)
         if self.use_fused_rope:
             extra_args["rotary_emb"] = self.rotary_emb
-        self.attn = attn_cls(
-            self.num_heads,
-            self.head_dim,
-            self.scaling,
-            num_kv_heads=self.num_kv_heads,
-            cache_config=cache_config,
-            quant_config=quant_config,
-            prefix=f"{prefix}.attn",
-            **extra_args)
+        self.attn = attn_cls(self.num_heads,
+                             self.head_dim,
+                             self.scaling,
+                             num_kv_heads=self.num_kv_heads,
+                             cache_config=cache_config,
+                             quant_config=quant_config,
+                             prefix=f"{prefix}.attn",
+                             **extra_args)
 
     def _get_attn_scale(self, positions: torch.Tensor) -> torch.Tensor:
         floor = torch.floor((positions + 1.0) / self.floor_scale)
@@ -246,7 +241,7 @@ class Llama4Attention(nn.Module):
         if self.use_fused_rope:
             assert not (
                 self.attn_temperature_tuning
-            ), f"{self.attn_temperature_tuning=} and {self.nope=} must be False with {VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE=}"
+            ), f"{self.attn_temperature_tuning=} must be False when using fused rope"
             attn_output = self.attn(q, k, v, positions=positions)
             output, _ = self.o_proj(attn_output)
             return output

@@ -30,11 +30,13 @@ logger = init_logger(__name__)
 USE_XFORMERS_OPS = None
 
 if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
-    VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = (
+        envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE)
 else:
     VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = False
 
 logger.info(f"[Aiter] {VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE=}")
+
 
 def check_xformers_availability():
     global USE_XFORMERS_OPS
@@ -262,12 +264,12 @@ class Attention(nn.Module, AttentionLayerBase):
                             if output_shape is not None else query.shape)
             if positions is not None:
                 output = torch.empty(output_shape,
-                                    dtype=query.dtype,
-                                    device=query.device)
+                                     dtype=query.dtype,
+                                     device=query.device)
             else:
                 output = torch.zeros(output_shape,
-                                    dtype=query.dtype,
-                                    device=query.device)
+                                     dtype=query.dtype,
+                                     device=query.device)
 
             hidden_size = output_shape[-1]
             # We skip reshaping query, key and value tensors for the MLA
@@ -290,15 +292,21 @@ class Attention(nn.Module, AttentionLayerBase):
                     attn_metadata = attn_metadata[self.layer_name]
                 self_kv_cache = self.kv_cache[forward_context.virtual_engine]
                 self.impl.forward(self,
-                                query,
-                                key,
-                                value,
-                                self_kv_cache,
-                                attn_metadata,
-                                output=output)
+                                  query,
+                                  key,
+                                  value,
+                                  self_kv_cache,
+                                  attn_metadata,
+                                  output=output)
             else:
                 torch.ops.vllm.unified_attention_with_output(
-                    query, key, value, output, self.layer_name, None, positions=positions)
+                    query,
+                    key,
+                    value,
+                    output,
+                    self.layer_name,
+                    None,
+                    positions=positions)
             return output.view(-1, hidden_size)
         else:
             if self.use_direct_call:
@@ -515,7 +523,7 @@ def unified_attention_with_output(
     output: torch.Tensor,
     layer_name: str,
     output_scale: Optional[torch.Tensor] = None,
-    positions:  Optional[torch.Tensor] = None,
+    positions: Optional[torch.Tensor] = None,
     output_block_scale: Optional[torch.Tensor] = None,
 ) -> None:
     wait_for_kv_layer_from_connector(layer_name)
@@ -526,42 +534,45 @@ def unified_attention_with_output(
     self = forward_context.no_compile_layers[layer_name]
     kv_cache = self.kv_cache[forward_context.virtual_engine]
 
-    from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
-    from vllm.v1.attention.backends.rocm_aiter_fa import AiterFlashAttentionImpl
     from vllm.v1.attention.backends.mla.rocm_aiter_mla import AiterMLAImpl
+    from vllm.v1.attention.backends.rocm_aiter_fa import (
+        AiterFlashAttentionImpl)
+    from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
+
     # Not all layers can use RoPE fusing, so check that they were given all
     # needed inputs along with the environment variable to enable this.
     if (
         hasattr(self.impl, "rotary_emb")
         and self.impl.rotary_emb is not None
         and positions is not None
-        and (
-            isinstance(self.impl, TritonAttentionImpl)
-            or isinstance(self.impl, AiterFlashAttentionImpl) 
-            or isinstance(self.impl, AiterMLAImpl)
+        and isinstance(
+            self.impl, (TritonAttentionImpl, AiterFlashAttentionImpl, AiterMLAImpl)
         )
     ):
-        assert VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE, f"Only expecting rotary_emb and positions when VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE is True."
+        assert (VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE
+                ), "rotary_emb and positions provided when unexpected."
         # fusing RoPE with flushing kv_cache operation
-        self.impl.forward(self,
-                        query,
-                        key,
-                        value,
-                        kv_cache,
-                        attn_metadata,
-                        output=output,
-                        output_scale=output_scale,
-                        positions=positions)
+        self.impl.forward(
+            self,
+            query,
+            key,
+            value,
+            kv_cache,
+            attn_metadata,
+            output=output,
+            output_scale=output_scale,
+            positions=positions,
+        )
     else:
         assert positions is None, f"positions must be None {positions=}"
         self.impl.forward(self,
-                        query,
-                        key,
-                        value,
-                        kv_cache,
-                        attn_metadata,
-                        output=output,
-                        output_scale=output_scale)
+                          query,
+                          key,
+                          value,
+                          kv_cache,
+                          attn_metadata,
+                          output=output,
+                          output_scale=output_scale)
 
     maybe_save_kv_layer_to_connector(layer_name, kv_cache)
 
@@ -573,7 +584,7 @@ def unified_attention_with_output_fake(
     output: torch.Tensor,
     layer_name: str,
     output_scale: Optional[torch.Tensor] = None,
-    positions:  Optional[torch.Tensor] = None,
+    positions: Optional[torch.Tensor] = None,
     output_block_scale: Optional[torch.Tensor] = None,
 ) -> None:
     return
