@@ -532,7 +532,6 @@ def unified_attention_with_output(
     # Not all layers can use RoPE fusing, so check that they were given all
     # needed inputs along with the environment variable to enable this.
     if (
-        
         and hasattr(self.impl, "rotary_emb")
         and self.impl.rotary_emb is not None
         and positions is not None
