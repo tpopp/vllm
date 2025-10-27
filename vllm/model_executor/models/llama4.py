@@ -46,6 +46,8 @@ from .utils import (AutoWeightsLoader, extract_layer_index, fast_topk,
 
 
 VLLM_ROCM_USE_AITER = current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER
+if VLLM_ROCM_USE_AITER:
+    import aiter
 
 class Llama4MoE(nn.Module):
 
