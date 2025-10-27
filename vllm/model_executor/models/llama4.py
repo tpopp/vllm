@@ -50,6 +50,8 @@ VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = (
     and envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE)
 
 
+VLLM_ROCM_USE_AITER = current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER
+
 class Llama4MoE(nn.Module):
 
     @staticmethod
@@ -57,12 +59,18 @@ class Llama4MoE(nn.Module):
         hidden_states: torch.Tensor,
         gating_output: torch.Tensor,
         topk: int,
-        renormalize: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        router_scores, router_indices = fast_topk(gating_output, topk, dim=-1)
-        # pseudo-standard is that the router scores are floats
-        router_scores = torch.sigmoid(router_scores.float())
-        return (router_scores, router_indices.to(torch.int32))
+        renormalize: bool) -> tuple[torch.Tensor, torch.Tensor]:
+        if VLLM_ROCM_USE_AITER:
+            tokens, _ = gating_output.shape
+            router_scores = torch.empty((tokens, topk), dtype=torch.float32, device=gating_output.device)
+            router_indices = torch.empty((tokens, topk), dtype=torch.int32, device=gating_output.device)
+            aiter.topk_sigmoid(router_scores, router_indices, gating_output)
+            return (router_scores, router_indices)
+        else:
+            router_scores, router_indices = fast_topk(gating_output, topk, dim=-1)
+            # pseudo-standard is that the router scores are floats
+            router_scores = torch.sigmoid(router_scores.float())
+            return (router_scores, router_indices.to(torch.int32))
 
     def __init__(self,
                  config: Llama4TextConfig,
