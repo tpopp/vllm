@@ -45,12 +45,13 @@ from .llama import LlamaForCausalLM, LlamaMLP, LlamaModel
 from .utils import (AutoWeightsLoader, extract_layer_index, fast_topk,
                     is_pp_missing_parameter)
 
-VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = (
-    current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER
-    and envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE)
-
 
 VLLM_ROCM_USE_AITER = current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER
+
+VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = (
+    VLLM_ROCM_USE_AITER
+    and envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE)
+
 
 class Llama4MoE(nn.Module):
 
