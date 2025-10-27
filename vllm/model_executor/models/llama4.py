@@ -47,6 +47,8 @@ from .utils import (AutoWeightsLoader, extract_layer_index, fast_topk,
 
 
 VLLM_ROCM_USE_AITER = current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER
+if VLLM_ROCM_USE_AITER:
+    import aiter
 
 VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = (
     VLLM_ROCM_USE_AITER
