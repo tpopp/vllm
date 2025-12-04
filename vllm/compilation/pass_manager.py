@@ -5,6 +5,7 @@ import functools
 from torch import fx as fx
 
 from vllm import envs
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -22,6 +23,9 @@ if current_platform.is_cuda_alike():
 
 if current_platform.is_cuda():
     from .collective_fusion import AllReduceFusionPass, AsyncTPPass
+
+if rocm_aiter_ops.is_enabled():
+    from .rocm_aiter_fusion import RocmAiterFusionPass
 
 from .fix_functionalization import FixFunctionalizationPass
 from .inductor_pass import CustomGraphPass, InductorPass, get_pass_context
@@ -92,6 +96,8 @@ class PostGradPassManager(CustomGraphPass):
 
         # Set the current vllm config to allow tracing CustomOp instances
         with set_current_vllm_config(config, check_compile=False):
+            if rocm_aiter_ops.is_enabled():
+                self.passes += [RocmAiterFusionPass(config)]
             if self.pass_config.eliminate_noops:
                 self.passes += [NoOpEliminationPass(config)]
 
