@@ -403,11 +403,13 @@ def test_aiter_fusion_rmsnorm_quant(
     monkeypatch: pytest.MonkeyPatch,
 ):
     force_kernel, group_shape, use_aiter_quant_op = kernel_groupshape_quant
+    custom_ops = ["+quant_fp8"] if use_aiter_quant_op else ["-quant_fp8"]
+    custom_ops += ["+rms_norm"]
     vllm_config = VllmConfig(
         model_config=ModelConfig(dtype=dtype),
         compilation_config=CompilationConfig(
             mode=CompilationMode.VLLM_COMPILE,
-            custom_ops=["+rms_norm", "+quant_fp8"],
+            custom_ops=custom_ops,
             pass_config=PassConfig(fuse_norm_quant=True, eliminate_noops=True),
         ),
     )
