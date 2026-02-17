@@ -71,6 +71,11 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+@torch.compile
+def sig_mul(expert_gate, out):
+    return F.sigmoid(expert_gate) * out
+
+
 class Qwen2MoeMLP(nn.Module):
     def __init__(
         self,
@@ -111,7 +116,7 @@ class Qwen2MoeMLP(nn.Module):
         out, _ = self.down_proj(out)
 
         if self.expert_gate is not None:
-            out = F.sigmoid(self.expert_gate(x)[0]) * out
+            out = sig_mul(self.expert_gate(x)[0], out)
 
         return out
 
