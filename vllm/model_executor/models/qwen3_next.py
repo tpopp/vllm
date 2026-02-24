@@ -484,16 +484,23 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
 
-    def fix_query_key_value_ordering(
+    @torch.compile(fullgraph=True)
+    def prepare_gdn_attention_core_inputs(
         self,
         mixed_qkvz,
         mixed_ba,
+        num_tokens,
     ):
         """
-        Derives `query`, `key` and `value` tensors from `mixed_qkvzba`.
+        Derives mixed_qkv, z, b, a, and initializes core_attn_out in a
+        single fused kernel launch to minimize launch overhead.
         """
-        new_tensor_shape_qkvz = mixed_qkvz.size()[:-1] + (
-            self.num_k_heads // self.tp_size,
+        base_shape_qkvz = mixed_qkvz.size()[:-1]
+        base_shape_ba = mixed_ba.size()[:-1]
+        ng = self.num_k_heads // self.tp_size
+
+        new_tensor_shape_qkvz = base_shape_qkvz + (
+            ng,
             (
                 self.head_k_dim
                 + self.head_k_dim
@@ -502,8 +509,8 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 // self.num_k_heads
             ),
         )
-        new_tensor_shape_ba = mixed_qkvz.size()[:-1] + (
-            self.num_k_heads // self.tp_size,
+        new_tensor_shape_ba = base_shape_ba + (
+            ng,
             2 * self.num_v_heads // self.num_k_heads,
         )
 
@@ -521,19 +528,62 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             self.num_v_heads // self.num_k_heads,
         ]
 
-        # [b, sq, ng, (hn + hn + np/ng * hn + np/ng + np/ng)]
-        # --> [b, sq, ng, hn], [b, sq, ng, hn], [b, sq, ng, np/ng * hn],
-        #  [b, sq, ng, np/ng * hn], [b, sq, ng, np/ng], [b, sq, ng, np/ng]
-        (query, key, value, z) = torch.split(mixed_qkvz, split_arg_list_qkvz, dim=2)
-        (b, a) = torch.split(mixed_ba, split_arg_list_ba, dim=2)
+        (query, key, value, z) = torch.split(mixed_qkvz, split_arg_list_qkvz, dim=-1)
+        (b, a) = torch.split(mixed_ba, split_arg_list_ba, dim=-1)
 
-        # [b, sq, ng, np/ng * hn] -> [b, sq, np, hn]
-        value = value.reshape(value.size(0), -1, self.head_v_dim)
-        z = z.reshape(z.size(0), -1, self.head_v_dim)
-        b = b.reshape(b.size(0), self.num_v_heads // self.tp_size)
-        a = a.reshape(a.size(0), self.num_v_heads // self.tp_size)
+        # 1. Interleave Q, K, V logically.
+        # Inside compile, this doesn't allocate memory yet; it just creates an indexing map.
+        mixed_qkv_logical = torch.cat([
+            query.reshape(num_tokens, -1),
+            key.reshape(num_tokens, -1),
+            value.reshape(num_tokens, -1)
+        ], dim=-1)
 
-        return query, key, value, z, b, a
+        # Note: we need zeros for the core_attn_out buffer
+        # see discussions in https://github.com/vllm-project/vllm/pull/28182
+        core_attn_zeros = torch.zeros(
+            num_tokens * (self.num_v_heads // self.tp_size) * self.head_v_dim,
+            dtype=mixed_qkvz.dtype,
+            device=mixed_qkvz.device
+        )
+
+        # We flatten everything into a 1D sequence and concatenate. Inductor will launch
+        # ONE Triton kernel to populate this single buffer.
+        fused = torch.cat([
+            mixed_qkv_logical.reshape(-1),
+            z.reshape(-1),
+            b.reshape(-1),
+            a.reshape(-1),
+            core_attn_zeros  # (Already 1D)
+        ], dim=0)
+
+        # 4. Calculate offsets dynamically to slice the buffer back out
+        curr = 0
+        qkv_numel = mixed_qkv_logical.numel()
+        z_numel = z.numel()
+        b_numel = b.numel()
+        a_numel = a.numel()
+        core_numel = core_attn_zeros.numel()
+
+        # 5. Slice and reshape (Zero-copy metadata changes)
+        mixed_qkv_out = fused[curr : curr + qkv_numel].view(num_tokens, -1)
+        curr += qkv_numel
+
+        z_out = fused[curr : curr + z_numel].view(num_tokens, -1, self.head_v_dim)
+        curr += z_numel
+
+        b_out = fused[curr : curr + b_numel].view(num_tokens, self.num_v_heads // self.tp_size)
+        curr += b_numel
+
+        a_out = fused[curr : curr + a_numel].view(num_tokens, self.num_v_heads // self.tp_size)
+        curr += a_numel
+
+        core_attn_out = fused[curr : curr + core_numel].view(
+            num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim
+        )
+
+        return mixed_qkv_out, z_out, b_out, a_out, core_attn_out
+
 
     def rearrange_mixed_qkv(self, mixed_qkv):
         if mixed_qkv is None:
@@ -572,25 +622,13 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         # ============================================================
         projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
         projected_states_ba, _ = self.in_proj_ba(hidden_states)
-        query, key, value, z, b, a = self.fix_query_key_value_ordering(
+        mixed_qkv, z, b, a, core_attn_out = self.prepare_gdn_attention_core_inputs(
             projected_states_qkvz, projected_states_ba
         )
-        query, key, value = map(
-            lambda x: rearrange(x, "l p d -> l (p d)"), (query, key, value)
-        )
-        mixed_qkv = torch.cat((query, key, value), dim=-1)
 
         # ============================================================
         # Part 2: Core Attention (Custom Op)
         # ============================================================
-        # Note: we should not use torch.empty here like other attention backends,
-        # see discussions in https://github.com/vllm-project/vllm/pull/28182
-        core_attn_out = torch.zeros(
-            (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
-
         torch.ops.vllm.gdn_attention_core(
             mixed_qkv,
             b,
