@@ -554,6 +554,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         value = rearrange(value, "l (h d) -> 1 l h d", d=self.head_v_dim)
         return query.contiguous(), key.contiguous(), value.contiguous()
 
+    @torch.compile
     def forward(
         self,
         hidden_states: torch.Tensor,
