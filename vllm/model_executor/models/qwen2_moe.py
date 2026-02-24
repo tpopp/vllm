@@ -71,11 +71,6 @@ from .utils import (
 logger = init_logger(__name__)
 
 
-@torch.compile
-def sig_mul(expert_gate, out):
-    return F.sigmoid(expert_gate) * out
-
-
 class Qwen2MoeMLP(nn.Module):
     def __init__(
         self,
@@ -110,6 +105,7 @@ class Qwen2MoeMLP(nn.Module):
         self.act_fn = SiluAndMul()
         self.expert_gate = expert_gate
 
+    @torch.compile
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
         out = self.act_fn(gate_up)
