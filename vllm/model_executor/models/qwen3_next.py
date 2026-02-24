@@ -535,24 +535,44 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
 
         return query, key, value, z, b, a
 
+	@torch.compile(fullgraph=True)
     def rearrange_mixed_qkv(self, mixed_qkv):
         if mixed_qkv is None:
             return None, None, None
+            
+        l = mixed_qkv.shape[0]
+        q_dim = self.key_dim // self.tp_size
+        k_dim = self.key_dim // self.tp_size
+        v_dim = self.value_dim // self.tp_size
+
+        # 1. Create the non-contiguous 2D views
         query, key, value = torch.split(
-            mixed_qkv,
-            [
-                self.key_dim // self.tp_size,
-                self.key_dim // self.tp_size,
-                self.value_dim // self.tp_size,
-            ],
-            dim=-1,
+            mixed_qkv, 
+            [q_dim, k_dim, v_dim], 
+            dim=-1
         )
-        query, key = map(
-            lambda x: rearrange(x, "l (h d) -> 1 l h d", d=self.head_k_dim),
-            (query, key),
-        )
-        value = rearrange(value, "l (h d) -> 1 l h d", d=self.head_v_dim)
-        return query.contiguous(), key.contiguous(), value.contiguous()
+        
+        # 2. Flatten and concatenate to force a single triton graph.
+        fused = torch.cat([
+            query.reshape(-1), 
+            key.reshape(-1), 
+            value.reshape(-1)
+        ], dim=0)
+        
+        # 3. Slice the single buffer. 
+        q_size = l * q_dim
+        k_size = l * k_dim
+        
+        q_contig = fused[0 : q_size]
+        k_contig = fused[q_size : q_size + k_size]
+        v_contig = fused[q_size + k_size : ]
+        
+        # 4. Zero cost reshape
+        query = q_contig.view(1, l, -1, self.head_k_dim)
+        key = k_contig.view(1, l, -1, self.head_k_dim)
+        value = v_contig.view(1, l, -1, self.head_v_dim)
+
+        return query, key, value
 
     def forward(
         self,
