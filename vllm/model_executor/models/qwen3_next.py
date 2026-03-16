@@ -10,6 +10,7 @@ from einops import rearrange
 from torch import nn
 from transformers.activations import ACT2FN
 
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import (
     CacheConfig,
@@ -264,7 +265,17 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             prefix=f"{prefix}.shared_expert_gate",
         )
 
-        if config.shared_expert_intermediate_size > 0:
+        self.is_fusion_moe_shared_experts_enabled = (
+            rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
+        )
+        self.n_shared_experts = 1
+
+        if (
+            self.is_fusion_moe_shared_experts_enabled
+            or config.shared_expert_intermediate_size <= 0
+        ):
+            self.shared_expert = None
+        else:
             self.shared_expert = Qwen3NextMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.shared_expert_intermediate_size,
@@ -274,8 +285,6 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 expert_gate=self.shared_expert_gate,
                 prefix=f"{prefix}.shared_expert",
             )
-        else:
-            self.shared_expert = None
 
         self.experts = SharedFusedMoE(
             shared_experts=self.shared_expert,
@@ -284,13 +293,16 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
-            reduce_results=False,
+            reduce_results=self.is_fusion_moe_shared_experts_enabled,
             renormalize=getattr(config, "norm_topk_prob", True),
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,
             is_sequence_parallel=self.is_sequence_parallel,
+            n_shared_experts=self.n_shared_experts
+            if self.is_fusion_moe_shared_experts_enabled
+            else None,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -314,6 +326,9 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 hidden_states=hidden_states, router_logits=router_logits
             )
 
+        if self.is_fusion_moe_shared_experts_enabled:
+            _, final_hidden_states = final_hidden_states
+
         if self.shared_expert is not None:
             final_hidden_states = final_hidden_states[0] + final_hidden_states[1]
 
@@ -327,7 +342,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 final_hidden_states
             )
 
-        return final_hidden_states.view(orig_shape)
+        return final_hidden_states.view(num_tokens, hidden_dim)
 
 
 class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
@@ -1169,7 +1184,8 @@ class Qwen3NextModel(nn.Module):
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=getattr(self.config, "num_experts", 0),
+            num_experts=self.config.num_experts
+            + (1 if rocm_aiter_ops.is_fusion_moe_shared_experts_enabled() else 0),
             num_redundant_experts=self.num_redundant_experts,
         )
 
@@ -1199,11 +1215,18 @@ class Qwen3NextModel(nn.Module):
                 if name is None:
                     continue
 
+            is_fusion_moe_shared_experts_layer = (
+                rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
+                and ("mlp.shared_expert" in name)
+            )
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
 
                 if "mlp.experts" in name:
+                    continue
+                if is_fusion_moe_shared_experts_layer:
                     continue
 
                 name = name.replace(weight_name, param_name)
@@ -1221,48 +1244,99 @@ class Qwen3NextModel(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                for mapping in expert_params_mapping:
-                    param_name, weight_name, expert_id, shard_id = mapping
-                    if weight_name not in name:
-                        continue
-                    name = name.replace(weight_name, param_name)
-                    # Skip layers on other devices.
-                    if is_pp_missing_parameter(name, self):
-                        continue
-                    # Skip loading extra bias for GPTQ models.
-                    if (
-                        name.endswith(".bias") or name.endswith("_bias")
-                    ) and name not in params_dict:
-                        continue
-                    if name not in params_dict:
-                        continue
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    weight_loader(
-                        param,
-                        loaded_weight,
-                        name,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
+                # Special handling: when AITER fusion_shared_experts is enabled,
+                # checkpoints may provide a single widened shared_experts tensor
+                # without explicit expert indices
+                # (e.g. ...mlp.shared_experts.gate_proj.weight).
+                # For models with multiple shared experts, split that tensor
+                # evenly into per-shared-expert slices and load them into
+                # appended expert slots mlp.experts.{n_routed_experts + j}.*
+                # accordingly.
+                num_chunks = 1
+                if is_fusion_moe_shared_experts_layer:
+                    num_chunks = getattr(self.config, "n_shared_experts", 1) or 1
+                    # Determine split axis based on op type
+                    # gate/up: ColumnParallel → split along dim 0
+                    # down: RowParallel → split along dim 1
+                    split_dim = (
+                        1
+                        if ("down_proj.weight" in name and loaded_weight.ndim > 1)
+                        else 0
                     )
-                    break
-                else:
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    if is_pp_missing_parameter(name, self):
-                        continue
-                    if name not in params_dict:
-                        logger.warning_once(
-                            f"Parameter {name} not found in params_dict, skip loading"
+                    total = loaded_weight.shape[split_dim]
+                    assert total % num_chunks == 0, (
+                        f"Shared expert weight dim {total} "
+                        f"not divisible by num_chunks {num_chunks}"
+                    )
+                    chunk_size = total // num_chunks
+
+                for j in range(num_chunks):
+                    chunk_name = name
+                    weight_to_load = loaded_weight
+
+                    if is_fusion_moe_shared_experts_layer:
+                        chunk_slice = slice(j * chunk_size, (j + 1) * chunk_size)
+                        if loaded_weight.ndim == 1:
+                            weight_to_load = loaded_weight[chunk_slice]
+                        elif split_dim == 0:
+                            weight_to_load = loaded_weight[chunk_slice, :]
+                        else:
+                            weight_to_load = loaded_weight[:, chunk_slice]
+                        # Synthesize an expert-style name so expert mapping
+                        # can route it
+                        chunk_name = name.replace(
+                            "mlp.shared_expert",
+                            f"mlp.experts.{self.config.num_experts + j}",
                         )
-                        continue
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-            loaded_params.add(name)
+
+                    for mapping in expert_params_mapping:
+                        param_name, weight_name, expert_id, shard_id = mapping
+                        if weight_name not in name:
+                            continue
+                        name = name.replace(weight_name, param_name)
+                        # Skip layers on other devices.
+                        if is_pp_missing_parameter(name, self):
+                            continue
+                        # Skip loading extra bias for GPTQ models.
+                        if (
+                            name.endswith(".bias") or name.endswith("_bias")
+                        ) and name not in params_dict:
+                            continue
+                        if name not in params_dict:
+                            continue
+                        param = params_dict[name]
+                        weight_loader = param.weight_loader
+                        success = weight_loader(
+                            param,
+                            weight_to_load,
+                            name,
+                            shard_id=shard_id,
+                            expert_id=expert_id,
+                        )
+                        if success:
+                            if not is_fusion_moe_shared_experts_layer:
+                                name = name_mapped
+                            else:
+                                loaded_params.add(name_mapped)
+                        break
+                    else:
+                        # Skip loading extra bias for GPTQ models.
+                        if name.endswith(".bias") and name not in params_dict:
+                            continue
+                        if is_pp_missing_parameter(name, self):
+                            continue
+                        if name not in params_dict:
+                            logger.warning_once(
+                                f"Parameter {name} not found in params_dict, skip loading"
+                            )
+                            continue
+                        param = params_dict[name]
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, loaded_weight)
+            if name is not None and not is_fusion_moe_shared_experts_layer:
+                loaded_params.add(name)
         return loaded_params
 
 
