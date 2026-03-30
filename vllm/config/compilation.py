@@ -136,8 +136,9 @@ class PassConfig:
     """Enable flashinfer allreduce fusion."""
     fuse_minimax_qk_norm: bool = None  # type: ignore[assignment]
     """Enable fused allreduce+RMSNorm for MiniMax QK norm."""
-    enable_qk_norm_rope_fusion: bool = False
-    """Enable fused Q/K RMSNorm + RoPE pass."""
+    enable_qk_norm_rope_fusion: bool = Field(default=None)
+    """Enable fused Q/K RMSNorm + RoPE pass.
+    Auto-enabled at O1+ for models with QK-norm layers (e.g. Qwen3)."""
 
     # ROCm/AITER specific fusions
     fuse_act_padding: bool = None  # type: ignore[assignment]
@@ -146,10 +147,16 @@ class PassConfig:
     """Fuse paired q/kv RMS norms in MLA attention."""
     fuse_rope_kvcache: bool = None  # type: ignore[assignment]
     """Fuse the QK rope + KV cache ops."""
+    enable_fuse_qk_norm_rope_kvcache: bool = Field(default=None)
+    """Fuse QK RMSNorm + RoPE + KV cache update into a single AITER HIP
+    kernel. Supersedes both enable_qk_norm_rope_fusion and fuse_rope_kvcache
+    for layers that support it. Auto-enabled at O1+ on ROCm for models
+    with QK-norm (e.g. Qwen3-MoE)."""
 
     rope_kvcache_fusion_max_token_num: int = 256
     """The threshold for ROCm AITER RoPE+KVCache fusion e.g. for small batch decode.
     Larger batch sizes e.g. during prefill will use the unfused kernels.
+    Also applies to the fused QK-Norm+RoPE+KVCache pass.
     """
 
     fi_allreduce_fusion_max_size_mb: float | None = None
@@ -228,6 +235,7 @@ class PassConfig:
         "fuse_act_padding",
         "fuse_mla_dual_rms_norm",
         "fuse_rope_kvcache",
+        "enable_qk_norm_rope_fusion",
         mode="wrap",
     )
     @classmethod
@@ -293,11 +301,15 @@ class PassConfig:
         after all defaults are finalized.
         TODO also log the compile ranges for which this is enabled.
         """
-        enabled_fusions = [
-            f.name[len("fuse_") :]
-            for f in fields(self)  # type: ignore[arg-type]
-            if getattr(self, f.name) and f.name.startswith("fuse_")
-        ]
+        fusion_prefixes = ("fuse_", "enable_")
+        enabled_fusions = []
+        for f in fields(self):
+            if not getattr(self, f.name):
+                continue
+            for prefix in fusion_prefixes:
+                if f.name.startswith(prefix):
+                    enabled_fusions.append(f.name[len(prefix) :])
+                    break
 
         if enabled_fusions:
             logger.info_once(
