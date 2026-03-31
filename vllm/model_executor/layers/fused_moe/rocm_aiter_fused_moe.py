@@ -480,4 +480,4 @@ class AiterExperts(mk.FusedMoEExpertsModular):
             num_local_tokens=num_local_tokens,
             output_dtype=output.dtype,
         )
-        output.copy_(result)
+        output.data = result
