@@ -10,6 +10,7 @@ from typing import final
 import torch
 
 import vllm.envs as envs
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import (
@@ -1363,7 +1364,7 @@ class FusedMoEModularKernel(torch.nn.Module):
 
         # Aiter don't use temp buffer, so can skip copy if output is contiguous
         if (
-            current_platform.is_rocm()
+            rocm_aiter_ops.is_fused_moe_enabled()
             and not self.inplace
             and fused_out.shape == output.shape
             and fused_out.is_contiguous()
