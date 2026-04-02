@@ -302,6 +302,8 @@ class RocmAttentionImpl(AttentionImpl):
                 f"num_heads: {num_heads}."
             )
 
+        self._need_kv_flash_permute = False
+
     def _forward_encoder_attention(
         self,
         query: torch.Tensor,
@@ -408,7 +410,8 @@ class RocmAttentionImpl(AttentionImpl):
             )
 
         key_cache, value_cache = PagedAttention.split_kv_cache(
-            kv_cache, self.num_kv_heads, self.head_size
+            kv_cache, self.num_kv_heads, self.head_size,
+            need_kv_flash_permute=self._need_kv_flash_permute,
         )
 
         if is_quantized_kv_cache(self.kv_cache_dtype):
@@ -498,6 +501,9 @@ class RocmAttentionImpl(AttentionImpl):
     def fused_qk_norm_rope_kvcache_supported(self):
         return rocm_aiter_ops.is_enabled()
 
+    def set_fused_kv_cache_layout(self):
+        self._need_kv_flash_permute = True
+
     def do_qk_norm_rope_kvcache_update(self,
         layer: AttentionLayer,
         qkv: torch.Tensor,
@@ -582,7 +588,7 @@ class RocmAttentionImpl(AttentionImpl):
             layer.num_kv_heads,  # type: ignore[attr-defined]
             layer.head_size,  # type: ignore[attr-defined]
         )
-        flash_layout = False
+        flash_layout = self._need_kv_flash_permute
 
         is_fp8_kv_cache = is_quantized_kv_cache(self.kv_cache_dtype)
         if is_fp8_kv_cache:
