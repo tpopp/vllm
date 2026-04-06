@@ -112,6 +112,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_PAGED_ATTN: bool = False
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_MOE: bool = True
+    VLLM_ROCM_AITER_MOE_DISPATCH_POLICY: int = 0
     VLLM_ROCM_USE_AITER_RMSNORM: bool = True
     VLLM_ROCM_USE_AITER_MLA: bool = True
     VLLM_ROCM_USE_AITER_MHA: bool = True
@@ -988,6 +989,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # By default is enabled.
     "VLLM_ROCM_USE_AITER_MOE": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_MOE", "True").lower() in ("true", "1")
+    ),
+    # MoE sorting dispatch policy passed to AITER fused MoE kernels.
+    # 0 = default, 1 or 2 = alternative policies (best value is
+    # model/workload-dependent). Requires ROCm/aiter#2576.
+    "VLLM_ROCM_AITER_MOE_DISPATCH_POLICY": lambda: int(
+        os.getenv("VLLM_ROCM_AITER_MOE_DISPATCH_POLICY", "0")
     ),
     # use aiter rms norm op if aiter ops are enabled.
     "VLLM_ROCM_USE_AITER_RMSNORM": lambda: (
