@@ -371,6 +371,50 @@ class MoERunnerBase(MoERunner):
             assert shared_experts_input is not None
             self._shared_experts.apply(shared_experts_input, order)
 
+    def _inject_fse_weights(
+        self,
+        layer: torch.nn.Module,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        num_fused_shared: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Inject shared expert gate values into the topk buffer for AITER
+        Fused Shared Expert (FSE) support.
+
+        When FSE is enabled, the shared expert is fused into the MoE kernel
+        as an extra expert slot. This method computes the shared expert gate
+        (sigmoid) and injects it into the pre-allocated topk buffer.
+        """
+        from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
+            inject_shared_expert_weights,
+        )
+
+        shared_expert_gate = getattr(layer, "_shared_expert_gate", None)
+        if shared_expert_gate is not None:
+            gate_logits, _ = shared_expert_gate(hidden_states)
+            top_k = getattr(layer, "top_k", topk_weights.shape[1])
+            if topk_weights.shape[1] > top_k:
+                # GroupedTopKRouter already returned the combined buffer;
+                # write sigmoid values directly into the shared expert slot.
+                torch.sigmoid(
+                    gate_logits,
+                    out=topk_weights[:, top_k : top_k + num_fused_shared],
+                )
+                shared_expert_weights = None
+            else:
+                shared_expert_weights = torch.sigmoid(gate_logits)
+        else:
+            shared_expert_weights = None
+
+        return inject_shared_expert_weights(
+            topk_weights,
+            topk_ids,
+            topk=getattr(layer, "top_k", topk_weights.shape[1]),
+            num_fused_shared_experts=num_fused_shared,
+            shared_expert_weights=shared_expert_weights,
+        )
+
     def _apply_quant_method(
         self,
         layer: torch.nn.Module,
@@ -396,6 +440,15 @@ class MoERunnerBase(MoERunner):
                 hidden_states=hidden_states,
                 router_logits=router_logits,
             )
+
+            # AITER FSE: inject shared expert gate weights into the
+            # topk buffer so the fused kernel handles shared experts.
+            num_fused_shared = getattr(layer, "num_fused_shared_experts", 0)
+            if num_fused_shared > 0:
+                topk_weights, topk_ids = self._inject_fse_weights(
+                    layer, hidden_states, topk_weights, topk_ids,
+                    num_fused_shared,
+                )
 
             # Passing shared_experts_input in case SharedExpertsOrder is
             # NO_OVERLAP or MK_INTERNAL_OVERLAPPED.
