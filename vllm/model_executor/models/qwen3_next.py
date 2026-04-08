@@ -167,7 +167,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,
             is_sequence_parallel=self.is_sequence_parallel,
-            n_shared_experts=1 if self.is_fse_enabled else None,
+            n_shared_experts=1 if self.is_fse_enabled else 0,
         )
         if self.is_fse_enabled:
             self.experts._shared_expert_gate = self.shared_expert_gate
@@ -195,7 +195,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
 
         if self.shared_expert is not None:
             final_hidden_states = final_hidden_states[0] + final_hidden_states[1]
-        elif self.is_fse_enabled:
+        else:
             _, final_hidden_states = final_hidden_states
 
         if self.is_sequence_parallel:
