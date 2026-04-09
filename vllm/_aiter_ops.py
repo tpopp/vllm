@@ -1773,7 +1773,7 @@ class rocm_aiter_ops:
 
         gemm_afp4wfp4(x_q, weight, x_s, weight_scale.T, out_dtype, y)
         return y
-    
+
     @staticmethod
     def hip_qk_norm_rope_and_cache(
         qkv: torch.Tensor,
@@ -1830,8 +1830,6 @@ class rocm_aiter_ops:
             block_size,
             x,
         )
-        
-        
 
     @staticmethod
     def triton_rope_and_cache(
