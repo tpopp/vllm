@@ -807,6 +807,14 @@ class AttentionImpl(AttentionImplBase[T], Generic[T]):
         """
         return False
 
+    def fused_qk_norm_rope_kvcache_supported(self):
+        """
+        Does this attention implementation support fused QKNorm+RoPE+KVCache fusion.
+        This is used by the QkNormRopeKvCachePattern to only fuse the QKNorm ops
+        with the RoPE ops and the KV cache update for implementations that support it.
+        """
+        return False
+
     def set_fused_kv_cache_layout(self):
         """Called by the fusion pass after confirming this layer will use
         the fused kernel. Backends that need to adjust their KV cache read
@@ -820,7 +828,7 @@ class AttentionImpl(AttentionImplBase[T], Generic[T]):
         with the KV cache update for implementations that support it.
         """
         return False
-    
+
     def do_qk_norm_rope_kvcache_update(self,
         layer: AttentionLayer,
         qkv: torch.Tensor,
