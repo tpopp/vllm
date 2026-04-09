@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from typing import Any
 
 import torch
 import torch._inductor.pattern_matcher as pm
@@ -25,7 +26,6 @@ from .act_quant_fusion import ActivationQuantPattern
 from .matcher_utils import (
     MatcherFusedAddRMSNorm,
     MatcherQuantFP8,
-    MatcherRMSNorm,
     MatcherSiluAndMul,
 )
 from .rms_quant_fusion import (
@@ -42,16 +42,22 @@ class AiterRMSNormQuantPattern:
     ):
         self.epsilon = epsilon
         self.quant_dtype = key.quant.dtype
+        self.device = torch.device("cuda")
 
-        self.rmsnorm_matcher = (
-            MatcherRMSNorm(epsilon, match_rocm_aiter=True)
-            if not key.fused_add
-            else MatcherFusedAddRMSNorm(epsilon, match_rocm_aiter=True)
-        )
+        if key.fused_add:
+            self.rmsnorm_matcher = MatcherFusedAddRMSNorm(
+                epsilon, match_rocm_aiter=True
+            )
         self.quant_matcher = MatcherQuantFP8(
             key.quant,
             match_rocm_aiter=match_aiter_quant,
         )
+
+    def empty(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+        return torch.empty(*args, dtype=torch.bfloat16, device=self.device, **kwargs)
+
+    def empty_f32(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+        return torch.empty(*args, dtype=torch.float32, device=self.device, **kwargs)
 
 
 class AiterRMSNormDynamicQuantPattern(AiterRMSNormQuantPattern):
@@ -80,7 +86,7 @@ class AiterRMSNormDynamicQuantPattern(AiterRMSNormQuantPattern):
             input: torch.Tensor,
             weight: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            result_rms = self.rmsnorm_matcher(input, weight)
+            result_rms = torch.ops.vllm_ir.rms_norm(input, weight, self.epsilon)
             result, scale = self.quant_matcher(result_rms)
             return result, scale
 
@@ -100,7 +106,8 @@ class AiterRMSNormDynamicQuantPattern(AiterRMSNormQuantPattern):
         pm.register_replacement(
             pattern,
             replacement,
-            self.rmsnorm_matcher.inputs(),
+            # input, weight
+            [self.empty(5, 16), self.empty(16)],
             pm.fwd_only,
             pm_pass,
         )
@@ -189,7 +196,7 @@ class AiterRMSFp8GroupQuantPattern(AiterRMSNormQuantPattern):
             input: torch.Tensor,
             weight: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            result_rms = self.rmsnorm_matcher(input, weight)
+            result_rms = torch.ops.vllm_ir.rms_norm(input, weight, self.epsilon)
             result, scale = self.quant_matcher(result_rms)
             return result, scale
 
@@ -207,7 +214,12 @@ class AiterRMSFp8GroupQuantPattern(AiterRMSNormQuantPattern):
             return at[0], at[1]
 
         pm.register_replacement(
-            pattern, replacement, self.rmsnorm_matcher.inputs(), pm.fwd_only, pm_pass
+            pattern,
+            replacement,
+            # input, weight
+            [self.empty(5, 16), self.empty(16)],
+            pm.fwd_only,
+            pm_pass,
         )
 
 
