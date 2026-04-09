@@ -302,7 +302,7 @@ class RocmAttentionImpl(AttentionImpl):
                 f"num_heads: {num_heads}."
             )
 
-        self._need_kv_flash_permute = False
+        self._use_interleaved_v_cache = False
 
         self._cached_k_scale_val: float | None = None
         self._cached_k_scale_cpu: torch.Tensor | None = None
@@ -416,7 +416,6 @@ class RocmAttentionImpl(AttentionImpl):
 
         key_cache, value_cache = PagedAttention.split_kv_cache(
             kv_cache, self.num_kv_heads, self.head_size,
-            need_kv_flash_permute=self._need_kv_flash_permute,
         )
 
         if is_quantized_kv_cache(self.kv_cache_dtype):
@@ -454,6 +453,7 @@ class RocmAttentionImpl(AttentionImpl):
             output_scale=output_scale,
             sinks=self.sinks,
             causal=attn_metadata.causal,
+            use_interleaved_v_cache=self._use_interleaved_v_cache,
         )
 
         return output
@@ -507,7 +507,7 @@ class RocmAttentionImpl(AttentionImpl):
         return rocm_aiter_ops.is_enabled()
 
     def set_fused_kv_cache_layout(self):
-        self._need_kv_flash_permute = True
+        self._use_interleaved_v_cache = True
 
     def do_qk_norm_rope_kvcache_update(self,
         layer: AttentionLayer,
@@ -534,11 +534,12 @@ class RocmAttentionImpl(AttentionImpl):
         num_heads_k = layer.num_kv_heads
         num_heads_v = layer.num_kv_heads
         head_dim = layer.head_size
-        use_shuffle_layout = rocm_aiter_ops.is_shuffle_kv_cache_enabled()
+        use_shuffle_layout = (self._use_interleaved_v_cache
+                              or rocm_aiter_ops.is_shuffle_kv_cache_enabled())
         block_size = key_cache.shape[1]
         x = 16 // key_cache.element_size()
 
-        # Cache CPU scalar tensors for scales so the C++ kernel's .item()
+        # Use CPU scalar tensors for scales so the C++ kernel's .item()
         # call doesn't trigger a device-to-host sync during CUDA graph capture.
         k_scale_val = layer._k_scale_float
         v_scale_val = layer._v_scale_float
@@ -599,7 +600,7 @@ class RocmAttentionImpl(AttentionImpl):
             layer.num_kv_heads,  # type: ignore[attr-defined]
             layer.head_size,  # type: ignore[attr-defined]
         )
-        flash_layout = self._need_kv_flash_permute
+        flash_layout = False
 
         is_fp8_kv_cache = is_quantized_kv_cache(self.kv_cache_dtype)
         if is_fp8_kv_cache:
