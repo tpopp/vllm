@@ -62,19 +62,60 @@ def unify_reshape_batch_dim(graph: fx.Graph) -> None:
     for node in graph.nodes:
         if node.op != "call_function" or node.target is not aten_reshape:
             continue
+        inp = node.args[0]
         shape_arg = node.args[1]
-        if not isinstance(shape_arg, (list, tuple)):
+        if not isinstance(shape_arg, (list, tuple)) or len(shape_arg) == 0:
             continue
+
+        # Only replace position 0 when the input tensor's dim-0 matches
+        # the batch node.  A ``-1`` that must infer a *product* of
+        # dimensions (e.g. batch*heads) would be wrong to replace.
+        s = shape_arg[0]
+        if not (
+            s == -1
+            or (isinstance(s, torch.SymInt) and not isinstance(s, torch.fx.Node))
+        ):
+            continue
+
+        # Check that the input's dim-0 is the batch dimension by
+        # comparing its FakeTensor metadata.
+        inp_meta = inp.meta.get("val") if isinstance(inp, torch.fx.Node) else None
+        if inp_meta is None:
+            continue
+        inp_dim0 = inp_meta.shape[0]
+        batch_meta = (
+            batch_node.meta.get("val")
+            if isinstance(batch_node, torch.fx.Node)
+            else None
+        )
+        batch_val = batch_meta if batch_meta is not None else batch_node
+        if inp_dim0 != batch_val:
+            continue
+
+        # Verify that replacing -1 with batch_node produces a reshape with
+        # the same total element count.  Compare product(inp.shape[1:])
+        # with product(shape_arg[1:]).  If they differ, -1 was meant to
+        # absorb extra dimensions (e.g. batch*heads) and must not be
+        # replaced by the batch node alone.
+        try:
+            inp_rest = 1
+            for d in inp_meta.shape[1:]:
+                inp_rest = inp_rest * d
+            tgt_rest = 1
+            can_verify = True
+            for d in shape_arg[1:]:
+                if isinstance(d, torch.fx.Node):
+                    can_verify = False
+                    break
+                tgt_rest = tgt_rest * d
+            if can_verify and inp_rest != tgt_rest:
+                continue
+        except (TypeError, ValueError):
+            continue
+
         new_shape = list(shape_arg)
-        changed = False
-        for i, s in enumerate(new_shape):
-            if s == -1 or (
-                isinstance(s, torch.SymInt) and not isinstance(s, torch.fx.Node)
-            ):
-                new_shape[i] = batch_node
-                changed = True
-        if changed:
-            node.args = (node.args[0], new_shape)
+        new_shape[0] = batch_node
+        node.args = (node.args[0], new_shape)
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +175,75 @@ direct_register_custom_op(
     op_func=fused_qk_norm_rope_and_unified_kv_cache_update_impl,
     mutates_args=["q_out", "k_out"],
     fake_impl=fused_qk_norm_rope_and_unified_kv_cache_update_fake,
+)
+
+
+# ---------------------------------------------------------------------------
+# Custom op: Triton-based fused QKV split + QK-norm + RoPE + KV cache update
+# ---------------------------------------------------------------------------
+
+
+def fused_triton_qk_norm_rope_kvcache_update_impl(
+    q_out: torch.Tensor,
+    k_out: torch.Tensor,
+    v_out: torch.Tensor,
+    gate_out: torch.Tensor | None,
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    rms_norm_eps: float,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+    attn_output_gate: bool,
+    layer_name: str = "",
+) -> torch.Tensor:
+    _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(layer_name)
+    if layer_slot_mapping is not None:
+        attn_layer.impl.do_triton_qk_norm_rope_kvcache_update(
+            attn_layer,
+            qkv,
+            q_out,
+            k_out,
+            v_out,
+            gate_out,
+            positions,
+            q_weight,
+            k_weight,
+            rms_norm_eps,
+            cos_sin_cache,
+            is_neox,
+            kv_cache,
+            layer_slot_mapping,
+            attn_output_gate=attn_output_gate,
+        )
+
+    return torch.empty(0, device=qkv.device, dtype=qkv.dtype)
+
+
+def fused_triton_qk_norm_rope_kvcache_update_fake(
+    q_out: torch.Tensor,
+    k_out: torch.Tensor,
+    v_out: torch.Tensor,
+    gate_out: torch.Tensor | None,
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    rms_norm_eps: float,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+    attn_output_gate: bool,
+    layer_name: str = "",
+) -> torch.Tensor:
+    return torch.empty(0, device=qkv.device, dtype=qkv.dtype)
+
+
+direct_register_custom_op(
+    op_name="fused_triton_qk_norm_rope_kvcache_update",
+    op_func=fused_triton_qk_norm_rope_kvcache_update_impl,
+    mutates_args=["q_out", "k_out", "v_out", "gate_out"],
+    fake_impl=fused_triton_qk_norm_rope_kvcache_update_fake,
 )
 
 
@@ -309,6 +419,310 @@ class QkNormRopeKvCachePattern:
 
 
 # ---------------------------------------------------------------------------
+# Pattern: Qwen3Next QK-norm + RoPE + unified_kv_cache_update (with gate)
+# ---------------------------------------------------------------------------
+
+
+class Qwen3NextQkNormRopeKvCachePattern:
+    """
+    Extend ``QkNormRopeKvCachePattern`` for the Qwen3Next attention layout.
+
+    When *attn_output_gate* is True the QKV projection emits ``[q||gate, k, v]``
+    where the q portion is doubled.  The pattern matches the gate extraction
+    (view → chunk → reshape) before the standard QK-norm + RoPE + KV-cache
+    sequence.  The replacement delegates to the Triton-based
+    ``fused_qkv_split_qk_norm_rope_cache`` kernel which handles the split,
+    norm, RoPE, gate extraction, and KV cache update in a single launch.
+
+    When *attn_output_gate* is False the pattern is identical to
+    ``QkNormRopeKvCachePattern``.
+    """
+
+    FUSED_OP = torch.ops.vllm.fused_triton_qk_norm_rope_kvcache_update.default
+
+    def __init__(
+        self,
+        layer: Attention,
+        eps: float,
+        is_neox: bool,
+        attn_output_gate: bool,
+        rope_flashinfer: bool = False,
+        match_rocm_aiter_rms: bool = False,
+        match_rocm_aiter_rope: bool = False,
+    ) -> None:
+        self.layer_name = layer.layer_name
+        self.num_heads = layer.num_heads
+        self.num_kv_heads = layer.num_kv_heads
+        self.head_size = layer.head_size
+        self.head_size_v = layer.head_size_v
+        self.eps = eps
+        self.is_neox = is_neox
+        self.rope_flashinfer = rope_flashinfer
+        self.attn_output_gate = attn_output_gate
+
+        self.q_size = self.num_heads * self.head_size
+        self.k_size = self.num_kv_heads * self.head_size
+        self.v_size = self.num_kv_heads * self.head_size_v
+
+        self.rmsnorm_matcher = MatcherRMSNorm(
+            eps, match_rocm_aiter=match_rocm_aiter_rms
+        )
+        self.rope_matcher = MatcherRotaryEmbedding(
+            is_neox=is_neox,
+            head_size=self.head_size,
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            use_flashinfer=rope_flashinfer,
+            match_rocm_aiter=(match_rocm_aiter_rope if match_rocm_aiter_rope else None),
+        )
+
+    def get_inputs(self) -> list[torch.Tensor]:
+        T = 5
+        L = 4096
+        q_portion = self.q_size * 2 if self.attn_output_gate else self.q_size
+        qkv = empty_bf16(T, q_portion + self.k_size + self.v_size)
+        positions = empty_i64(T)
+        q_weight = empty_bf16(1, self.head_size)
+        k_weight = empty_bf16(1, self.head_size)
+        if self.rope_flashinfer:
+            cos_sin_cache = empty_fp32(L, self.head_size)
+        else:
+            cos_sin_cache = empty_bf16(L, self.head_size)
+        return [qkv, positions, q_weight, k_weight, cos_sin_cache]
+
+    def register(self, pm_pass: PatternMatcherPass) -> None:
+        num_heads = self.num_heads
+        num_kv_heads = self.num_kv_heads
+        head_dim = self.head_size
+        head_dim_v = self.head_size_v
+        q_size = self.q_size
+        k_size = self.k_size
+        v_size = self.v_size
+        layer_name = self.layer_name
+        eps = self.eps
+        is_neox = self.is_neox
+        attn_output_gate = self.attn_output_gate
+
+        rmsnorm_matcher = self.rmsnorm_matcher
+        rope_matcher = self.rope_matcher
+
+        if attn_output_gate:
+            # --- gated pattern: q_gate split + GemmaRMSNorm + RoPE + KV cache
+            #
+            # GemmaRMSNorm (used as Qwen3NextRMSNorm) decomposes during
+            # torch.compile into:
+            #   x_fp32 = x.float()
+            #   var = x_fp32.pow(2).mean(-1, keepdim=True)
+            #   x_normed = x_fp32 * rsqrt(var + eps)
+            #   out = (x_normed * (1 + weight.float())).to(orig_dtype)
+            #
+            # The compiler also eliminates canceling reshape pairs
+            # (q_3d.reshape(T, q_size) → view(T, heads, dim)) so the
+            # RMSNorm input comes directly from the chunk result.
+
+            def pattern(
+                qkv: torch.Tensor,
+                positions: torch.Tensor,
+                q_weight: torch.Tensor,
+                k_weight: torch.Tensor,
+                cos_sin_cache: torch.Tensor,
+            ) -> tuple[
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+            ]:
+                T = qkv.shape[0]
+                q_gate, k, v = qkv.split([q_size * 2, k_size, v_size], dim=-1)
+
+                q_gate_3d = q_gate.view(T, num_heads, 2 * head_dim)
+                q_3d, gate_3d = q_gate_3d.chunk(2, dim=-1)
+
+                # Q GemmaRMSNorm (on q_3d: [T, num_heads, head_dim])
+                q_c = q_3d.clone()
+                q_fp = q_c.float()
+                q_var = q_fp.pow(2).mean(dim=-1, keepdim=True)
+                q_n = q_fp * torch.rsqrt(q_var + eps)
+                q_n = q_n * (1.0 + q_weight.float())
+                q_n = q_n.to(qkv.dtype)
+                q_flat = q_n.view(T, q_size)
+
+                # K GemmaRMSNorm (on k: [T, k_size] → view to
+                # [T, num_kv_heads, head_dim])
+                k_3d = k.view(T, num_kv_heads, head_dim)
+                k_fp = k_3d.float()
+                k_var = k_fp.pow(2).mean(dim=-1, keepdim=True)
+                k_n = k_fp * torch.rsqrt(k_var + eps)
+                k_n = k_n * (1.0 + k_weight.float())
+                k_n = k_n.to(qkv.dtype)
+                k_flat = k_n.view(T, k_size)
+
+                q_rope, k_rope = rope_matcher(positions, q_flat, k_flat, cos_sin_cache)
+
+                q_rope = q_rope.view(T, num_heads, head_dim)
+                k_rope = k_rope.view(T, num_kv_heads, head_dim)
+                v = v.view(T, num_kv_heads, head_dim_v)
+                dummy = torch.ops.vllm.unified_kv_cache_update(k_rope, v, layer_name)
+                return dummy, q_rope, k_rope, v, gate_3d
+
+            def replacement(
+                qkv: torch.Tensor,
+                positions: torch.Tensor,
+                q_weight: torch.Tensor,
+                k_weight: torch.Tensor,
+                cos_sin_cache: torch.Tensor,
+            ) -> tuple[
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+            ]:
+                T = qkv.shape[0]
+
+                q_out = torch.empty(
+                    T,
+                    num_heads,
+                    head_dim,
+                    device=qkv.device,
+                    dtype=qkv.dtype,
+                )
+                k_out = torch.empty(
+                    T,
+                    num_kv_heads,
+                    head_dim,
+                    device=qkv.device,
+                    dtype=qkv.dtype,
+                )
+                v_out = torch.empty(
+                    T,
+                    num_kv_heads,
+                    head_dim_v,
+                    device=qkv.device,
+                    dtype=qkv.dtype,
+                )
+                gate_out = torch.empty(
+                    T,
+                    num_heads,
+                    head_dim,
+                    device=qkv.device,
+                    dtype=qkv.dtype,
+                )
+
+                results = auto_functionalized(
+                    self.FUSED_OP,
+                    q_out=q_out,
+                    k_out=k_out,
+                    v_out=v_out,
+                    gate_out=gate_out,
+                    qkv=qkv,
+                    positions=positions,
+                    q_weight=q_weight,
+                    k_weight=k_weight,
+                    rms_norm_eps=eps,
+                    cos_sin_cache=cos_sin_cache,
+                    is_neox=is_neox,
+                    attn_output_gate=True,
+                    layer_name=layer_name,
+                )
+
+                # results: (dummy, q_out, k_out, v_out, gate_out)
+                return results[0], results[1], results[2], results[3], results[4]
+        else:
+            # --- non-gated: same as QkNormRopeKvCachePattern ---
+
+            def pattern(  # type: ignore[misc]
+                qkv: torch.Tensor,
+                positions: torch.Tensor,
+                q_weight: torch.Tensor,
+                k_weight: torch.Tensor,
+                cos_sin_cache: torch.Tensor,
+            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+                T = qkv.shape[0]
+                q, k, v = qkv.split([q_size, k_size, v_size], dim=-1)
+
+                q_by_head = q.view(T, q_size // head_dim, head_dim)
+                q_normed = rmsnorm_matcher(q_by_head, q_weight)
+                q_flat = q_normed.view(T, q_size)
+
+                k_by_head = k.view(T, k_size // head_dim, head_dim)
+                k_normed = rmsnorm_matcher(k_by_head, k_weight)
+                k_flat = k_normed.view(T, k_size)
+
+                q_rope, k_rope = rope_matcher(positions, q_flat, k_flat, cos_sin_cache)
+
+                q_rope = q_rope.view(T, num_heads, head_dim)
+                k_rope = k_rope.view(T, num_kv_heads, head_dim)
+                v = v.view(T, num_kv_heads, head_dim_v)
+                dummy = torch.ops.vllm.unified_kv_cache_update(k_rope, v, layer_name)
+                return dummy, q_rope, k_rope, v
+
+            def replacement(  # type: ignore[misc]
+                qkv: torch.Tensor,
+                positions: torch.Tensor,
+                q_weight: torch.Tensor,
+                k_weight: torch.Tensor,
+                cos_sin_cache: torch.Tensor,
+            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+                T = qkv.shape[0]
+                q_out = torch.empty(
+                    T,
+                    num_heads,
+                    head_dim,
+                    device=qkv.device,
+                    dtype=qkv.dtype,
+                )
+                k_out = torch.empty(
+                    T,
+                    num_kv_heads,
+                    head_dim,
+                    device=qkv.device,
+                    dtype=qkv.dtype,
+                )
+                v_out = torch.empty(
+                    T,
+                    num_kv_heads,
+                    head_dim_v,
+                    device=qkv.device,
+                    dtype=qkv.dtype,
+                )
+
+                results = auto_functionalized(
+                    self.FUSED_OP,
+                    q_out=q_out,
+                    k_out=k_out,
+                    v_out=v_out,
+                    gate_out=None,
+                    qkv=qkv,
+                    positions=positions,
+                    q_weight=q_weight,
+                    k_weight=k_weight,
+                    rms_norm_eps=eps,
+                    cos_sin_cache=cos_sin_cache,
+                    is_neox=is_neox,
+                    attn_output_gate=False,
+                    layer_name=layer_name,
+                )
+
+                # results: (dummy, q_out, k_out, v_out)
+                return results[0], results[1], results[2], results[3]
+
+        def fwd_and_view_to_reshape(*args, **kwargs) -> fx.GraphModule:
+            gm = pm.fwd_only(*args, **kwargs)
+            view_to_reshape(gm)
+            return gm
+
+        pm.register_replacement(
+            pattern,
+            replacement,
+            self.get_inputs(),
+            fwd_and_view_to_reshape,
+            pm_pass,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Pass class
 # ---------------------------------------------------------------------------
 
@@ -417,6 +831,57 @@ class QkNormRopeKvCacheFusionPass(VllmPatternMatcherPass):
                                     else:
                                         raise
 
+        # Qwen3Next-specific patterns with attn_output_gate handling.
+        hf_config = config.model_config.hf_text_config
+        attn_output_gate = getattr(hf_config, "attn_output_gate", None)
+        if attn_output_gate is None and type(hf_config).__name__ in (
+            "Qwen3NextConfig",
+        ):
+            attn_output_gate = True
+        if attn_output_gate is not None:
+            for gate_val in (
+                [attn_output_gate]
+                if isinstance(attn_output_gate, bool)
+                else [True, False]
+            ):
+                for _, layer in attn_layers.items():
+                    if not layer.impl.fused_qk_norm_rope_kvcache_supported():
+                        continue
+                    for aiter_rms in aiter_rms_variants:
+                        for aiter_rope in aiter_rope_variants:
+                            for epsilon in [1e-5, 1e-6]:
+                                for neox in [True, False]:
+                                    fi_variants = (
+                                        [False, True]
+                                        if RotaryEmbedding.enabled()
+                                        else [False]
+                                    )
+                                    for rope_fi in fi_variants:
+                                        try:
+                                            Qwen3NextQkNormRopeKvCachePattern(
+                                                layer=layer,
+                                                eps=epsilon,
+                                                is_neox=neox,
+                                                attn_output_gate=gate_val,
+                                                rope_flashinfer=rope_fi,
+                                                match_rocm_aiter_rms=aiter_rms,
+                                                match_rocm_aiter_rope=aiter_rope,
+                                            ).register(self.patterns)
+                                        except RuntimeError as e:
+                                            if "Duplicate pattern" not in str(e):
+                                                raise
+                                            logger.debug(
+                                                "Skipping duplicate Qwen3Next "
+                                                "pattern: gate=%s rms=%s "
+                                                "rope=%s eps=%s neox=%s fi=%s",
+                                                gate_val,
+                                                aiter_rms,
+                                                aiter_rope,
+                                                epsilon,
+                                                neox,
+                                                rope_fi,
+                                            )
+
         # Backends that set _use_interleaved_v_cache (e.g. ROCM_ATTN)
         # require a consistent V-cache layout across ALL compile ranges.
         # If max_token_num is too small, unfused ranges would write
@@ -473,4 +938,6 @@ class QkNormRopeKvCacheFusionPass(VllmPatternMatcherPass):
         return compile_range.end <= self.max_token_num
 
     def uuid(self) -> str:
-        return VllmInductorPass.hash_source(self, QkNormRopeKvCachePattern)
+        return VllmInductorPass.hash_source(
+            self, QkNormRopeKvCachePattern, Qwen3NextQkNormRopeKvCachePattern
+        )
