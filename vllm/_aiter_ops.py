@@ -1102,6 +1102,127 @@ def _triton_rotary_embedding_fake(
     return
 
 
+def _rocm_aiter_fused_qkv_split_qk_norm_rope_cache_impl(
+    qkv: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    positions: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    q_out: torch.Tensor,
+    k_out: torch.Tensor,
+    v_out: torch.Tensor,
+    gate_out: torch.Tensor | None,
+    qh: int,
+    kvh: int,
+    head_dim: int,
+    is_neox: bool = True,
+    offsets: torch.Tensor | None = None,
+    reuse_freqs_front_part: bool = True,
+    attn_output_gate: bool = False,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+    eps: float = 1e-5,
+) -> None:
+    import triton
+    from aiter.ops.triton._triton_kernels.rope.fused_qkv_split_qk_norm_rope_cache import (
+        _fused_qkv_split_qk_norm_rope_cache_kernel,
+    )
+
+    T = qkv.shape[0]
+    block_size = key_cache.shape[2]
+    BLOCK_D = head_dim
+    BLOCK_D_HALF = head_dim // 2
+    BLOCK_T = 32
+    num_warps = 4
+    grid = (triton.cdiv(T, BLOCK_T), qh)
+
+    _fused_qkv_split_qk_norm_rope_cache_kernel[grid](
+        qkv_ptr=qkv,
+        q_weight_ptr=q_weight,
+        k_weight_ptr=k_weight,
+        cos_ptr=cos,
+        sin_ptr=sin,
+        pos_ptr=positions,
+        off_ptr=offsets,
+        q_ptr=q_out,
+        gate_ptr=gate_out,
+        k_ptr=k_out,
+        v_ptr=v_out,
+        key_cache_ptr=key_cache,
+        value_cache_ptr=value_cache,
+        slot_mapping_ptr=slot_mapping,
+        T=T,
+        eps=eps,
+        k_scale_ptr=k_scale,
+        v_scale_ptr=v_scale,
+        stride_qkv_t=qkv.stride(0),
+        stride_qkv_d=qkv.stride(1),
+        stride_cos_t=cos.stride(0),
+        stride_cos_d=cos.stride(-1),
+        stride_pos_t=positions.stride(0),
+        stride_q_t=q_out.stride(0),
+        stride_q_h=q_out.stride(1),
+        stride_q_d=q_out.stride(2),
+        stride_kv_t=k_out.stride(0),
+        stride_kv_h=k_out.stride(1),
+        stride_kv_d=k_out.stride(2),
+        key_cache_stride_t=key_cache.stride(0),
+        key_cache_stride_h=key_cache.stride(1),
+        key_cache_stride_d=key_cache.stride(3),
+        key_cache_stride_b=key_cache.stride(2),
+        value_cache_stride_t=value_cache.stride(0),
+        value_cache_stride_h=value_cache.stride(1),
+        value_cache_stride_d=value_cache.stride(3),
+        value_cache_stride_b=value_cache.stride(2),
+        REUSE_FREQS_FRONT_PART=reuse_freqs_front_part,
+        IS_NEOX=is_neox,
+        HAVE_POS=(positions is not None),
+        HAVE_OFFS=(offsets is not None),
+        ENABLE_GATED_Q=attn_output_gate,
+        QH=qh,
+        KVH=kvh,
+        BLOCK_T=BLOCK_T,
+        BLOCK_D=BLOCK_D,
+        BLOCK_D_HALF=BLOCK_D_HALF,
+        BLOCK_SIZE=block_size,
+        HAVE_K_SCALE=k_scale is not None,
+        HAVE_V_SCALE=v_scale is not None,
+        num_warps=num_warps,
+    )
+
+
+def _rocm_aiter_fused_qkv_split_qk_norm_rope_cache_fake(
+    qkv: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    positions: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    q_out: torch.Tensor,
+    k_out: torch.Tensor,
+    v_out: torch.Tensor,
+    gate_out: torch.Tensor | None,
+    qh: int,
+    kvh: int,
+    head_dim: int,
+    is_neox: bool = True,
+    offsets: torch.Tensor | None = None,
+    reuse_freqs_front_part: bool = True,
+    attn_output_gate: bool = False,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+    eps: float = 1e-5,
+) -> None:
+    return
+
+
 # Global flag to ensure ops are registered only once
 _OPS_REGISTERED = False
 
@@ -1552,6 +1673,20 @@ class rocm_aiter_ops:
                 fake_impl=_fused_mla_dual_rms_norm_fake,
             )
 
+            direct_register_custom_op(
+                op_name="rocm_aiter_fused_qkv_split_qk_norm_rope_cache",
+                op_func=_rocm_aiter_fused_qkv_split_qk_norm_rope_cache_impl,
+                mutates_args=[
+                    "q_out",
+                    "k_out",
+                    "v_out",
+                    "gate_out",
+                    "key_cache",
+                    "value_cache",
+                ],
+                fake_impl=_rocm_aiter_fused_qkv_split_qk_norm_rope_cache_fake,
+            )
+
             _OPS_REGISTERED = True
 
     @staticmethod
@@ -1601,6 +1736,62 @@ class rocm_aiter_ops:
     @staticmethod
     def get_fused_mla_dual_rms_norm_op() -> OpOverload:
         return torch.ops.vllm.fused_mla_dual_rms_norm.default
+
+    @staticmethod
+    def get_fused_qkv_split_qk_norm_rope_cache_op() -> OpOverload:
+        return torch.ops.vllm.rocm_aiter_fused_qkv_split_qk_norm_rope_cache.default
+
+    @staticmethod
+    def fused_qkv_split_qk_norm_rope_cache(
+        qkv: torch.Tensor,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        positions: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        q_out: torch.Tensor,
+        k_out: torch.Tensor,
+        v_out: torch.Tensor,
+        gate_out: torch.Tensor | None,
+        qh: int,
+        kvh: int,
+        head_dim: int,
+        is_neox: bool = True,
+        offsets: torch.Tensor | None = None,
+        reuse_freqs_front_part: bool = True,
+        attn_output_gate: bool = False,
+        k_scale: torch.Tensor | None = None,
+        v_scale: torch.Tensor | None = None,
+        eps: float = 1e-5,
+    ) -> None:
+        torch.ops.vllm.rocm_aiter_fused_qkv_split_qk_norm_rope_cache(
+            qkv,
+            q_weight,
+            k_weight,
+            cos,
+            sin,
+            positions,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            q_out,
+            k_out,
+            v_out,
+            gate_out,
+            qh,
+            kvh,
+            head_dim,
+            is_neox,
+            offsets,
+            reuse_freqs_front_part,
+            attn_output_gate,
+            k_scale,
+            v_scale,
+            eps,
+        )
 
     @staticmethod
     def rms_norm(

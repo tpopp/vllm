@@ -287,6 +287,60 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
         # the interleaved V-cache read path that the parent would enable.
         pass
 
+    def do_triton_qk_norm_rope_kvcache_update(
+        self,
+        layer: AttentionLayer,
+        qkv: torch.Tensor,
+        q_out: torch.Tensor,
+        k_out: torch.Tensor,
+        v_out: torch.Tensor,
+        gate_out: torch.Tensor | None,
+        positions: torch.Tensor,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        rms_norm_eps: float,
+        cos_sin_cache: torch.Tensor,
+        is_neox: bool,
+        kv_cache: torch.Tensor,
+        layer_slot_mapping: torch.Tensor,
+        attn_output_gate: bool = False,
+    ):
+        key_cache, value_cache = kv_cache.unbind(0)
+
+        is_fp8_kv_cache = self.kv_cache_dtype.startswith("fp8")
+        if is_fp8_kv_cache:
+            key_cache = key_cache.view(self.fp8_dtype)
+            value_cache = value_cache.view(self.fp8_dtype)
+
+        cos, sin = cos_sin_cache.chunk(2, dim=-1)
+
+        k_scale = layer._k_scale if is_fp8_kv_cache else None
+        v_scale = layer._v_scale if is_fp8_kv_cache else None
+
+        rocm_aiter_ops.fused_qkv_split_qk_norm_rope_cache(
+            qkv=qkv,
+            q_weight=q_weight,
+            k_weight=k_weight,
+            cos=cos,
+            sin=sin,
+            positions=positions,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            slot_mapping=layer_slot_mapping,
+            q_out=q_out,
+            k_out=k_out,
+            v_out=v_out,
+            gate_out=gate_out,
+            qh=self.num_heads,
+            kvh=self.num_kv_heads,
+            head_dim=self.head_size,
+            is_neox=is_neox,
+            attn_output_gate=attn_output_gate,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            eps=rms_norm_eps,
+        )
+
     def do_rope_and_kv_cache_update(
         self,
         layer: AttentionLayer,
