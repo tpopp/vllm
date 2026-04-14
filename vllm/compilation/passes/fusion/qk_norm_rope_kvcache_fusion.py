@@ -199,24 +199,67 @@ def fused_triton_qk_norm_rope_kvcache_update_impl(
     layer_name: str = "",
 ) -> torch.Tensor:
     _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(layer_name)
-    if layer_slot_mapping is not None:
-        attn_layer.impl.do_triton_qk_norm_rope_kvcache_update(
-            attn_layer,
-            qkv,
-            q_out,
-            k_out,
-            v_out,
-            gate_out,
-            positions,
-            q_weight,
-            k_weight,
-            rms_norm_eps,
-            cos_sin_cache,
-            is_neox,
-            kv_cache,
-            layer_slot_mapping,
-            attn_output_gate=attn_output_gate,
-        )
+    if layer_slot_mapping is None:
+        return torch.empty(0, device=qkv.device, dtype=qkv.dtype)
+
+    T = qkv.shape[0]
+    num_heads = q_out.shape[1]
+    head_dim = q_out.shape[2]
+    num_kv_heads = k_out.shape[1]
+    q_size = num_heads * head_dim
+    kv_size = num_kv_heads * head_dim
+
+    if attn_output_gate:
+        q_gate, k, v = qkv.split([q_size * 2, kv_size, kv_size], dim=-1)
+        q_gate_3d = q_gate.view(T, num_heads, 2 * head_dim)
+        q_3d, gate_3d = q_gate_3d.chunk(2, dim=-1)
+    else:
+        q_flat, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+        q_3d = q_flat.view(T, num_heads, head_dim)
+
+    # GemmaRMSNorm for Q
+    q_fp = q_3d.float()
+    q_var = q_fp.pow(2).mean(dim=-1, keepdim=True)
+    q_n = q_fp * torch.rsqrt(q_var + rms_norm_eps)
+    q_n = q_n * (1.0 + q_weight.float())
+    q_normed = q_n.to(qkv.dtype)
+
+    # GemmaRMSNorm for K
+    k_3d = k.view(T, num_kv_heads, head_dim)
+    k_fp = k_3d.float()
+    k_var = k_fp.pow(2).mean(dim=-1, keepdim=True)
+    k_n = k_fp * torch.rsqrt(k_var + rms_norm_eps)
+    k_n = k_n * (1.0 + k_weight.float())
+    k_normed = k_n.to(qkv.dtype)
+
+    # RoPE (supports partial rotation: rotary_dim <= head_dim)
+    cos_sin = cos_sin_cache[positions.long()]
+    cos, sin = cos_sin.chunk(2, dim=-1)
+    rotary_dim = cos.shape[-1] * 2
+
+    def _apply_neox_rope(x_3d: torch.Tensor) -> torch.Tensor:
+        x_rot = x_3d[..., :rotary_dim]
+        x_pass = x_3d[..., rotary_dim:]
+        x1 = x_rot[..., : rotary_dim // 2]
+        x2 = x_rot[..., rotary_dim // 2 :]
+        c = cos.unsqueeze(1)
+        s = sin.unsqueeze(1)
+        x_rot_out = torch.cat([x1 * c - x2 * s, x2 * c + x1 * s], dim=-1)
+        return torch.cat([x_rot_out, x_pass], dim=-1)
+
+    q_rope = _apply_neox_rope(q_normed)
+    k_rope = _apply_neox_rope(k_normed)
+
+    q_out.copy_(q_rope)
+    k_out.copy_(k_rope)
+    v_out.copy_(v.view(T, num_kv_heads, head_dim))
+    if attn_output_gate and gate_out is not None:
+        gate_out.copy_(gate_3d)
+
+    # KV cache update
+    torch.ops.vllm.unified_kv_cache_update(
+        k_rope, v.view(T, num_kv_heads, head_dim), layer_name
+    )
 
     return torch.empty(0, device=qkv.device, dtype=qkv.dtype)
 
