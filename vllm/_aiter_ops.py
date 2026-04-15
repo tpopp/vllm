@@ -1016,6 +1016,14 @@ def _rocm_aiter_fused_qkv_split_qk_norm_rope_cache_impl(
         _fused_qkv_split_qk_norm_rope_cache_kernel,
     )
 
+    qkv = qkv.contiguous()
+    q_weight = q_weight.contiguous()
+    k_weight = k_weight.contiguous()
+    cos = cos.contiguous()
+    sin = sin.contiguous()
+    positions = positions.contiguous()
+    slot_mapping = slot_mapping.contiguous()
+
     T = qkv.shape[0]
     BLOCK_D = head_dim
     BLOCK_D_HALF = head_dim // 2
