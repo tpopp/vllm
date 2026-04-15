@@ -1133,12 +1133,41 @@ def _rocm_aiter_fused_qkv_split_qk_norm_rope_cache_impl(
     )
 
     T = qkv.shape[0]
-    block_size = key_cache.shape[2]
     BLOCK_D = head_dim
     BLOCK_D_HALF = head_dim // 2
+    ROTARY_DIM_HALF = cos.shape[-1]
     BLOCK_T = 32
     num_warps = 4
     grid = (triton.cdiv(T, BLOCK_T), qh)
+
+    # Detect KV cache layout by matching kvh to the correct dimension.
+    # Paged attention: [num_blocks, num_kv_heads, block_size, head_dim]
+    # Flash attention: [num_pages, page_size, num_kv_heads, head_dim]
+    if key_cache.shape[1] == kvh:
+        block_size = key_cache.shape[2]
+        kc_stride_t = key_cache.stride(0)
+        kc_stride_h = key_cache.stride(1)
+        kc_stride_b = key_cache.stride(2)
+        kc_stride_d = key_cache.stride(3)
+        vc_stride_t = value_cache.stride(0)
+        vc_stride_h = value_cache.stride(1)
+        vc_stride_b = value_cache.stride(2)
+        vc_stride_d = value_cache.stride(3)
+    elif key_cache.shape[2] == kvh:
+        block_size = key_cache.shape[1]
+        kc_stride_t = key_cache.stride(0)
+        kc_stride_h = key_cache.stride(2)
+        kc_stride_b = key_cache.stride(1)
+        kc_stride_d = key_cache.stride(3)
+        vc_stride_t = value_cache.stride(0)
+        vc_stride_h = value_cache.stride(2)
+        vc_stride_b = value_cache.stride(1)
+        vc_stride_d = value_cache.stride(3)
+    else:
+        raise ValueError(
+            f"Cannot determine KV cache layout: key_cache.shape="
+            f"{key_cache.shape}, kvh={kvh}"
+        )
 
     _fused_qkv_split_qk_norm_rope_cache_kernel[grid](
         qkv_ptr=qkv,
@@ -1170,14 +1199,14 @@ def _rocm_aiter_fused_qkv_split_qk_norm_rope_cache_impl(
         stride_kv_t=k_out.stride(0),
         stride_kv_h=k_out.stride(1),
         stride_kv_d=k_out.stride(2),
-        key_cache_stride_t=key_cache.stride(0),
-        key_cache_stride_h=key_cache.stride(1),
-        key_cache_stride_d=key_cache.stride(3),
-        key_cache_stride_b=key_cache.stride(2),
-        value_cache_stride_t=value_cache.stride(0),
-        value_cache_stride_h=value_cache.stride(1),
-        value_cache_stride_d=value_cache.stride(3),
-        value_cache_stride_b=value_cache.stride(2),
+        key_cache_stride_t=kc_stride_t,
+        key_cache_stride_h=kc_stride_h,
+        key_cache_stride_d=kc_stride_d,
+        key_cache_stride_b=kc_stride_b,
+        value_cache_stride_t=vc_stride_t,
+        value_cache_stride_h=vc_stride_h,
+        value_cache_stride_d=vc_stride_d,
+        value_cache_stride_b=vc_stride_b,
         REUSE_FREQS_FRONT_PART=reuse_freqs_front_part,
         IS_NEOX=is_neox,
         HAVE_POS=(positions is not None),
@@ -1189,6 +1218,7 @@ def _rocm_aiter_fused_qkv_split_qk_norm_rope_cache_impl(
         BLOCK_D=BLOCK_D,
         BLOCK_D_HALF=BLOCK_D_HALF,
         BLOCK_SIZE=block_size,
+        ROTARY_DIM_HALF=ROTARY_DIM_HALF,
         HAVE_K_SCALE=k_scale is not None,
         HAVE_V_SCALE=v_scale is not None,
         num_warps=num_warps,
