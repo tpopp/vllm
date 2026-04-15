@@ -473,7 +473,7 @@ class Fp8LinearMethod(LinearMethodBase):
         if self.use_marlin:
             return self.fp8_linear.apply_weights(layer, x, bias)
 
-        return self.fp8_linear.apply_weights(layer, x, bias)
+        return self.fp8_linear.apply_weights(layer, x, bias, rms_norm_parameters=rms_norm_parameters) 
 
 
 # TODO(future PR): remove this class in favor of

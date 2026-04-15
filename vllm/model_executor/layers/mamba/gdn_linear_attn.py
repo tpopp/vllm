@@ -777,10 +777,11 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         # Part 3: Output Projection
         # ============================================================
         quant_method = self.out_proj.quant_method.__class__.__name__
+        from vllm.model_executor.kernels.linear import Fp8BlockScaledMMLinearKernel
         if (
             GDN_AITER_TRITON_AVAILABLE
             and self.out_proj.quant_method.__class__.__name__ == "Fp8LinearMethod"
-            and self.out_proj.quant_method.fp8_linear.__class__.__name__ == "Fp8BlockScaledMMLinearKernel"
+            and isinstance(self.out_proj.quant_method.fp8_linear, Fp8BlockScaledMMLinearKernel)
         ):
             rms_norm_parameters = {
                 "z": z,
