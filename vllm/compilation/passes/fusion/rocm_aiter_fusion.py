@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import operator
 from typing import Any
 
 import torch
@@ -420,6 +421,230 @@ class AiterFusedAddGemmaRMSFp8GroupQuantPattern(AiterRMSNormQuantPattern):
         )
 
 
+class RMSNormGatedQuantManualFusion:
+    """
+    Manually matches the decomposed RMSNormGated(x, z, weight, eps,
+    norm_before_gate=True) + reshape + rocm_aiter_group_fp8_quant pattern
+    and replaces it with rocm_aiter_rmsnorm_input_quant_fp8.
+
+    The pattern in the FX graph is:
+      convert_element_type(x, fp32)                [x_fp32]
+      pow(x_fp32, 2) -> mean(-1, True) -> add(eps) -> rsqrt
+      mul(x_fp32, rsqrt)                           [x_normed]
+      convert_element_type(weight, fp32)            [w_fp32]
+      mul(x_normed, w_fp32)                         [weighted]
+      convert_element_type(z, fp32)                 [z_fp32]
+      sigmoid(z_fp32)
+      mul(z_fp32, sigmoid)                          [silu_z]
+      mul(weighted, silu_z)                         [gated]
+      convert_element_type(gated, bf16)             [result_bf16]
+      reshape(result_bf16, [num_tokens, hidden])    [reshaped]
+      rocm_aiter_group_fp8_quant(reshaped, 128)     [quant, scale]
+    """
+
+    FUSED_OP = rocm_aiter_ops.get_rmsnorm_input_quant_fp8_op()
+    QUANT_OP = torch.ops.vllm.rocm_aiter_group_fp8_quant.default
+
+    @staticmethod
+    def _is_op(node: fx.Node, target: Any) -> bool:
+        return node.op == "call_function" and node.target == target
+
+    def apply(self, graph: fx.Graph) -> int:
+        count = 0
+        nodes_to_remove: list[fx.Node] = []
+
+        for node in graph.nodes:
+            if not self._is_op(node, self.QUANT_OP):
+                continue
+
+            quant_input = node.args[0]
+            if not isinstance(quant_input, fx.Node):
+                continue
+
+            # quant_input should be a reshape
+            if not self._is_op(quant_input, torch.ops.aten.reshape.default):
+                continue
+            reshape_node = quant_input
+            reshape_input = reshape_node.args[0]
+            if not isinstance(reshape_input, fx.Node):
+                continue
+
+            # reshape_input should be convert_element_type to bf16
+            if not self._is_op(
+                reshape_input, torch.ops.prims.convert_element_type.default
+            ):
+                continue
+            if reshape_input.args[1] != torch.bfloat16:
+                continue
+            bf16_cast = reshape_input
+
+            # bf16_cast input should be mul (gated = weighted * silu_z)
+            gated_mul = bf16_cast.args[0]
+            if not isinstance(gated_mul, fx.Node):
+                continue
+            if not self._is_op(gated_mul, torch.ops.aten.mul.Tensor):
+                continue
+
+            # gated_mul args: (weighted, silu_z)
+            weighted = gated_mul.args[0]
+            silu_z = gated_mul.args[1]
+            if not isinstance(weighted, fx.Node) or not isinstance(silu_z, fx.Node):
+                continue
+
+            # silu_z should be mul(z_fp32, sigmoid(z_fp32))
+            if not self._is_op(silu_z, torch.ops.aten.mul.Tensor):
+                continue
+            z_fp32 = silu_z.args[0]
+            sigmoid_node = silu_z.args[1]
+            if not isinstance(z_fp32, fx.Node) or not isinstance(sigmoid_node, fx.Node):
+                continue
+            if not self._is_op(sigmoid_node, torch.ops.aten.sigmoid.default):
+                continue
+            if sigmoid_node.args[0] is not z_fp32:
+                continue
+
+            # z_fp32 should be convert_element_type(z, fp32)
+            if not self._is_op(z_fp32, torch.ops.prims.convert_element_type.default):
+                continue
+            if z_fp32.args[1] != torch.float32:
+                continue
+            z_view = z_fp32.args[0]  # the view/reshape of z
+
+            # weighted should be mul(x_normed, w_fp32)
+            if not self._is_op(weighted, torch.ops.aten.mul.Tensor):
+                continue
+            x_normed = weighted.args[0]
+            w_fp32 = weighted.args[1]
+            if not isinstance(x_normed, fx.Node) or not isinstance(w_fp32, fx.Node):
+                continue
+
+            # w_fp32 should be convert_element_type(weight, fp32)
+            if not self._is_op(w_fp32, torch.ops.prims.convert_element_type.default):
+                continue
+            if w_fp32.args[1] != torch.float32:
+                continue
+            weight_node = w_fp32.args[0]  # the original weight
+
+            # x_normed should be mul(x_fp32, rsqrt_node)
+            if not self._is_op(x_normed, torch.ops.aten.mul.Tensor):
+                continue
+            x_fp32 = x_normed.args[0]
+            rsqrt_node = x_normed.args[1]
+            if not isinstance(x_fp32, fx.Node) or not isinstance(rsqrt_node, fx.Node):
+                continue
+
+            # Verify the RMS path: rsqrt(mean(pow(x_fp32, 2), -1, True) + eps)
+            if not self._is_op(rsqrt_node, torch.ops.aten.rsqrt.default):
+                continue
+            add_eps = rsqrt_node.args[0]
+            if not isinstance(add_eps, fx.Node):
+                continue
+            if not self._is_op(add_eps, torch.ops.aten.add.Tensor):
+                continue
+            mean_node = add_eps.args[0]
+            eps_val = add_eps.args[1]
+            if not isinstance(mean_node, fx.Node):
+                continue
+            if not self._is_op(mean_node, torch.ops.aten.mean.dim):
+                continue
+            pow_node = mean_node.args[0]
+            if not isinstance(pow_node, fx.Node):
+                continue
+            if not self._is_op(pow_node, torch.ops.aten.pow.Tensor_Scalar):
+                continue
+            if pow_node.args[0] is not x_fp32:
+                continue
+
+            # x_fp32 should be convert_element_type(x_view, fp32)
+            if not self._is_op(x_fp32, torch.ops.prims.convert_element_type.default):
+                continue
+            if x_fp32.args[1] != torch.float32:
+                continue
+            x_view = x_fp32.args[0]  # the view/reshape of x
+
+            # Check that intermediate nodes don't have other users
+            # (except x_fp32 which feeds both pow and mul)
+            if len(bf16_cast.users) != 1:  # only reshape
+                continue
+            if len(reshape_node.users) != 1:  # only quant
+                continue
+
+            logger.info(
+                "RMSNormGatedQuantManualFusion: matched pattern at %s",
+                node.name,
+            )
+
+            # Build the replacement:
+            # 1. Call rmsnorm_input_quant_fp8(x, weight, bias=None, z, eps, ...)
+            # 2. Reshape outputs to match expected shapes
+            reshape_size = reshape_node.args[1]  # [num_tokens, hidden_size]
+
+            with graph.inserting_before(node):
+                fused = graph.call_function(
+                    self.FUSED_OP,
+                    kwargs={
+                        "x": x_view,
+                        "weight": weight_node,
+                        "bias": None,
+                        "z": z_view,
+                        "eps": eps_val,
+                        "norm_before_gate": True,
+                        "activation": "silu",
+                        "group_size": 128,
+                    },
+                )
+                quant_out = graph.call_function(operator.getitem, (fused, 0))
+                scale_out = graph.call_function(operator.getitem, (fused, 1))
+                quant_reshaped = graph.call_function(
+                    torch.ops.aten.reshape.default,
+                    (quant_out, reshape_size),
+                )
+                # Scale: from [n, 1] to [num_tokens, num_heads]
+                scale_reshaped = graph.call_function(
+                    torch.ops.aten.reshape.default,
+                    (scale_out, [reshape_size[0], -1]),
+                )
+
+            # Replace uses of the quant node's getitem users
+            for user in list(node.users):
+                if self._is_op(user, operator.getitem):
+                    idx = user.args[1]
+                    if idx == 0:
+                        user.replace_all_uses_with(quant_reshaped)
+                    elif idx == 1:
+                        user.replace_all_uses_with(scale_reshaped)
+                    nodes_to_remove.append(user)
+
+            nodes_to_remove.extend(
+                [
+                    node,
+                    reshape_node,
+                    bf16_cast,
+                    gated_mul,
+                    silu_z,
+                    sigmoid_node,
+                    weighted,
+                    x_normed,
+                    rsqrt_node,
+                    add_eps,
+                    mean_node,
+                    pow_node,
+                ]
+            )
+            # Only remove z_fp32, w_fp32, x_fp32 if they have no other users
+            for n in [z_fp32, w_fp32, x_fp32]:
+                if all(u in nodes_to_remove or u is fused for u in n.users):
+                    nodes_to_remove.append(n)
+
+            count += 1
+
+        for n in reversed(nodes_to_remove):
+            if len(n.users) == 0:
+                graph.erase_node(n)
+
+        return count
+
+
 class RocmAiterRMSNormQuantFusionPass(VllmPatternMatcherPass):
     """
     This pass fuses aiter rms_norm & vllm/aiter quant custom ops
@@ -471,11 +696,20 @@ class RocmAiterRMSNormQuantFusionPass(VllmPatternMatcherPass):
                     epsilon, FP8_DTYPE, match_aiter_quant=match_aiter_quant
                 ).register(self.patterns)
 
+        self._gated_fusion = RMSNormGatedQuantManualFusion()
+
         self.dump_patterns(config, self.patterns)
 
     @VllmInductorPass.time_and_log
     def __call__(self, graph: fx.Graph) -> None:
-        self.matched_count = self.patterns.apply(graph)
+        gated_count = self._gated_fusion.apply(graph)
+        if gated_count > 0:
+            logger.info(
+                "%s RMSNormGatedQuant manual fusion replaced %s patterns",
+                self.__class__.__name__,
+                gated_count,
+            )
+        self.matched_count = self.patterns.apply(graph) + gated_count
         logger.debug(
             "%s Replaced %s patterns", self.__class__.__name__, self.matched_count
         )
@@ -488,6 +722,7 @@ class RocmAiterRMSNormQuantFusionPass(VllmPatternMatcherPass):
             AiterFusedAddRMSFp8GroupQuantPattern,
             AiterGemmaRMSFp8GroupQuantPattern,
             AiterFusedAddGemmaRMSFp8GroupQuantPattern,
+            RMSNormGatedQuantManualFusion,
         ]
         return self.hash_source(self, *fusion_patterns)
 
