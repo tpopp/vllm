@@ -312,3 +312,4 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
             expert_map=expert_map,
             output=output,
         )
+        return output

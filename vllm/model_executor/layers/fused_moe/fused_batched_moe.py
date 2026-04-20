@@ -806,6 +806,7 @@ class NaiveBatchedExperts(mk.FusedMoEExpertsModular):
                 w2_dq = w2[expert]
 
             output[expert, :num, :] = tmp @ w2_dq.transpose(0, 1).to(tmp.dtype)
+        return output
 
 
 def batched_moe_kernel_quantize_input(
@@ -1121,3 +1122,4 @@ class BatchedTritonExperts(mk.FusedMoEExpertsModular):
             per_act_token_quant=self.per_act_token_quant,
             block_shape=self.block_shape,
         )
+        return output

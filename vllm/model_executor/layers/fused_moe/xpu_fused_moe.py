@@ -141,6 +141,7 @@ class XPUExperts(mk.FusedMoEExpertsModular):
             is_fp8=self.is_fp8,
             is_mxfp4=self.is_mxfp4,
         )
+        return output
 
 
 class XPUExpertsFp8(XPUExperts):

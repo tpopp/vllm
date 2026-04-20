@@ -447,3 +447,4 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
             expert_num_tokens,
             expected_m,
         )
+        return output

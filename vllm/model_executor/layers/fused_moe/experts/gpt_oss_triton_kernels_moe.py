@@ -652,6 +652,7 @@ class OAITritonExperts(BaseOAITritonExperts):
             intermediate_cache=workspace2,
             a1q_scale=a1q_scale,
         )
+        return output
 
 
 class UnfusedOAITritonExperts(BaseOAITritonExperts):
@@ -798,6 +799,7 @@ class UnfusedOAITritonExperts(BaseOAITritonExperts):
         )
 
         self.moe_sum(intermediate_cache3.view(-1, topk, K), output)
+        return output
 
 
 class OAITritonMxfp4ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):

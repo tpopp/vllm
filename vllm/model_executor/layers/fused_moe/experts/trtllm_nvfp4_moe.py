@@ -201,7 +201,7 @@ class TrtLlmNvFp4ExpertsModular(TrtLlmNvFp4ExpertsBase, mk.FusedMoEExpertsModula
         import vllm.utils.flashinfer as fi_utils
 
         if fi_utils._is_fi_autotuning:
-            return
+            return output
 
         # Invoke kernel.
         flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe(
@@ -236,6 +236,7 @@ class TrtLlmNvFp4ExpertsModular(TrtLlmNvFp4ExpertsBase, mk.FusedMoEExpertsModula
             activation_type=activation_to_flashinfer_int(activation),
             output=output,
         )
+        return output
 
 
 class TrtLlmNvFp4ExpertsMonolithic(

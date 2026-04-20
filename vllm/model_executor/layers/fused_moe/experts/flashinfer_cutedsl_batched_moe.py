@@ -185,6 +185,7 @@ class FlashInferCuteDSLBatchedExperts(mk.FusedMoEExpertsModular):
             workspace=workspace2,
             out=output,
         )
+        return output
 
 
 def get_cute_dtype(input: torch.Tensor) -> str:

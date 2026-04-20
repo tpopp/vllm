@@ -2139,6 +2139,7 @@ class TritonExperts(mk.FusedMoEExpertsModular):
 
         # separate function is required for MoE + LoRA
         self.moe_sum(intermediate_cache3, output)
+        return output
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
         ops.moe_sum(input, output)
@@ -2317,3 +2318,4 @@ class TritonWNA16Experts(TritonExperts):
 
         # separate function is required for MoE + LoRA
         self.moe_sum(intermediate_cache3, output)
+        return output

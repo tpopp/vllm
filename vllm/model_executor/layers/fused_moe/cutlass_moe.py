@@ -382,6 +382,7 @@ class CutlassExpertsFp8Base(mk.FusedMoEExpertsModular):
             use_batched_format,
             topk_weights,
         )
+        return output
 
 
 class CutlassExpertsFp8(CutlassExpertsFp8Base):
@@ -795,6 +796,7 @@ class CutlassExpertsFp4(mk.FusedMoEExpertsModular):
             device=hidden_states.device,
             apply_router_weight_on_input=apply_router_weight_on_input,
         )
+        return output
 
 
 def run_cutlass_moe_mxfp4(
@@ -1088,6 +1090,7 @@ class CutlassExpertsMxfp4(mk.FusedMoEExpertsModular):
             device=hidden_states.device,
             apply_router_weight_on_input=apply_router_weight_on_input,
         )
+        return output
 
 
 # W4A8
@@ -1394,6 +1397,7 @@ class CutlassExpertsW4A8Fp8(mk.FusedMoEExpertsModular):
             topk_weights,
             self.group_size,
         )
+        return output
 
 
 def cutlass_moe_w4a8_fp8(

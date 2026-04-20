@@ -170,3 +170,4 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
                 local_expert_offset=self.local_expert_offset,
                 moe_output=output,
             )
+        return output

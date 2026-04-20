@@ -399,6 +399,7 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
             use_w4_group_scaling=use_w4_group_scaling,
             tune_max_num_tokens=max(self.max_capture_size, 1),
         )
+        return output
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
         # No support for LoRA in flashinfer_cutlass_fused_moe.
