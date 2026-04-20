@@ -808,6 +808,49 @@ def _rocm_aiter_rmsnorm_fp8_group_quant_fake(
     )
 
 
+def _rocm_aiter_rmsnorm_input_quant_fp8_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    z: torch.Tensor,
+    eps: float,
+    norm_before_gate: bool,
+    activation: str,
+    group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from aiter.ops.triton.quant import rmsnorm_input_quant_fp8
+
+    return rmsnorm_input_quant_fp8(
+        x,
+        weight,
+        bias,
+        z,
+        eps,
+        norm_before_gate=norm_before_gate,
+        activation=activation,
+        out_dtype=FP8_DTYPE,
+        group_size=group_size,
+    )
+
+
+def _rocm_aiter_rmsnorm_input_quant_fp8_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    z: torch.Tensor,
+    eps: float,
+    norm_before_gate: bool,
+    activation: str,
+    group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    M, N = x.shape
+    scale_shape = (M, (N + group_size - 1) // group_size)
+    return (
+        torch.empty_like(x, dtype=FP8_DTYPE, device=x.device),
+        torch.empty(scale_shape, dtype=torch.float32, device=x.device),
+    )
+
+
 def _rocm_aiter_group_fp8_quant_impl(
     x: torch.Tensor,
     group_size: int,
@@ -1366,6 +1409,12 @@ class rocm_aiter_ops:
             )
 
             direct_register_custom_op(
+                op_name="rocm_aiter_rmsnorm_input_quant_fp8",
+                op_func=_rocm_aiter_rmsnorm_input_quant_fp8_impl,
+                fake_impl=_rocm_aiter_rmsnorm_input_quant_fp8_fake,
+            )
+
+            direct_register_custom_op(
                 op_name="rocm_aiter_rmsnorm_with_add_fp8_group_quant",
                 op_func=_rocm_aiter_rmsnorm_with_add_fp8_group_quant_impl,
                 fake_impl=_rocm_aiter_rmsnorm_with_add_fp8_group_quant_fake,
@@ -1450,6 +1499,10 @@ class rocm_aiter_ops:
     @staticmethod
     def get_rmsnorm_group_fused_quant_op() -> OpOverload:
         return torch.ops.vllm.rocm_aiter_rmsnorm_fp8_group_quant.default
+
+    @staticmethod
+    def get_rmsnorm_input_quant_fp8_op() -> OpOverload:
+        return torch.ops.vllm.rocm_aiter_rmsnorm_input_quant_fp8.default
 
     @staticmethod
     def get_rmsnorm_group_add_fused_quant_op() -> OpOverload:
