@@ -75,9 +75,12 @@ gdn_aiter_rmsnorm_fp8_quant = None
 
 try:
     from vllm._aiter_ops import is_aiter_found_and_supported
+
     if envs.VLLM_ROCM_USE_AITER and is_aiter_found_and_supported():
         from aiter.ops.triton.causal_conv1d_update_fast import (
             causal_conv1d_update_fast as _gdn_aiter_causal_conv1d_update_fast,
+        )
+        from aiter.ops.triton.causal_conv1d_update_fast import (
             fused_reshape_causal_conv1d_update_fast as _gdn_aiter_fused_reshape_causal_conv1d_update_fast,
         )
         from aiter.ops.triton.gated_delta_net import (
@@ -88,8 +91,12 @@ try:
         )
 
         gdn_aiter_causal_conv1d_update_fast = _gdn_aiter_causal_conv1d_update_fast
-        gdn_aiter_fused_reshape_causal_conv1d_update_fast = _gdn_aiter_fused_reshape_causal_conv1d_update_fast
-        gdn_aiter_fused_rearrange_sigmoid_gated_delta_rule = _gdn_aiter_fused_rearrange_sigmoid_gated_delta_rule
+        gdn_aiter_fused_reshape_causal_conv1d_update_fast = (
+            _gdn_aiter_fused_reshape_causal_conv1d_update_fast
+        )
+        gdn_aiter_fused_rearrange_sigmoid_gated_delta_rule = (
+            _gdn_aiter_fused_rearrange_sigmoid_gated_delta_rule
+        )
         gdn_aiter_rmsnorm_fp8_quant = _gdn_aiter_rmsnorm_fp8_quant
         GDN_AITER_TRITON_AVAILABLE = True
 except ImportError:
@@ -581,9 +588,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             self.num_v_heads // self.num_k_heads,
         ]
 
-        (query, key, value, z) = torch.split(
-            mixed_qkvz, split_arg_list_qkvz, dim=-1
-        )
+        (query, key, value, z) = torch.split(mixed_qkvz, split_arg_list_qkvz, dim=-1)
         (b, a) = torch.split(mixed_ba, split_arg_list_ba, dim=-1)
 
         mixed_qkv_logical = torch.cat(
@@ -641,26 +646,20 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         v_dim = self.value_dim // self.tp_size
 
         # 1. Create the non-contiguous 2D views
-        query, key, value = torch.split(
-            mixed_qkv,
-            [q_dim, k_dim, v_dim],
-            dim=-1
-        )
+        query, key, value = torch.split(mixed_qkv, [q_dim, k_dim, v_dim], dim=-1)
 
         # 2. Flatten and concatenate to force a single triton graph.
-        fused = torch.cat([
-            query.reshape(-1),
-            key.reshape(-1),
-            value.reshape(-1)
-        ], dim=0)
+        fused = torch.cat(
+            [query.reshape(-1), key.reshape(-1), value.reshape(-1)], dim=0
+        )
 
         # 3. Slice the single buffer.
         q_size = l * q_dim
         k_size = l * k_dim
 
-        q_contig = fused[0 : q_size]
+        q_contig = fused[0:q_size]
         k_contig = fused[q_size : q_size + k_size]
-        v_contig = fused[q_size + k_size : ]
+        v_contig = fused[q_size + k_size :]
 
         # 4. Zero cost reshape
         query = q_contig.view(1, l, -1, self.head_k_dim)
@@ -691,10 +690,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         # ============================================================
         # Fast path for with Triton decode kernels for part 1&2
         # ============================================================
-        if (
-            not hasattr(self, "in_proj_qkv") 
-            and GDN_AITER_TRITON_AVAILABLE
-        ):
+        if not hasattr(self, "in_proj_qkv") and GDN_AITER_TRITON_AVAILABLE:
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
             projected_states_ba, _ = self.in_proj_ba(hidden_states)
             projected_states_qkvz = projected_states_qkvz.view(num_tokens, -1)
@@ -770,6 +766,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                 b,
                 a,
                 core_attn_out,
+                False,
                 _encode_layer_name(self.prefix),
             )
 
@@ -778,10 +775,13 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         # ============================================================
         quant_method = self.out_proj.quant_method.__class__.__name__
         from vllm.model_executor.kernels.linear import Fp8BlockScaledMMLinearKernel
+
         if (
             GDN_AITER_TRITON_AVAILABLE
             and self.out_proj.quant_method.__class__.__name__ == "Fp8LinearMethod"
-            and isinstance(self.out_proj.quant_method.fp8_linear, Fp8BlockScaledMMLinearKernel)
+            and isinstance(
+                self.out_proj.quant_method.fp8_linear, Fp8BlockScaledMMLinearKernel
+            )
         ):
             rms_norm_parameters = {
                 "z": z,
@@ -930,7 +930,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         # then run chunk_gated_delta_rule with in-kernel L2 norm disabled.
         T = FLA_CHUNK_SIZE
         dummy_mixed_qkv = torch.randn(
-            T, qkv_or_qkvz.shape[-1]-v_dim, device=device, dtype=dtype
+            T, qkv_or_qkvz.shape[-1] - v_dim, device=device, dtype=dtype
         )
         dummy_a = torch.randn(T, num_v_heads, device=device, dtype=dtype)
         dummy_b = torch.randn(T, num_v_heads, device=device, dtype=dtype)
@@ -1007,7 +1007,9 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         if attn_metadata is None:
             # V1 profile run — warm up prefill kernels so that
             # autotuning completes before KV cache allocation.
-            v_dim = core_attn_out.shape[-1] * core_attn_out.shape[-2] if fast_kernel else 0
+            v_dim = (
+                core_attn_out.shape[-1] * core_attn_out.shape[-2] if fast_kernel else 0
+            )
             self._warmup_prefill_kernels(qkv_or_qkvz, v_dim)
             return
 
@@ -1023,9 +1025,9 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             and not fast_kernel
         ):
             return self._forward_core_decode_non_spec(
-                mixed_qkv=mixed_qkv,
-                b=b,
-                a=a,
+                mixed_qkv=qkv_or_qkvz,
+                b=b_or_ba,
+                a=a_or_z_out,
                 core_attn_out=core_attn_out,
                 attn_metadata=attn_metadata,
             )
@@ -1270,7 +1272,6 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         core_attn_out: torch.Tensor,
         attn_metadata: GDNAttentionMetadata,
     ):
-
         has_initial_state = attn_metadata.has_initial_state
         spec_query_start_loc = attn_metadata.spec_query_start_loc
         non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
@@ -1372,24 +1373,26 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                     validate_data=True,
                 )
             else:
-                mixed_qkv_non_spec, b, a = gdn_aiter_fused_reshape_causal_conv1d_update_fast(
-                    qkvz,
-                    num_actual_tokens,
-                    self.num_k_heads // self.tp_size,
-                    self.num_v_heads // self.tp_size,
-                    self.head_k_dim,
-                    self.head_v_dim,
-                    ba,
-                    z_out,
-                    core_attn_out,
-                    conv_state,
-                    conv_weights,
-                    self.conv1d.bias,
-                    self.activation,
-                    conv_state_indices=non_spec_state_indices_tensor[
-                        : attn_metadata.num_actual_tokens
-                    ],
-                    validate_data=True,
+                mixed_qkv_non_spec, b, a = (
+                    gdn_aiter_fused_reshape_causal_conv1d_update_fast(
+                        qkvz,
+                        num_actual_tokens,
+                        self.num_k_heads // self.tp_size,
+                        self.num_v_heads // self.tp_size,
+                        self.head_k_dim,
+                        self.head_v_dim,
+                        ba,
+                        z_out,
+                        core_attn_out,
+                        conv_state,
+                        conv_weights,
+                        self.conv1d.bias,
+                        self.activation,
+                        conv_state_indices=non_spec_state_indices_tensor[
+                            : attn_metadata.num_actual_tokens
+                        ],
+                        validate_data=True,
+                    )
                 )
         else:
             mixed_qkv_non_spec = None
