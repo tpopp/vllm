@@ -424,162 +424,369 @@ class AiterFusedAddGemmaRMSFp8GroupQuantPattern(AiterRMSNormQuantPattern):
 class RMSNormGatedQuantManualFusion:
     """
     Manually matches the decomposed RMSNormGated(x, z, weight, eps,
-    norm_before_gate=True) + reshape + rocm_aiter_group_fp8_quant pattern
-    and replaces it with rocm_aiter_rmsnorm_input_quant_fp8.
+    norm_before_gate=True) + group fp8 quant pattern and replaces it
+    with rocm_aiter_rmsnorm_input_quant_fp8.
 
-    The pattern in the FX graph is:
-      convert_element_type(x, fp32)                [x_fp32]
-      pow(x_fp32, 2) -> mean(-1, True) -> add(eps) -> rsqrt
-      mul(x_fp32, rsqrt)                           [x_normed]
-      convert_element_type(weight, fp32)            [w_fp32]
-      mul(x_normed, w_fp32)                         [weighted]
-      convert_element_type(z, fp32)                 [z_fp32]
-      sigmoid(z_fp32)
-      mul(z_fp32, sigmoid)                          [silu_z]
-      mul(weighted, silu_z)                         [gated]
-      convert_element_type(gated, bf16)             [result_bf16]
-      reshape(result_bf16, [num_tokens, hidden])    [reshaped]
-      rocm_aiter_group_fp8_quant(reshaped, 128)     [quant, scale]
+    Supports two quant representations:
+      1. rocm_aiter_group_fp8_quant custom op (when +quant_fp8)
+      2. Fully decomposed group quant aten ops (when -quant_fp8)
     """
 
     FUSED_OP = rocm_aiter_ops.get_rmsnorm_input_quant_fp8_op()
-    QUANT_OP = torch.ops.vllm.rocm_aiter_group_fp8_quant.default
 
     @staticmethod
     def _is_op(node: fx.Node, target: Any) -> bool:
         return node.op == "call_function" and node.target == target
+
+    def _match_gated_norm(
+        self, bf16_cast: fx.Node
+    ) -> tuple[fx.Node, fx.Node, fx.Node, Any, list[fx.Node], list[fx.Node]] | None:
+        """Walk backwards from bf16_cast to match decomposed RMSNormGated.
+        Returns (x_view, z_view, weight_node, eps_val, nodes_to_remove,
+        conditionally_removable_nodes) or None if no match.
+        """
+        gated_mul = bf16_cast.args[0]
+        if not isinstance(gated_mul, fx.Node):
+            return None
+        if not self._is_op(gated_mul, torch.ops.aten.mul.Tensor):
+            return None
+
+        weighted = gated_mul.args[0]
+        silu_z = gated_mul.args[1]
+        if not isinstance(weighted, fx.Node) or not isinstance(silu_z, fx.Node):
+            return None
+
+        if not self._is_op(silu_z, torch.ops.aten.mul.Tensor):
+            return None
+        z_fp32 = silu_z.args[0]
+        sigmoid_node = silu_z.args[1]
+        if not isinstance(z_fp32, fx.Node) or not isinstance(sigmoid_node, fx.Node):
+            return None
+        if not self._is_op(sigmoid_node, torch.ops.aten.sigmoid.default):
+            return None
+        if sigmoid_node.args[0] is not z_fp32:
+            return None
+
+        if not self._is_op(z_fp32, torch.ops.prims.convert_element_type.default):
+            return None
+        if z_fp32.args[1] != torch.float32:
+            return None
+        z_view = z_fp32.args[0]
+
+        if not self._is_op(weighted, torch.ops.aten.mul.Tensor):
+            return None
+        x_normed = weighted.args[0]
+        w_fp32 = weighted.args[1]
+        if not isinstance(x_normed, fx.Node) or not isinstance(w_fp32, fx.Node):
+            return None
+
+        if not self._is_op(w_fp32, torch.ops.prims.convert_element_type.default):
+            return None
+        if w_fp32.args[1] != torch.float32:
+            return None
+        weight_node = w_fp32.args[0]
+
+        if not self._is_op(x_normed, torch.ops.aten.mul.Tensor):
+            return None
+        x_fp32 = x_normed.args[0]
+        rsqrt_node = x_normed.args[1]
+        if not isinstance(x_fp32, fx.Node) or not isinstance(rsqrt_node, fx.Node):
+            return None
+
+        if not self._is_op(rsqrt_node, torch.ops.aten.rsqrt.default):
+            return None
+        add_eps = rsqrt_node.args[0]
+        if not isinstance(add_eps, fx.Node):
+            return None
+        if not self._is_op(add_eps, torch.ops.aten.add.Tensor):
+            return None
+        mean_node = add_eps.args[0]
+        eps_val = add_eps.args[1]
+        if not isinstance(mean_node, fx.Node):
+            return None
+        if not self._is_op(mean_node, torch.ops.aten.mean.dim):
+            return None
+        pow_node = mean_node.args[0]
+        if not isinstance(pow_node, fx.Node):
+            return None
+        if not self._is_op(pow_node, torch.ops.aten.pow.Tensor_Scalar):
+            return None
+        if pow_node.args[0] is not x_fp32:
+            return None
+
+        if not self._is_op(x_fp32, torch.ops.prims.convert_element_type.default):
+            return None
+        if x_fp32.args[1] != torch.float32:
+            return None
+        x_view = x_fp32.args[0]
+
+        nodes = [
+            bf16_cast,
+            gated_mul,
+            silu_z,
+            sigmoid_node,
+            weighted,
+            x_normed,
+            rsqrt_node,
+            add_eps,
+            mean_node,
+            pow_node,
+        ]
+        conditionally_remove = [z_fp32, w_fp32, x_fp32]
+        return (x_view, z_view, weight_node, eps_val, nodes, conditionally_remove)
+
+    def _match_custom_op_quant(
+        self, bf16_cast: fx.Node
+    ) -> (
+        tuple[
+            fx.Node,
+            list[fx.Node],
+            list[fx.Node],
+            list,
+        ]
+        | None
+    ):
+        """Match bf16_cast → reshape → rocm_aiter_group_fp8_quant.
+        Returns (insert_before_node, quant_nodes_to_remove,
+                 getitem_nodes_to_remove, reshape_size) or None.
+        """
+        if len(bf16_cast.users) != 1:
+            return None
+        reshape_node = next(iter(bf16_cast.users))
+        if not self._is_op(reshape_node, torch.ops.aten.reshape.default):
+            return None
+        if len(reshape_node.users) != 1:
+            return None
+        quant_node = next(iter(reshape_node.users))
+        if not self._is_op(
+            quant_node,
+            torch.ops.vllm.rocm_aiter_group_fp8_quant.default,
+        ):
+            return None
+
+        reshape_size = reshape_node.args[1]
+
+        getitem_nodes = []
+        for user in list(quant_node.users):
+            if self._is_op(user, operator.getitem):
+                getitem_nodes.append(user)
+
+        return (
+            quant_node,
+            [quant_node, reshape_node],
+            getitem_nodes,
+            reshape_size,
+        )
+
+    def _match_decomposed_quant(
+        self, bf16_cast: fx.Node
+    ) -> (
+        tuple[
+            fx.Node,
+            list[fx.Node],
+            dict[int, fx.Node],
+            list,
+            Any,
+        ]
+        | None
+    ):
+        """Match bf16_cast → decomposed group quant chain.
+        Pattern: reshape(bf16, [-1, ng, gs]) → abs → max → getitem[0] →
+        f32 → div(448) → clamp_min(min_scale) [scales_3d]
+        → div(grouped, scales) → clamp(-448, 448) → f8e4m3fn →
+        reshape(-1, hidden) [quant_flat]
+        → squeeze(scales_3d, -1) [scales_squeezed]
+
+        Returns (insert_before_node, quant_nodes_to_remove,
+                 output_map {0: quant_flat, 1: scales_squeezed},
+                 reshape_size_for_quant, num_groups) or None.
+        """
+        if len(bf16_cast.users) != 1:
+            return None
+        group_reshape = next(iter(bf16_cast.users))
+        if not self._is_op(group_reshape, torch.ops.aten.reshape.default):
+            return None
+
+        grouped = group_reshape  # [n, ng, gs]
+
+        # grouped should have 2 users: abs (for absmax) and div (x/scales)
+        if len(grouped.users) != 2:
+            return None
+
+        abs_node = None
+        x_div_scales = None
+        for u in grouped.users:
+            if self._is_op(u, torch.ops.aten.abs.default):
+                abs_node = u
+            elif self._is_op(u, torch.ops.aten.div.Tensor):
+                x_div_scales = u
+        if abs_node is None or x_div_scales is None:
+            return None
+
+        # abs → max(-1, True) → getitem[0] → f32 → div(448) → clamp_min
+        max_node = None
+        for u in abs_node.users:
+            if self._is_op(u, torch.ops.aten.max.dim):
+                max_node = u
+        if max_node is None:
+            return None
+
+        getitem_max = None
+        for u in max_node.users:
+            if self._is_op(u, operator.getitem) and u.args[1] == 0:
+                getitem_max = u
+        if getitem_max is None:
+            return None
+
+        if len(getitem_max.users) != 1:
+            return None
+        absmax_f32 = next(iter(getitem_max.users))
+        if not self._is_op(absmax_f32, torch.ops.prims.convert_element_type.default):
+            return None
+        if absmax_f32.args[1] != torch.float32:
+            return None
+
+        if len(absmax_f32.users) != 1:
+            return None
+        scales_raw_div = next(iter(absmax_f32.users))
+        if not self._is_op(scales_raw_div, torch.ops.aten.div.Tensor):
+            return None
+
+        if len(scales_raw_div.users) != 1:
+            return None
+        scales_3d = next(iter(scales_raw_div.users))
+        if not self._is_op(scales_3d, torch.ops.aten.clamp_min.default):
+            return None
+
+        # scales_3d should have 2 users: x_div_scales and squeeze
+        if len(scales_3d.users) != 2:
+            return None
+        if x_div_scales.args[1] is not scales_3d:
+            return None
+
+        squeeze_node = None
+        for u in scales_3d.users:
+            if self._is_op(u, torch.ops.aten.squeeze.dim):
+                squeeze_node = u
+        if squeeze_node is None:
+            return None
+
+        # x_div_scales → clamp_min(-448) → clamp_max(448) → f8e4m3fn →
+        # reshape(-1, hidden)
+        if len(x_div_scales.users) != 1:
+            return None
+        clamp_lo = next(iter(x_div_scales.users))
+        if not self._is_op(clamp_lo, torch.ops.aten.clamp_min.default):
+            return None
+
+        if len(clamp_lo.users) != 1:
+            return None
+        clamp_hi = next(iter(clamp_lo.users))
+        if not self._is_op(clamp_hi, torch.ops.aten.clamp_max.default):
+            return None
+
+        if len(clamp_hi.users) != 1:
+            return None
+        fp8_cast = next(iter(clamp_hi.users))
+        if not self._is_op(fp8_cast, torch.ops.prims.convert_element_type.default):
+            return None
+
+        if len(fp8_cast.users) != 1:
+            return None
+        quant_flat = next(iter(fp8_cast.users))
+        if not self._is_op(quant_flat, torch.ops.aten.reshape.default):
+            return None
+
+        quant_flat_size = quant_flat.args[1]
+        group_reshape_size = group_reshape.args[1]
+        num_groups = group_reshape_size[1]
+
+        quant_nodes = [
+            group_reshape,
+            abs_node,
+            max_node,
+            getitem_max,
+            absmax_f32,
+            scales_raw_div,
+            scales_3d,
+            x_div_scales,
+            clamp_lo,
+            clamp_hi,
+            fp8_cast,
+            quant_flat,
+            squeeze_node,
+        ]
+
+        output_map = {0: quant_flat, 1: squeeze_node}
+
+        return (
+            quant_flat,
+            quant_nodes,
+            output_map,
+            quant_flat_size,
+            num_groups,
+        )
 
     def apply(self, graph: fx.Graph) -> int:
         count = 0
         nodes_to_remove: list[fx.Node] = []
 
         for node in graph.nodes:
-            if not self._is_op(node, self.QUANT_OP):
+            if not self._is_op(node, torch.ops.prims.convert_element_type.default):
+                continue
+            if node.args[1] != torch.bfloat16:
                 continue
 
-            quant_input = node.args[0]
-            if not isinstance(quant_input, fx.Node):
+            bf16_cast = node
+            norm_result = self._match_gated_norm(bf16_cast)
+            if norm_result is None:
                 continue
 
-            # quant_input should be a reshape
-            if not self._is_op(quant_input, torch.ops.aten.reshape.default):
-                continue
-            reshape_node = quant_input
-            reshape_input = reshape_node.args[0]
-            if not isinstance(reshape_input, fx.Node):
-                continue
+            (
+                x_view,
+                z_view,
+                weight_node,
+                eps_val,
+                norm_nodes,
+                norm_cond_nodes,
+            ) = norm_result
 
-            # reshape_input should be convert_element_type to bf16
-            if not self._is_op(
-                reshape_input, torch.ops.prims.convert_element_type.default
-            ):
-                continue
-            if reshape_input.args[1] != torch.bfloat16:
-                continue
-            bf16_cast = reshape_input
-
-            # bf16_cast input should be mul (gated = weighted * silu_z)
-            gated_mul = bf16_cast.args[0]
-            if not isinstance(gated_mul, fx.Node):
-                continue
-            if not self._is_op(gated_mul, torch.ops.aten.mul.Tensor):
-                continue
-
-            # gated_mul args: (weighted, silu_z)
-            weighted = gated_mul.args[0]
-            silu_z = gated_mul.args[1]
-            if not isinstance(weighted, fx.Node) or not isinstance(silu_z, fx.Node):
-                continue
-
-            # silu_z should be mul(z_fp32, sigmoid(z_fp32))
-            if not self._is_op(silu_z, torch.ops.aten.mul.Tensor):
-                continue
-            z_fp32 = silu_z.args[0]
-            sigmoid_node = silu_z.args[1]
-            if not isinstance(z_fp32, fx.Node) or not isinstance(sigmoid_node, fx.Node):
-                continue
-            if not self._is_op(sigmoid_node, torch.ops.aten.sigmoid.default):
-                continue
-            if sigmoid_node.args[0] is not z_fp32:
-                continue
-
-            # z_fp32 should be convert_element_type(z, fp32)
-            if not self._is_op(z_fp32, torch.ops.prims.convert_element_type.default):
-                continue
-            if z_fp32.args[1] != torch.float32:
-                continue
-            z_view = z_fp32.args[0]  # the view/reshape of z
-
-            # weighted should be mul(x_normed, w_fp32)
-            if not self._is_op(weighted, torch.ops.aten.mul.Tensor):
-                continue
-            x_normed = weighted.args[0]
-            w_fp32 = weighted.args[1]
-            if not isinstance(x_normed, fx.Node) or not isinstance(w_fp32, fx.Node):
-                continue
-
-            # w_fp32 should be convert_element_type(weight, fp32)
-            if not self._is_op(w_fp32, torch.ops.prims.convert_element_type.default):
-                continue
-            if w_fp32.args[1] != torch.float32:
-                continue
-            weight_node = w_fp32.args[0]  # the original weight
-
-            # x_normed should be mul(x_fp32, rsqrt_node)
-            if not self._is_op(x_normed, torch.ops.aten.mul.Tensor):
-                continue
-            x_fp32 = x_normed.args[0]
-            rsqrt_node = x_normed.args[1]
-            if not isinstance(x_fp32, fx.Node) or not isinstance(rsqrt_node, fx.Node):
-                continue
-
-            # Verify the RMS path: rsqrt(mean(pow(x_fp32, 2), -1, True) + eps)
-            if not self._is_op(rsqrt_node, torch.ops.aten.rsqrt.default):
-                continue
-            add_eps = rsqrt_node.args[0]
-            if not isinstance(add_eps, fx.Node):
-                continue
-            if not self._is_op(add_eps, torch.ops.aten.add.Tensor):
-                continue
-            mean_node = add_eps.args[0]
-            eps_val = add_eps.args[1]
-            if not isinstance(mean_node, fx.Node):
-                continue
-            if not self._is_op(mean_node, torch.ops.aten.mean.dim):
-                continue
-            pow_node = mean_node.args[0]
-            if not isinstance(pow_node, fx.Node):
-                continue
-            if not self._is_op(pow_node, torch.ops.aten.pow.Tensor_Scalar):
-                continue
-            if pow_node.args[0] is not x_fp32:
-                continue
-
-            # x_fp32 should be convert_element_type(x_view, fp32)
-            if not self._is_op(x_fp32, torch.ops.prims.convert_element_type.default):
-                continue
-            if x_fp32.args[1] != torch.float32:
-                continue
-            x_view = x_fp32.args[0]  # the view/reshape of x
-
-            # Check that intermediate nodes don't have other users
-            # (except x_fp32 which feeds both pow and mul)
-            if len(bf16_cast.users) != 1:  # only reshape
-                continue
-            if len(reshape_node.users) != 1:  # only quant
-                continue
-
-            logger.info(
-                "RMSNormGatedQuantManualFusion: matched pattern at %s",
-                node.name,
+            # Try custom op quant first, then decomposed quant
+            custom_quant = self._match_custom_op_quant(bf16_cast)
+            decomposed_quant = (
+                self._match_decomposed_quant(bf16_cast)
+                if custom_quant is None
+                else None
             )
 
-            # Build the replacement:
-            # 1. Call rmsnorm_input_quant_fp8(x, weight, bias=None, z, eps, ...)
-            # 2. Reshape outputs to match expected shapes
-            reshape_size = reshape_node.args[1]  # [num_tokens, hidden_size]
+            if custom_quant is None and decomposed_quant is None:
+                continue
 
-            with graph.inserting_before(node):
+            if custom_quant is not None:
+                (
+                    insert_before,
+                    quant_remove,
+                    getitem_nodes,
+                    reshape_size,
+                ) = custom_quant
+                num_groups = None
+            else:
+                assert decomposed_quant is not None
+                (
+                    insert_before,
+                    quant_remove,
+                    output_map,
+                    reshape_size,
+                    num_groups,
+                ) = decomposed_quant
+
+            logger.info(
+                "RMSNormGatedQuantManualFusion: matched %s pattern at %s",
+                "custom-op" if custom_quant else "decomposed",
+                insert_before.name,
+            )
+
+            with graph.inserting_before(insert_before):
                 fused = graph.call_function(
                     self.FUSED_OP,
                     kwargs={
@@ -599,40 +806,31 @@ class RMSNormGatedQuantManualFusion:
                     torch.ops.aten.reshape.default,
                     (quant_out, reshape_size),
                 )
-                # Scale: from [n, 1] to [num_tokens, num_heads]
+                if num_groups is not None:
+                    scale_reshape_size = [-1, num_groups]
+                else:
+                    scale_reshape_size = [reshape_size[0], -1]
                 scale_reshaped = graph.call_function(
                     torch.ops.aten.reshape.default,
-                    (scale_out, [reshape_size[0], -1]),
+                    (scale_out, scale_reshape_size),
                 )
 
-            # Replace uses of the quant node's getitem users
-            for user in list(node.users):
-                if self._is_op(user, operator.getitem):
-                    idx = user.args[1]
+            if custom_quant is not None:
+                for gi_node in getitem_nodes:
+                    idx = gi_node.args[1]
                     if idx == 0:
-                        user.replace_all_uses_with(quant_reshaped)
+                        gi_node.replace_all_uses_with(quant_reshaped)
                     elif idx == 1:
-                        user.replace_all_uses_with(scale_reshaped)
-                    nodes_to_remove.append(user)
+                        gi_node.replace_all_uses_with(scale_reshaped)
+                    nodes_to_remove.append(gi_node)
+            else:
+                assert decomposed_quant is not None
+                output_map[0].replace_all_uses_with(quant_reshaped)
+                output_map[1].replace_all_uses_with(scale_reshaped)
 
-            nodes_to_remove.extend(
-                [
-                    node,
-                    reshape_node,
-                    bf16_cast,
-                    gated_mul,
-                    silu_z,
-                    sigmoid_node,
-                    weighted,
-                    x_normed,
-                    rsqrt_node,
-                    add_eps,
-                    mean_node,
-                    pow_node,
-                ]
-            )
-            # Only remove z_fp32, w_fp32, x_fp32 if they have no other users
-            for n in [z_fp32, w_fp32, x_fp32]:
+            nodes_to_remove.extend(quant_remove)
+            nodes_to_remove.extend(norm_nodes)
+            for n in norm_cond_nodes:
                 if all(u in nodes_to_remove or u is fused for u in n.users):
                     nodes_to_remove.append(n)
 
@@ -696,20 +894,11 @@ class RocmAiterRMSNormQuantFusionPass(VllmPatternMatcherPass):
                     epsilon, FP8_DTYPE, match_aiter_quant=match_aiter_quant
                 ).register(self.patterns)
 
-        self._gated_fusion = RMSNormGatedQuantManualFusion()
-
         self.dump_patterns(config, self.patterns)
 
     @VllmInductorPass.time_and_log
     def __call__(self, graph: fx.Graph) -> None:
-        gated_count = self._gated_fusion.apply(graph)
-        if gated_count > 0:
-            logger.info(
-                "%s RMSNormGatedQuant manual fusion replaced %s patterns",
-                self.__class__.__name__,
-                gated_count,
-            )
-        self.matched_count = self.patterns.apply(graph) + gated_count
+        self.matched_count = self.patterns.apply(graph)
         logger.debug(
             "%s Replaced %s patterns", self.__class__.__name__, self.matched_count
         )
@@ -722,7 +911,6 @@ class RocmAiterRMSNormQuantFusionPass(VllmPatternMatcherPass):
             AiterFusedAddRMSFp8GroupQuantPattern,
             AiterGemmaRMSFp8GroupQuantPattern,
             AiterFusedAddGemmaRMSFp8GroupQuantPattern,
-            RMSNormGatedQuantManualFusion,
         ]
         return self.hash_source(self, *fusion_patterns)
 
@@ -901,3 +1089,28 @@ class RocmAiterTritonAddRMSNormPadFusionPass(VllmPatternMatcherPass):
 
     def uuid(self) -> str:
         return VllmInductorPass.hash_source(self, AddAiterRMSNormPadPattern)
+
+
+class RocmAiterRMSNormGatedQuantFusionPass(VllmInductorPass):
+    """
+    Standalone pass that fuses decomposed RMSNormGated + quant into
+    rocm_aiter_rmsnorm_input_quant_fp8. Runs independently of
+    fuse_norm_quant so it works with -rms_norm -quant_fp8 custom_ops.
+    """
+
+    def __init__(self, config: VllmConfig) -> None:
+        super().__init__(config)
+        self._fusion = RMSNormGatedQuantManualFusion()
+
+    @VllmInductorPass.time_and_log
+    def __call__(self, graph: fx.Graph) -> None:
+        self.matched_count = self._fusion.apply(graph)
+        if self.matched_count > 0:
+            logger.info(
+                "%s replaced %s patterns",
+                self.__class__.__name__,
+                self.matched_count,
+            )
+
+    def uuid(self) -> str:
+        return VllmInductorPass.hash_source(self, RMSNormGatedQuantManualFusion)
