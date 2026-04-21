@@ -279,148 +279,6 @@ class AiterFusedAddRMSFp8GroupQuantPattern(AiterRMSNormQuantPattern):
         )
 
 
-class AiterGemmaRMSFp8GroupQuantPattern(AiterRMSNormQuantPattern):
-    """
-    This pattern fuses aiter gemma_rms_norm & group fp8 quant custom
-    ops into an aiter rmsnorm_input_quant_fp8 op (with optional z gate).
-    Matches: convert_element_type(weight, f32) -> add(w, 1.0) -> rms_norm -> quant
-    Returns rms_norm result as extra output to handle multi-consumer case.
-    """
-
-    FUSED_OP = rocm_aiter_ops.get_rmsnorm_input_quant_fp8_op()
-
-    def __init__(
-        self,
-        epsilon: float,
-        quant_dtype: torch.dtype,
-        group_shape: GroupShape,
-        match_aiter_quant: bool = True,
-        symmetric: bool = True,
-    ) -> None:
-        scale = ScaleDesc(torch.float32, False, group_shape)
-        key = FusedRMSQuantKey(
-            fused_add=False,
-            quant=QuantKey(dtype=quant_dtype, scale=scale, symmetric=symmetric),
-        )
-
-        super().__init__(epsilon, key, match_aiter_quant)
-
-    def register(self, pm_pass: PatternMatcherPass) -> None:
-        def pattern(
-            input: torch.Tensor,
-            weight: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            w_fp32 = torch.ops.prims.convert_element_type(weight, torch.float32)
-            w_plus_1 = w_fp32 + 1.0
-            result_rms = torch.ops.vllm_ir.rms_norm(input, w_plus_1, self.epsilon)
-            result, scale = self.quant_matcher(result_rms)
-            return result, scale, result_rms
-
-        def replacement(
-            input: torch.Tensor,
-            weight: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            w_fp32 = torch.ops.prims.convert_element_type(weight, torch.float32)
-            w_plus_1 = w_fp32 + 1.0
-            result_rms = torch.ops.vllm_ir.rms_norm(input, w_plus_1, self.epsilon)
-            at = self.FUSED_OP(
-                x=input,
-                weight=w_plus_1.to(input.dtype),
-                bias=None,
-                z=input,
-                eps=self.epsilon,
-                norm_before_gate=True,
-                activation="silu",
-                group_size=128,
-            )
-
-            return at[0], at[1], result_rms
-
-        pm.register_replacement(
-            pattern,
-            replacement,
-            [self.empty(4, 2048), self.empty(2048)],
-            pm.fwd_only,
-            pm_pass,
-        )
-
-
-class AiterFusedAddGemmaRMSFp8GroupQuantPattern(AiterRMSNormQuantPattern):
-    """
-    This pattern fuses aiter gemma_rms_norm_with_add & group fp8 quant custom
-    ops into an aiter rmsnorm_input_quant_fp8 op (with optional z gate).
-    Matches: convert_element_type(weight, f32) -> add(w, 1.0)
-             -> input+residual -> rms_norm -> quant
-    Returns rms_norm and residual as extra outputs for multi-consumer case.
-    """
-
-    FUSED_OP = rocm_aiter_ops.get_rmsnorm_input_quant_fp8_op()
-
-    def __init__(
-        self,
-        epsilon: float,
-        quant_dtype: torch.dtype,
-        group_shape: GroupShape,
-        match_aiter_quant: bool = True,
-        symmetric: bool = True,
-    ) -> None:
-        scale = ScaleDesc(torch.float32, False, group_shape)
-        key = FusedRMSQuantKey(
-            fused_add=True,
-            quant=QuantKey(dtype=quant_dtype, scale=scale, symmetric=symmetric),
-        )
-
-        super().__init__(epsilon, key, match_aiter_quant)
-
-    def register(self, pm_pass: PatternMatcherPass) -> None:
-        def pattern(
-            input: torch.Tensor,
-            weight: torch.Tensor,
-            residual: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-            w_fp32 = torch.ops.prims.convert_element_type(weight, torch.float32)
-            w_plus_1 = w_fp32 + 1.0
-            residual_out = input + residual
-            result_rms = torch.ops.vllm_ir.rms_norm(
-                residual_out, w_plus_1, self.epsilon
-            )
-            result, scale = self.quant_matcher(result_rms)
-
-            return result, scale, residual_out, result_rms
-
-        def replacement(
-            input: torch.Tensor,
-            weight: torch.Tensor,
-            residual: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-            w_fp32 = torch.ops.prims.convert_element_type(weight, torch.float32)
-            w_plus_1 = w_fp32 + 1.0
-            residual_out = input + residual
-            result_rms = torch.ops.vllm_ir.rms_norm(
-                residual_out, w_plus_1, self.epsilon
-            )
-            at = self.FUSED_OP(
-                x=residual_out,
-                weight=w_plus_1.to(input.dtype),
-                bias=None,
-                z=residual_out,
-                eps=self.epsilon,
-                norm_before_gate=True,
-                activation="silu",
-                group_size=128,
-            )
-
-            return at[0], at[1], residual_out, result_rms
-
-        pm.register_replacement(
-            pattern,
-            replacement,
-            [self.empty(4, 2048), self.empty(2048), self.empty(4, 2048)],
-            pm.fwd_only,
-            pm_pass,
-        )
-
-
 class RMSNormGatedQuantManualFusion:
     """
     Manually matches the decomposed RMSNormGated(x, z, weight, eps,
@@ -861,16 +719,6 @@ class RocmAiterRMSNormQuantFusionPass(VllmPatternMatcherPass):
         # Make sure fused add patterns are before simple rms norm,
         # as the latter is a subset of the former in torch ops
         for epsilon in [1e-5, 1e-6]:
-            # Fuse gemma_rms_norm + aiter dynamic group fp8 quant
-            AiterGemmaRMSFp8GroupQuantPattern(
-                epsilon, FP8_DTYPE, GroupShape(1, 128)
-            ).register(self.patterns)
-
-            # Fuse gemma_rms_norm_with_add + aiter dynamic group fp8 quant
-            AiterFusedAddGemmaRMSFp8GroupQuantPattern(
-                epsilon, FP8_DTYPE, GroupShape(1, 128)
-            ).register(self.patterns)
-
             #  Fuse aiter rms_norm + aiter dynamic group fp8 quant
             AiterRMSFp8GroupQuantPattern(
                 epsilon, FP8_DTYPE, GroupShape(1, 128)
@@ -909,8 +757,6 @@ class RocmAiterRMSNormQuantFusionPass(VllmPatternMatcherPass):
             AiterFusedAddRMSNormDynamicQuantPattern,
             AiterRMSFp8GroupQuantPattern,
             AiterFusedAddRMSFp8GroupQuantPattern,
-            AiterGemmaRMSFp8GroupQuantPattern,
-            AiterFusedAddGemmaRMSFp8GroupQuantPattern,
         ]
         return self.hash_source(self, *fusion_patterns)
 
