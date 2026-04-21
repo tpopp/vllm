@@ -86,7 +86,6 @@ class QuantFP8(CustomOp):
         scale: torch.Tensor | None = None,
         scale_ub: torch.Tensor | None = None,
         use_triton: bool = False,
-        rms_norm_parameters: dict | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from vllm.model_executor.layers.quantization.utils import fp8_utils
 
@@ -138,7 +137,6 @@ class QuantFP8(CustomOp):
         scale: torch.Tensor | None = None,
         scale_ub: torch.Tensor | None = None,
         use_triton: bool = False,
-        rms_norm_parameters: dict | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.is_group_quant and use_triton:
             assert scale is None, "Dynamic group quantization does not use scale"
@@ -174,7 +172,6 @@ class QuantFP8(CustomOp):
         scale: torch.Tensor | None = None,
         scale_ub: torch.Tensor | None = None,
         use_triton: bool = False,
-        rms_norm_parameters: dict | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # XPU can use same code path as CUDA.
         return self.forward_cuda(x, scale, scale_ub, use_triton)
@@ -185,14 +182,10 @@ class QuantFP8(CustomOp):
         scale: torch.Tensor | None = None,
         scale_ub: torch.Tensor | None = None,
         use_triton: bool = False,
-        rms_norm_parameters: dict | None = None,
     ):
         if self.is_group_quant and not self.static:
             assert scale is None, "Dynamic group quantization does not use scale"
-            if rms_norm_parameters is not None:
-                return self._rmsnorm_quantize_group_native(x, rms_norm_parameters)
-            else:
-                return self._quantize_group_native(x)
+            return self._quantize_group_native(x)
 
         assert (scale is not None) == self.static
         assert scale_ub is None or (
@@ -264,60 +257,5 @@ class QuantFP8(CustomOp):
 
         if self.column_major_scales:
             scales = scales.transpose(-2, -1).contiguous().transpose(-1, -2)
-
-        return x_quant, scales
-
-    def _rmsnorm_quantize_group_native(
-        self, 
-        x: torch.Tensor, # (n, h, d)
-        rms_norm_parameters: dict,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-
-        assert not self.column_major_scales, "column major for scales is not supported in this kernel"
-        assert rms_norm_parameters is not None, "rms norm parameters must not be None"
-        z = rms_norm_parameters["z"]
-        weight = rms_norm_parameters["weight"]
-        bias = rms_norm_parameters["bias"]
-        norm_group_size = rms_norm_parameters["group_size"]
-        eps = rms_norm_parameters["eps"]
-        norm_before_gate = rms_norm_parameters["norm_before_gate"]
-        activation = rms_norm_parameters["activation"]
-        core_kernel = rms_norm_parameters["core_kernel"]
-
-        assert norm_group_size is None, "group_size in rms norm should be None"
-        assert norm_before_gate, "norm_before_gate should be True"
-
-        ## following asserts are based on the fact that x and z are created by torch.zeros()
-        assert x.is_contiguous(), "x should be contiguous"
-        assert z.is_contiguous(), "z should be contiguous"
-
-        num_tokens, num_heads, head_dim = z.shape
-        x = x.view(-1, head_dim)
-        z = z.view(-1, head_dim)
-        assert x.size() == z.size(), "x and z should have the same shape"
-        assert self.group_size == head_dim, f"the kernel is only supported for group_size == head_dim, got group_size {self.group_size} and head_dim {head_dim}"
-
-        weight = weight.contiguous()
-        if bias is not None:
-            bias = bias.contiguous()
-
-        x_quant, scales = core_kernel(
-            x,
-            weight,
-            bias,
-            z,
-            eps,
-            norm_before_gate=norm_before_gate,
-            use_ue8m0=self.use_ue8m0,
-            activation=activation,
-            out_dtype=_FP8_DTYPE,
-            fp8_min=_FP8_MIN,
-            fp8_max=_FP8_MAX,
-            fp8_min_scaling_factor=_FP8_MIN_SCALING_FACTOR,
-            group_size=self.group_size,
-        )
-
-        x_quant = x_quant.view(num_tokens, -1)
-        scales = scales.view(num_tokens, -1)
 
         return x_quant, scales

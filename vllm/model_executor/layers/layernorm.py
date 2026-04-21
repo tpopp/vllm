@@ -456,6 +456,42 @@ class RMSNormGated(CustomOp):
     def reset_parameters(self):
         torch.nn.init.ones_(self.weight)
 
+    @staticmethod
+    def forward_static(
+        x: torch.Tensor,
+        z: torch.Tensor | None,
+        weight: torch.Tensor,
+        epsilon: float,
+        orig_dtype: torch.dtype,
+        group_size: int | None = None,
+        norm_before_gate: bool = True,
+    ) -> torch.Tensor:
+        """Static native implementation equivalent to forward_native()."""
+        x = x.float()
+        weight = weight.float()
+        if z is not None:
+            z = z.float()
+
+        if z is not None and not norm_before_gate:
+            x = x * F.silu(z)
+
+        if group_size is None:
+            variance = x.pow(2).mean(dim=-1, keepdim=True)
+            x_normed = x * torch.rsqrt(variance + epsilon)
+            out = x_normed * weight
+        else:
+            from einops import rearrange
+
+            x_group = rearrange(x, "... (g d) -> ... g d", d=group_size)
+            variance = x_group.pow(2).mean(dim=-1, keepdim=True)
+            x_normed = x_group * torch.rsqrt(variance + epsilon)
+            out = rearrange(x_normed, "... g d -> ... (g d)") * weight
+
+        if z is not None and norm_before_gate:
+            out = out * F.silu(z)
+
+        return out.to(orig_dtype)
+
     def forward_native(
         self, x: torch.Tensor, z: torch.Tensor | None = None
     ) -> torch.Tensor:

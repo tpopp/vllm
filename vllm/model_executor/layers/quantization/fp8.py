@@ -433,7 +433,6 @@ class Fp8LinearMethod(LinearMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
-        rms_norm_parameters: dict | None = None,
     ) -> torch.Tensor:
         # if batch invariant mode is enabled, prefer DeepGEMM FP8 path
         # we will use BF16 dequant when DeepGEMM is not supported.
@@ -444,7 +443,6 @@ class Fp8LinearMethod(LinearMethodBase):
                     layer,
                     x,
                     bias,
-                    rms_norm_parameters=rms_norm_parameters,
                 )
             else:
                 # per-tensor/channel: dequant to BF16 and run GEMM
@@ -473,7 +471,7 @@ class Fp8LinearMethod(LinearMethodBase):
         if self.use_marlin:
             return self.fp8_linear.apply_weights(layer, x, bias)
 
-        return self.fp8_linear.apply_weights(layer, x, bias, rms_norm_parameters=rms_norm_parameters) 
+        return self.fp8_linear.apply_weights(layer, x, bias)
 
 
 # TODO(future PR): remove this class in favor of

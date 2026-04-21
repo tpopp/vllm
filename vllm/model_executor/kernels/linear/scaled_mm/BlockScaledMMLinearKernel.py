@@ -117,9 +117,8 @@ class Fp8BlockScaledMMLinearKernel(
         output_shape = [*x.shape[:-1], weight.shape[0]]
 
         if self.apply_input_quant:
-            rms_norm_parameters = kwargs.get("rms_norm_parameters", None)
             q_input, input_scale = self.quant_fp8(
-                input_2d, input_scale, scale_up, use_triton=self.use_triton, rms_norm_parameters=rms_norm_parameters
+                input_2d, input_scale, scale_up, use_triton=self.use_triton
             )
         else:
             q_input = input_2d
