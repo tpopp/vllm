@@ -9,7 +9,7 @@ from torch._inductor.pattern_matcher import PatternMatcherPass
 
 import vllm.model_executor.layers.quantization.utils.fp8_utils  # noqa: F401
 from vllm._aiter_ops import rocm_aiter_ops
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
@@ -328,8 +328,8 @@ class AiterRMSNormGatedFp8GroupQuantPattern(AiterRMSNormQuantPattern):
         epsilon: float,
         quant_dtype: torch.dtype,
         group_shape: GroupShape,
-        num_heads: int = 32,
-        head_dim: int = 128,
+        num_heads: int,
+        head_dim: int,
         use_triton: bool = False,
         symmetric: bool = True,
     ) -> None:
@@ -420,6 +420,19 @@ class RocmAiterRMSNormQuantFusionPass(VllmPatternMatcherPass):
             pass_name="rocm_aiter_rms_norm_quant_fusion_pass"
         )
 
+        # Discover (num_heads, head_dim) pairs for gated RMSNorm patterns
+        # from GatedDeltaNetAttention layers in static_forward_context.
+        from vllm.model_executor.layers.mamba.gdn_linear_attn import (
+            GatedDeltaNetAttention,
+        )
+
+        gdn_layers = get_layers_from_vllm_config(config, GatedDeltaNetAttention)
+        gated_norm_shapes: set[tuple[int, int]] = set()
+        for layer in gdn_layers.values():
+            gated_norm_shapes.add(
+                (layer.num_v_heads // layer.tp_size, layer.head_v_dim)
+            )
+
         # Make sure fused add patterns are before simple rms norm,
         # as the latter is a subset of the former in torch ops
         for epsilon in [1e-5, 1e-6]:
@@ -442,13 +455,14 @@ class RocmAiterRMSNormQuantFusionPass(VllmPatternMatcherPass):
             )
 
             # Fuse decomposed RMSNormGated + group fp8 quant
-            AiterRMSNormGatedFp8GroupQuantPattern(
-                epsilon,
-                FP8_DTYPE,
-                GroupShape(1, 128),
-                num_heads=32,
-                head_dim=128,
-            ).register(self.patterns)
+            for num_heads, head_dim in gated_norm_shapes:
+                AiterRMSNormGatedFp8GroupQuantPattern(
+                    epsilon,
+                    FP8_DTYPE,
+                    GroupShape(1, 128),
+                    num_heads=num_heads,
+                    head_dim=head_dim,
+                ).register(self.patterns)
 
         self.dump_patterns(config, self.patterns)
 
