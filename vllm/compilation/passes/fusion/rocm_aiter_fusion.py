@@ -25,6 +25,7 @@ from ..vllm_inductor_pass import (
     VllmPatternMatcherPass,
     _fx_view_to_reshape,
 )
+from ..fx_utils import is_func
 from .act_quant_fusion import ActivationQuantPattern
 from .matcher_utils import (
     MatcherFusedAddRMSNorm,
@@ -38,6 +39,45 @@ from .rms_quant_fusion import (
 
 logger = init_logger(__name__)
 FP8_DTYPE = current_platform.fp8_dtype()
+
+
+def _remove_noop_reshapes(gm: fx.GraphModule) -> None:
+    """Remove reshape/view ops where input and output shapes are identical."""
+    aten_reshape = torch.ops.aten.reshape.default
+    for node in list(gm.graph.nodes):
+        if not is_func(node, aten_reshape):
+            continue
+        inp = node.args[0]
+        if not isinstance(inp, fx.Node):
+            continue
+        if "val" not in inp.meta or "val" not in node.meta:
+            continue
+        in_shape = inp.meta["val"].shape
+        out_shape = node.meta["val"].shape
+        if in_shape == out_shape:
+            node.replace_all_uses_with(inp)
+            gm.graph.erase_node(node)
+
+
+def _fold_consecutive_reshapes(gm: fx.GraphModule) -> None:
+    """Fold consecutive reshape ops into a single reshape.
+
+    When reshape(A, shape1) feeds only into reshape(result, shape2),
+    the first reshape is redundant -- replace with reshape(A, shape2).
+    """
+    aten_reshape = torch.ops.aten.reshape.default
+    for node in list(gm.graph.nodes):
+        if not is_func(node, aten_reshape):
+            continue
+        inp = node.args[0]
+        if not isinstance(inp, fx.Node) or not is_func(inp, aten_reshape):
+            continue
+        if len(inp.users) != 1:
+            continue
+        original_input = inp.args[0]
+        node.args = (original_input, node.args[1])
+        inp.replace_all_uses_with(original_input)
+        gm.graph.erase_node(inp)
 
 
 class AiterRMSNormQuantPattern:
@@ -290,8 +330,9 @@ class AiterRMSNormGatedFp8GroupQuantPattern(AiterRMSNormQuantPattern):
 
     The norm operates per-head on (N*H, D) tensors. The compiler folds the
     reshape chain so after norm the result goes through reshape→merge→quant.
-    We include the reshapes in the pattern and rely on view_to_reshape to
-    unify aten.view/aten.reshape so the pattern matches the actual graph.
+    The pattern reshapes from (N*H, D) to (N, H*D) before calling
+    MatcherQuantFP8 so that _quantize_group_native sees the full hidden dim
+    and computes the correct num_groups.
     """
 
     FUSED_OP = rocm_aiter_ops.get_rmsnorm_input_quant_fp8_op()
@@ -313,15 +354,17 @@ class AiterRMSNormGatedFp8GroupQuantPattern(AiterRMSNormQuantPattern):
         )
         super().__init__(epsilon, key, match_aiter_quant)
         self.rmsnorm_gated_matcher = MatcherRMSNormGated(epsilon)
+        self.quant_matcher = MatcherQuantFP8(
+            quant_key=kFp8Dynamic128Sym, match_rocm_aiter=match_aiter_quant,
+        )
         self.num_heads = num_heads
         self.head_dim = head_dim
 
     def register(self, pm_pass: PatternMatcherPass) -> None:
         num_heads = self.num_heads
         head_dim = self.head_dim
-        fp8_max = torch.finfo(FP8_DTYPE).max
-        fp8_min = torch.finfo(FP8_DTYPE).min
-        fp8_min_scaling_factor = 1.0 / (fp8_max * 512.0)
+        hidden_dim = num_heads * head_dim
+        quant_matcher = self.quant_matcher
 
         def pattern(
             x: torch.Tensor,
@@ -329,14 +372,9 @@ class AiterRMSNormGatedFp8GroupQuantPattern(AiterRMSNormQuantPattern):
             weight: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor]:
             normed = self.rmsnorm_gated_matcher(x, z, weight)
-            grouped = normed.reshape(-1, num_heads, head_dim)
-            absmax = grouped.abs().max(dim=-1, keepdim=True)[0].float()
-            scales = (absmax / fp8_max).clamp(min=fp8_min_scaling_factor)
-            x_scaled = grouped / scales
-            x_clamped = x_scaled.clamp(fp8_min, fp8_max).to(FP8_DTYPE)
-            x_out = x_clamped.reshape(-1, num_heads * head_dim)
-            scales_out = scales.squeeze(-1)
-            return x_out, scales_out
+            merged = normed.reshape(-1, hidden_dim)
+            quant_out, scales_out = quant_matcher(merged)
+            return quant_out, scales_out
 
         def replacement(
             x: torch.Tensor,
@@ -355,7 +393,7 @@ class AiterRMSNormGatedFp8GroupQuantPattern(AiterRMSNormQuantPattern):
             )
             fp8_out = fused[0]
             scales_out = fused[1]
-            fp8_reshaped = fp8_out.reshape(-1, num_heads * head_dim)
+            fp8_reshaped = fp8_out.reshape(-1, hidden_dim)
             scales_reshaped = scales_out.reshape(-1, num_heads)
             return fp8_reshaped, scales_reshaped
 
@@ -367,6 +405,8 @@ class AiterRMSNormGatedFp8GroupQuantPattern(AiterRMSNormQuantPattern):
         def trace_fn(*args, **kwargs):
             gm = pm.fwd_only(*args, **kwargs)
             _fx_view_to_reshape(gm)
+            _fold_consecutive_reshapes(gm)
+            _remove_noop_reshapes(gm)
             return gm
 
         pm.register_replacement(
@@ -640,75 +680,19 @@ class RocmAiterRMSNormGatedQuantFusionPass(VllmPatternMatcherPass):
 
         self.dump_patterns(config, self.patterns)
 
-        with open("/tmp/gated_quant_pattern_dump.txt", "w") as f:
-            for p in self.patterns.patterns.values():
-                for pat in p:
-                    f.write(f"=== Pattern: {pat} ===\n")
-                    f.write(f"  type: {type(pat).__name__}\n")
-                    f.write(
-                        f"  attrs: {[a for a in dir(pat) if not a.startswith('_')]}\n"
-                    )
-                    if hasattr(pat, "pattern"):
-                        graph = pat.pattern
-                        if hasattr(graph, "nodes"):
-                            for node in graph.nodes:
-                                meta = ""
-                                if hasattr(node, "meta") and "val" in node.meta:
-                                    val = node.meta["val"]
-                                    if isinstance(val, torch.Tensor):
-                                        meta = f" | shape={val.shape} dtype={val.dtype}"
-                                f.write(
-                                    f"  {node.name}: {node.op} "
-                                    f"{node.target} "
-                                    f"args={str(node.args)[:300]}{meta}\n"
-                                )
-                        elif hasattr(graph, "graph"):
-                            for node in graph.graph.nodes:
-                                meta = ""
-                                if hasattr(node, "meta") and "val" in node.meta:
-                                    val = node.meta["val"]
-                                    if isinstance(val, torch.Tensor):
-                                        meta = f" | shape={val.shape} dtype={val.dtype}"
-                                f.write(
-                                    f"  {node.name}: {node.op} "
-                                    f"{node.target} "
-                                    f"args={str(node.args)[:300]}{meta}\n"
-                                )
-                        else:
-                            f.write(f"  pattern_repr: {repr(graph)[:500]}\n")
-                    f.write("\n")
-
     @VllmInductorPass.time_and_log
     def __call__(self, graph: fx.Graph) -> None:
-        dump_idx = getattr(self, "_dump_idx", 0)
-        self._dump_idx = dump_idx + 1
-        with open(f"/tmp/gated_quant_graph_{dump_idx}.txt", "w") as f:
-            for node in graph.nodes:
-                meta = ""
-                if hasattr(node, "meta") and "val" in node.meta:
-                    val = node.meta["val"]
-                    if isinstance(val, torch.Tensor):
-                        meta = f" | shape={val.shape} dtype={val.dtype}"
-                    elif isinstance(val, (tuple, list)):
-                        parts = []
-                        for v in val:
-                            if isinstance(v, torch.Tensor):
-                                parts.append(f"shape={v.shape} dtype={v.dtype}")
-                            else:
-                                parts.append(str(type(v).__name__)[:20])
-                        meta = f" | ({', '.join(parts)})"
-                f.write(
-                    f"{node.name}: {node.op} {node.target} "
-                    f"args={str(node.args)[:300]}{meta}\n"
-                )
+        _orig_fx_to_pat = pm.fx_to_pattern
 
-        self.matched_count = self.patterns.apply(graph)
-        logger.info(
-            "%s replaced %s patterns (graph %d)",
-            self.__class__.__name__,
-            self.matched_count,
-            dump_idx,
-        )
+        def _relaxed_fx_to_pattern(*a, **kw):
+            kw["ignore_types"] = (int, torch.SymInt)
+            return _orig_fx_to_pat(*a, **kw)
+
+        pm.fx_to_pattern = _relaxed_fx_to_pattern
+        try:
+            self.matched_count = self.patterns.apply(graph)
+        finally:
+            pm.fx_to_pattern = _orig_fx_to_pat
 
     def uuid(self) -> str:
         return VllmInductorPass.hash_source(self, AiterRMSNormGatedFp8GroupQuantPattern)

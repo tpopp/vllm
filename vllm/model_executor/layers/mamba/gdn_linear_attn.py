@@ -93,7 +93,7 @@ try:
         gdn_aiter_fused_rearrange_sigmoid_gated_delta_rule = (
             _gdn_aiter_fused_rearrange_sigmoid_gated_delta_rule
         )
-        GDN_AITER_TRITON_AVAILABLE = True
+        GDN_AITER_TRITON_AVAILABLE = False  # Force decomposition for fusion pass
 except ImportError:
     pass
 
