@@ -41,24 +41,6 @@ logger = init_logger(__name__)
 FP8_DTYPE = current_platform.fp8_dtype()
 
 
-def _remove_noop_reshapes(gm: fx.GraphModule) -> None:
-    """Remove reshape/view ops where input and output shapes are identical."""
-    aten_reshape = torch.ops.aten.reshape.default
-    for node in list(gm.graph.nodes):
-        if not is_func(node, aten_reshape):
-            continue
-        inp = node.args[0]
-        if not isinstance(inp, fx.Node):
-            continue
-        if "val" not in inp.meta or "val" not in node.meta:
-            continue
-        in_shape = inp.meta["val"].shape
-        out_shape = node.meta["val"].shape
-        if in_shape == out_shape:
-            node.replace_all_uses_with(inp)
-            gm.graph.erase_node(node)
-
-
 def _fold_consecutive_reshapes(gm: fx.GraphModule) -> None:
     """Fold consecutive reshape ops into a single reshape.
 
@@ -407,7 +389,6 @@ class AiterRMSNormGatedFp8GroupQuantPattern(AiterRMSNormQuantPattern):
             gm = pm.fwd_only(*args, **kwargs)
             _fx_view_to_reshape(gm)
             _fold_consecutive_reshapes(gm)
-            _remove_noop_reshapes(gm)
             return gm
 
         pm.register_replacement(
