@@ -44,6 +44,12 @@ FP8_DTYPE = current_platform.fp8_dtype()
 def _fold_consecutive_reshapes(gm: fx.GraphModule) -> None:
     """Fold consecutive reshape ops into a single reshape.
 
+    ``make_fx`` faithfully records every view/reshape the Python code performs,
+    so patterns like ``x.reshape(a, b).reshape(c, d)`` produce two reshape
+    nodes.  Inductor's own optimisation would fold these, but
+    ``pm.register_replacement``'s ``trace_fn`` runs before Inductor, so we
+    must fold them ourselves for the pattern to match the compiled graph.
+
     When reshape(A, shape1) feeds only into reshape(result, shape2),
     the first reshape is redundant -- replace with reshape(A, shape2).
     """
@@ -468,6 +474,10 @@ class RocmAiterRMSNormQuantFusionPass(VllmPatternMatcherPass):
 
     @VllmInductorPass.time_and_log
     def __call__(self, graph: fx.Graph) -> None:
+        # The gated RMSNorm pattern uses concrete ints for reshape dimensions
+        # at trace time, but the compiled graph may use torch.SymInt.  Tell
+        # the pattern matcher to treat int/SymInt as wildcards so that
+        # reshape shape arguments don't block matching.
         _orig_fx_to_pat = pm.fx_to_pattern
 
         def _relaxed_fx_to_pattern(*a, **kw):

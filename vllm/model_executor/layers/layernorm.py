@@ -466,7 +466,17 @@ class RMSNormGated(CustomOp):
         group_size: int | None = None,
         norm_before_gate: bool = True,
     ) -> torch.Tensor:
-        """Static native implementation equivalent to forward_native()."""
+        """Pure-PyTorch RMS normalization with optional gating.
+
+        This static method contains the full native logic so that both
+        ``forward_native`` and ``MatcherRMSNormGated`` (used by the
+        compilation pattern matcher) can share the same implementation.
+
+        If *z* is not None and *norm_before_gate* is True:
+            ``out = rms_norm(x) * silu(z)``
+        If *z* is not None and *norm_before_gate* is False:
+            ``out = rms_norm(x * silu(z))``
+        """
         x = x.float()
         weight = weight.float()
         if z is not None:

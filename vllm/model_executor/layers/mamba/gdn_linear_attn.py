@@ -8,6 +8,7 @@ from torch import nn
 from transformers.activations import ACT2FN
 
 from vllm import envs
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
@@ -65,37 +66,34 @@ from vllm.utils.torch_utils import (
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
-# Optional ROCm Aiter Triton kernels for Qwen-Next GDN (import once; False if
-# aiter is missing, unsupported, or disabled).
+# Optional ROCm AITER Triton kernels for the GDN decode fast-path.
+# Availability is checked centrally via rocm_aiter_ops; the actual function
+# references are imported here so that they can be called without per-call
+# import overhead.
 GDN_AITER_TRITON_AVAILABLE = False
 gdn_aiter_fused_rearrange_sigmoid_gated_delta_rule = None
 gdn_aiter_causal_conv1d_update_fast = None
 gdn_aiter_fused_reshape_causal_conv1d_update_fast = None
 
-try:
-    from vllm._aiter_ops import is_aiter_found_and_supported
+if rocm_aiter_ops.is_enabled() and rocm_aiter_ops.are_gdn_triton_kernels_available():
+    from aiter.ops.triton.causal_conv1d_update_fast import (
+        causal_conv1d_update_fast as _gdn_aiter_causal_conv1d_update_fast,
+    )
+    from aiter.ops.triton.causal_conv1d_update_fast import (
+        fused_reshape_causal_conv1d_update_fast as _gdn_aiter_fused_reshape_causal_conv1d_update_fast,  # noqa: E501
+    )
+    from aiter.ops.triton.gated_delta_net import (
+        fused_rearrange_sigmoid_gated_delta_rule as _gdn_aiter_fused_rearrange_sigmoid_gated_delta_rule,  # noqa: E501
+    )
 
-    if envs.VLLM_ROCM_USE_AITER and is_aiter_found_and_supported():
-        from aiter.ops.triton.causal_conv1d_update_fast import (
-            causal_conv1d_update_fast as _gdn_aiter_causal_conv1d_update_fast,
-        )
-        from aiter.ops.triton.causal_conv1d_update_fast import (
-            fused_reshape_causal_conv1d_update_fast as _gdn_aiter_fused_reshape_causal_conv1d_update_fast,
-        )
-        from aiter.ops.triton.gated_delta_net import (
-            fused_rearrange_sigmoid_gated_delta_rule as _gdn_aiter_fused_rearrange_sigmoid_gated_delta_rule,
-        )
-
-        gdn_aiter_causal_conv1d_update_fast = _gdn_aiter_causal_conv1d_update_fast
-        gdn_aiter_fused_reshape_causal_conv1d_update_fast = (
-            _gdn_aiter_fused_reshape_causal_conv1d_update_fast
-        )
-        gdn_aiter_fused_rearrange_sigmoid_gated_delta_rule = (
-            _gdn_aiter_fused_rearrange_sigmoid_gated_delta_rule
-        )
-        GDN_AITER_TRITON_AVAILABLE = True
-except ImportError:
-    pass
+    gdn_aiter_causal_conv1d_update_fast = _gdn_aiter_causal_conv1d_update_fast
+    gdn_aiter_fused_reshape_causal_conv1d_update_fast = (
+        _gdn_aiter_fused_reshape_causal_conv1d_update_fast
+    )
+    gdn_aiter_fused_rearrange_sigmoid_gated_delta_rule = (
+        _gdn_aiter_fused_rearrange_sigmoid_gated_delta_rule
+    )
+    GDN_AITER_TRITON_AVAILABLE = True
 
 logger = init_logger(__name__)
 
@@ -768,9 +766,8 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         # ============================================================
         # Part 3: Output Projection
         # ============================================================
-        # The RMSNormGated + quant fusion is handled by the compilation
-        # pass (RMSNormGatedQuantManualFusion) which replaces the
-        # decomposed ops with rocm_aiter_rmsnorm_input_quant_fp8.
+        # The RMSNormGated + quant sequence below is eligible for fusion
+        # by the compilation pass when fuse_norm_quant is enabled.
         z_shape_og = z.shape
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
         z = z.reshape(-1, z.shape[-1])
