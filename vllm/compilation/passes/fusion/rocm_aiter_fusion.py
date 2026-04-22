@@ -423,7 +423,7 @@ class RocmAiterRMSNormQuantFusionPass(VllmPatternMatcherPass):
     """
     This pass fuses aiter rms_norm & vllm/aiter quant custom ops
     into a fused rms_norm_quant op.
-    It also supports fused_add_rms_norm.
+    It also supports fused_add_rms_norm and gated rms_norm (RMSNormGated).
     """
 
     @enable_fake_mode
@@ -460,13 +460,33 @@ class RocmAiterRMSNormQuantFusionPass(VllmPatternMatcherPass):
                     epsilon, FP8_DTYPE, match_aiter_quant=match_aiter_quant
                 ).register(self.patterns)
 
+            # Fuse decomposed RMSNormGated + group fp8 quant
+            AiterRMSNormGatedFp8GroupQuantPattern(
+                epsilon,
+                FP8_DTYPE,
+                GroupShape(1, 128),
+                num_heads=32,
+                head_dim=128,
+            ).register(self.patterns)
+
         self.dump_patterns(config, self.patterns)
 
     @VllmInductorPass.time_and_log
     def __call__(self, graph: fx.Graph) -> None:
-        self.matched_count = self.patterns.apply(graph)
+        _orig_fx_to_pat = pm.fx_to_pattern
+
+        def _relaxed_fx_to_pattern(*a, **kw):
+            kw["ignore_types"] = (int, torch.SymInt)
+            return _orig_fx_to_pat(*a, **kw)
+
+        pm.fx_to_pattern = _relaxed_fx_to_pattern
+        try:
+            self.matched_count = self.patterns.apply(graph)
+        finally:
+            pm.fx_to_pattern = _orig_fx_to_pat
+
         logger.debug(
-            "%s Replaced %s patterns", self.__class__.__name__, self.matched_count
+            "%s replaced %s patterns", self.__class__.__name__, self.matched_count
         )
 
     def uuid(self) -> str:
@@ -475,6 +495,7 @@ class RocmAiterRMSNormQuantFusionPass(VllmPatternMatcherPass):
             AiterFusedAddRMSNormDynamicQuantPattern,
             AiterRMSFp8GroupQuantPattern,
             AiterFusedAddRMSFp8GroupQuantPattern,
+            AiterRMSNormGatedFp8GroupQuantPattern,
         ]
         return self.hash_source(self, *fusion_patterns)
 
@@ -653,51 +674,3 @@ class RocmAiterTritonAddRMSNormPadFusionPass(VllmPatternMatcherPass):
 
     def uuid(self) -> str:
         return VllmInductorPass.hash_source(self, AddAiterRMSNormPadPattern)
-
-
-class RocmAiterRMSNormGatedQuantFusionPass(VllmPatternMatcherPass):
-    """
-    Fuses decomposed RMSNormGated + group FP8 quant into
-    rocm_aiter_rmsnorm_input_quant_fp8. Runs independently of
-    fuse_norm_quant so it works with -rms_norm -quant_fp8 custom_ops.
-    """
-
-    @enable_fake_mode
-    def __init__(self, config: VllmConfig) -> None:
-        super().__init__(config)
-
-        self.patterns: PatternMatcherPass = PatternMatcherPass(
-            pass_name="rocm_aiter_rmsnorm_gated_quant_fusion_pass"
-        )
-
-        for epsilon in [1e-5, 1e-6]:
-            AiterRMSNormGatedFp8GroupQuantPattern(
-                epsilon,
-                FP8_DTYPE,
-                GroupShape(1, 128),
-                num_heads=32,
-                head_dim=128,
-            ).register(self.patterns)
-
-        self.dump_patterns(config, self.patterns)
-
-    @VllmInductorPass.time_and_log
-    def __call__(self, graph: fx.Graph) -> None:
-        _orig_fx_to_pat = pm.fx_to_pattern
-
-        def _relaxed_fx_to_pattern(*a, **kw):
-            kw["ignore_types"] = (int, torch.SymInt)
-            return _orig_fx_to_pat(*a, **kw)
-
-        pm.fx_to_pattern = _relaxed_fx_to_pattern
-        try:
-            self.matched_count = self.patterns.apply(graph)
-        finally:
-            pm.fx_to_pattern = _orig_fx_to_pat
-
-        logger.debug(
-            "%s matched %d patterns", self.__class__.__name__, self.matched_count
-        )
-
-    def uuid(self) -> str:
-        return VllmInductorPass.hash_source(self, AiterRMSNormGatedFp8GroupQuantPattern)
