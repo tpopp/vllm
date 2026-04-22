@@ -19,13 +19,13 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 
+from ..fx_utils import is_func
 from ..inductor_pass import enable_fake_mode
 from ..vllm_inductor_pass import (
     VllmInductorPass,
     VllmPatternMatcherPass,
     _fx_view_to_reshape,
 )
-from ..fx_utils import is_func
 from .act_quant_fusion import ActivationQuantPattern
 from .matcher_utils import (
     MatcherFusedAddRMSNorm,
@@ -355,7 +355,8 @@ class AiterRMSNormGatedFp8GroupQuantPattern(AiterRMSNormQuantPattern):
         super().__init__(epsilon, key, match_aiter_quant)
         self.rmsnorm_gated_matcher = MatcherRMSNormGated(epsilon)
         self.quant_matcher = MatcherQuantFP8(
-            quant_key=kFp8Dynamic128Sym, match_rocm_aiter=match_aiter_quant,
+            quant_key=kFp8Dynamic128Sym,
+            match_rocm_aiter=match_aiter_quant,
         )
         self.num_heads = num_heads
         self.head_dim = head_dim
@@ -693,6 +694,10 @@ class RocmAiterRMSNormGatedQuantFusionPass(VllmPatternMatcherPass):
             self.matched_count = self.patterns.apply(graph)
         finally:
             pm.fx_to_pattern = _orig_fx_to_pat
+
+        logger.debug(
+            "%s matched %d patterns", self.__class__.__name__, self.matched_count
+        )
 
     def uuid(self) -> str:
         return VllmInductorPass.hash_source(self, AiterRMSNormGatedFp8GroupQuantPattern)
