@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3-Next/Qwen3.5 model."""
 
+from typing import Any
+
 import torch
 from einops import rearrange
 from torch import nn
@@ -71,9 +73,9 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 # references are imported here so that they can be called without per-call
 # import overhead.
 GDN_AITER_TRITON_AVAILABLE = False
-gdn_aiter_fused_rearrange_sigmoid_gated_delta_rule = None
-gdn_aiter_causal_conv1d_update_fast = None
-gdn_aiter_fused_reshape_causal_conv1d_update_fast = None
+gdn_aiter_fused_rearrange_sigmoid_gated_delta_rule: Any = None
+gdn_aiter_causal_conv1d_update_fast: Any = None
+gdn_aiter_fused_reshape_causal_conv1d_update_fast: Any = None
 
 if rocm_aiter_ops.is_enabled() and rocm_aiter_ops.are_gdn_triton_kernels_available():
     from aiter.ops.triton.causal_conv1d_update_fast import (
@@ -633,7 +635,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         if mixed_qkv is None:
             return None, None, None
 
-        l = mixed_qkv.shape[0]
+        seq_len = mixed_qkv.shape[0]
         q_dim = self.key_dim // self.tp_size
         k_dim = self.key_dim // self.tp_size
         v_dim = self.value_dim // self.tp_size
@@ -647,17 +649,17 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         )
 
         # 3. Slice the single buffer.
-        q_size = l * q_dim
-        k_size = l * k_dim
+        q_size = seq_len * q_dim
+        k_size = seq_len * k_dim
 
         q_contig = fused[0:q_size]
         k_contig = fused[q_size : q_size + k_size]
         v_contig = fused[q_size + k_size :]
 
         # 4. Zero cost reshape
-        query = q_contig.view(1, l, -1, self.head_k_dim)
-        key = k_contig.view(1, l, -1, self.head_k_dim)
-        value = v_contig.view(1, l, -1, self.head_v_dim)
+        query = q_contig.view(1, seq_len, -1, self.head_k_dim)
+        key = k_contig.view(1, seq_len, -1, self.head_k_dim)
+        value = v_contig.view(1, seq_len, -1, self.head_v_dim)
 
         return query, key, value
 
