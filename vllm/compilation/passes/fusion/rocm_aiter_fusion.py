@@ -447,7 +447,7 @@ class RocmAiterRMSNormQuantFusionPass(VllmPatternMatcherPass):
                 epsilon, FP8_DTYPE, GroupShape(1, 128)
             ).register(self.patterns)
 
-            for match_aiter_quant in [True, False]:
+            for match_aiter_quant in [True]:
                 # Fuse aiter rms_norm + (aiter / vllm built-in)
                 # dynamic per-token fp8 quant
                 AiterRMSNormDynamicQuantPattern(
