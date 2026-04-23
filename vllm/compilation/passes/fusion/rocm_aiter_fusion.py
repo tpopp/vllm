@@ -489,15 +489,18 @@ class RocmAiterRMSNormQuantFusionPass(VllmPatternMatcherPass):
                     match_rocm_aiter_quant=match_aiter_quant,
                 ).register(self.patterns)
 
-            # Fuse decomposed RMSNormGated + group fp8 quant
-            for num_heads, head_dim in gated_norm_shapes:
-                AiterRMSNormGatedFp8GroupQuantPattern(
-                    epsilon,
-                    FP8_DTYPE,
-                    GroupShape(1, 128),
-                    num_heads=num_heads,
-                    head_dim=head_dim,
-                ).register(self.patterns)
+            # Fuse decomposed RMSNormGated + group fp8 quant.
+            # The replacement op (fused_rms_gated_fp8_group_quant) requires
+            # an aiter version that includes the GDN triton kernel renames.
+            if gated_norm_shapes and rocm_aiter_ops.are_gdn_triton_kernels_available():
+                for num_heads, head_dim in gated_norm_shapes:
+                    AiterRMSNormGatedFp8GroupQuantPattern(
+                        epsilon,
+                        FP8_DTYPE,
+                        GroupShape(1, 128),
+                        num_heads=num_heads,
+                        head_dim=head_dim,
+                    ).register(self.patterns)
 
         self.dump_patterns(config, self.patterns)
 
