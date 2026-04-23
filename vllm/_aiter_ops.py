@@ -1302,7 +1302,7 @@ class rocm_aiter_ops:
         if not is_aiter_found_and_supported():
             return False
         try:
-            import aiter.ops.triton.causal_conv1d_update_fast  # noqa: F401
+            import aiter.ops.triton.causal_conv1d_update_single_token  # noqa: F401
             import aiter.ops.triton.gated_delta_net  # noqa: F401
 
             return True
