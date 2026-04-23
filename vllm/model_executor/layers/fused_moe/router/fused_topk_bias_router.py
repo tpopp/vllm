@@ -210,6 +210,7 @@ class FusedTopKBiasRouter(BaseRouter):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         indices_type: torch.dtype | None,
+        num_fused_shared_experts: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute routing using fused top-k with bias."""
         topk_weights, topk_ids = fused_topk_bias(

@@ -223,6 +223,7 @@ class BaseRouter(FusedMoERouter):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         indices_type: torch.dtype | None,
+        num_fused_shared_experts: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Compute the actual routing logic.
@@ -234,6 +235,8 @@ class BaseRouter(FusedMoERouter):
             hidden_states: Input hidden states
             router_logits: Router logits for expert selection
             indices_type: Desired dtype for expert indices (may be None)
+            num_fused_shared_experts: Number of shared experts whose
+                activation is fused into the routing kernel (0 = disabled)
 
         Returns:
             tuple of (topk_weights, topk_ids)
@@ -244,6 +247,7 @@ class BaseRouter(FusedMoERouter):
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
+        num_fused_shared_experts: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Route the input hidden states to the top-k experts based on the
@@ -273,7 +277,8 @@ class BaseRouter(FusedMoERouter):
 
         # Step 3: Compute routing (delegated to subclass)
         topk_weights, topk_ids = self._compute_routing(
-            hidden_states, router_logits, indices_type
+            hidden_states, router_logits, indices_type,
+            num_fused_shared_experts=num_fused_shared_experts,
         )
 
         # Capture logical ids before EPLB mapping.
