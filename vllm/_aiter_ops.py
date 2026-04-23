@@ -808,7 +808,7 @@ def _rocm_aiter_rmsnorm_fp8_group_quant_fake(
     )
 
 
-def _rocm_aiter_rmsnorm_input_quant_fp8_impl(
+def _rocm_aiter_fused_rms_gated_fp8_group_quant_impl(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor | None,
@@ -818,9 +818,9 @@ def _rocm_aiter_rmsnorm_input_quant_fp8_impl(
     activation: str,
     group_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from aiter.ops.triton.quant import rmsnorm_input_quant_fp8
+    from aiter.ops.triton.quant import fused_rms_gated_fp8_group_quant
 
-    return rmsnorm_input_quant_fp8(
+    return fused_rms_gated_fp8_group_quant(
         x,
         weight,
         bias,
@@ -833,7 +833,7 @@ def _rocm_aiter_rmsnorm_input_quant_fp8_impl(
     )
 
 
-def _rocm_aiter_rmsnorm_input_quant_fp8_fake(
+def _rocm_aiter_fused_rms_gated_fp8_group_quant_fake(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor | None,
@@ -1432,9 +1432,9 @@ class rocm_aiter_ops:
             )
 
             direct_register_custom_op(
-                op_name="rocm_aiter_rmsnorm_input_quant_fp8",
-                op_func=_rocm_aiter_rmsnorm_input_quant_fp8_impl,
-                fake_impl=_rocm_aiter_rmsnorm_input_quant_fp8_fake,
+                op_name="rocm_aiter_fused_rms_gated_fp8_group_quant",
+                op_func=_rocm_aiter_fused_rms_gated_fp8_group_quant_impl,
+                fake_impl=_rocm_aiter_fused_rms_gated_fp8_group_quant_fake,
             )
 
             direct_register_custom_op(
@@ -1524,8 +1524,8 @@ class rocm_aiter_ops:
         return torch.ops.vllm.rocm_aiter_rmsnorm_fp8_group_quant.default
 
     @staticmethod
-    def get_rmsnorm_input_quant_fp8_op() -> OpOverload:
-        return torch.ops.vllm.rocm_aiter_rmsnorm_input_quant_fp8.default
+    def get_fused_rms_gated_fp8_group_quant_op() -> OpOverload:
+        return torch.ops.vllm.rocm_aiter_fused_rms_gated_fp8_group_quant.default
 
     @staticmethod
     def get_rmsnorm_group_add_fused_quant_op() -> OpOverload:

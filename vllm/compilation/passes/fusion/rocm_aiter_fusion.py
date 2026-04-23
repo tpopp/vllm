@@ -332,7 +332,7 @@ class AiterFusedAddRMSFp8GroupQuantPattern(AiterRMSNormQuantPattern):
 class AiterRMSNormGatedFp8GroupQuantPattern(AiterRMSNormQuantPattern):
     """
     Matches decomposed RMSNormGated + reshape + group FP8 quant and replaces
-    with rocm_aiter_rmsnorm_input_quant_fp8.
+    with rocm_aiter_fused_rms_gated_fp8_group_quant.
 
     The norm operates per-head on (N*H, D) tensors. The compiler folds the
     reshape chain so after norm the result goes through reshape→merge→quant.
@@ -341,7 +341,7 @@ class AiterRMSNormGatedFp8GroupQuantPattern(AiterRMSNormQuantPattern):
     and computes the correct num_groups.
     """
 
-    FUSED_OP = rocm_aiter_ops.get_rmsnorm_input_quant_fp8_op()
+    FUSED_OP = rocm_aiter_ops.get_fused_rms_gated_fp8_group_quant_op()
 
     def __init__(
         self,
