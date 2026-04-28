@@ -8,6 +8,7 @@ from torch._higher_order_ops.auto_functionalize import auto_functionalized
 from torch._inductor.fx_passes.post_grad import view_to_reshape
 from torch._inductor.pattern_matcher import PatternMatcherPass
 
+import vllm.ir.ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.config.utils import Range
@@ -21,7 +22,7 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 from ..inductor_pass import enable_fake_mode
 from ..vllm_inductor_pass import VllmInductorPass, VllmPatternMatcherPass
-from .matcher_utils import MatcherRMSNorm, MatcherRotaryEmbedding
+from .matcher_utils import MatcherRotaryEmbedding
 from .rms_quant_fusion import empty_bf16, empty_fp32, empty_i64
 
 logger = init_logger(__name__)
@@ -202,63 +203,58 @@ def fused_triton_qk_norm_rope_kvcache_update_impl(
     if layer_slot_mapping is None:
         return torch.empty(0, device=qkv.device, dtype=qkv.dtype)
 
-    T = qkv.shape[0]
     num_heads = q_out.shape[1]
     head_dim = q_out.shape[2]
     num_kv_heads = k_out.shape[1]
-    q_size = num_heads * head_dim
-    kv_size = num_kv_heads * head_dim
 
-    if attn_output_gate:
-        q_gate, k, v = qkv.split([q_size * 2, kv_size, kv_size], dim=-1)
-        q_gate_3d = q_gate.view(T, num_heads, 2 * head_dim)
-        q_3d, gate_3d = q_gate_3d.chunk(2, dim=-1)
-    else:
-        q_flat, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
-        q_3d = q_flat.view(T, num_heads, head_dim)
+    # Split cos_sin_cache into cos and sin WITHOUT position indexing.
+    # The AITER kernel indexes by position internally, so we must pass
+    # the full cache to avoid double-indexing.
+    rdh = cos_sin_cache.shape[-1] // 2
+    cos_full = cos_sin_cache[:, :rdh]
+    sin_full = cos_sin_cache[:, rdh:]
 
-    # GemmaRMSNorm for Q
-    q_fp = q_3d.float()
-    q_var = q_fp.pow(2).mean(dim=-1, keepdim=True)
-    q_n = q_fp * torch.rsqrt(q_var + rms_norm_eps)
-    q_n = q_n * (1.0 + q_weight.float())
-    q_normed = q_n.to(qkv.dtype)
+    # Skip cache writes inside the AITER kernel (slot_mapping of -1).
+    # reshape_and_cache_flash writes in a packed layout (BHDSX) that
+    # differs from plain NHD; the backend's do_kv_cache_update uses
+    # the correct format for the active attention backend.
+    skip_slots = torch.full_like(layer_slot_mapping, -1)
 
-    # GemmaRMSNorm for K
-    k_3d = k.view(T, num_kv_heads, head_dim)
-    k_fp = k_3d.float()
-    k_var = k_fp.pow(2).mean(dim=-1, keepdim=True)
-    k_n = k_fp * torch.rsqrt(k_var + rms_norm_eps)
-    k_n = k_n * (1.0 + k_weight.float())
-    k_normed = k_n.to(qkv.dtype)
+    key_cache, value_cache = kv_cache.unbind(0)
+    key_cache_hnd = key_cache.permute(0, 2, 1, 3)
+    value_cache_hnd = value_cache.permute(0, 2, 1, 3)
 
-    # RoPE (supports partial rotation: rotary_dim <= head_dim)
-    cos_sin = cos_sin_cache[positions.long()]
-    cos, sin = cos_sin.chunk(2, dim=-1)
-    rotary_dim = cos.shape[-1] * 2
+    rocm_aiter_ops.fused_qkv_split_qk_norm_rope_cache(
+        qkv=qkv,
+        q_weight=q_weight,
+        k_weight=k_weight,
+        cos=cos_full,
+        sin=sin_full,
+        positions=positions,
+        key_cache=key_cache_hnd,
+        value_cache=value_cache_hnd,
+        slot_mapping=skip_slots,
+        q_out=q_out,
+        k_out=k_out,
+        v_out=v_out,
+        gate_out=gate_out,
+        qh=num_heads,
+        kvh=num_kv_heads,
+        head_dim=head_dim,
+        is_neox=is_neox,
+        attn_output_gate=attn_output_gate,
+        k_scale=None,
+        v_scale=None,
+        eps=rms_norm_eps,
+    )
 
-    def _apply_neox_rope(x_3d: torch.Tensor) -> torch.Tensor:
-        x_rot = x_3d[..., :rotary_dim]
-        x_pass = x_3d[..., rotary_dim:]
-        x1 = x_rot[..., : rotary_dim // 2]
-        x2 = x_rot[..., rotary_dim // 2 :]
-        c = cos.unsqueeze(1)
-        s = sin.unsqueeze(1)
-        x_rot_out = torch.cat([x1 * c - x2 * s, x2 * c + x1 * s], dim=-1)
-        return torch.cat([x_rot_out, x_pass], dim=-1)
-
-    q_rope = _apply_neox_rope(q_normed)
-    k_rope = _apply_neox_rope(k_normed)
-
-    q_out.copy_(q_rope)
-    k_out.copy_(k_rope)
-    v_out.copy_(v.view(T, num_kv_heads, head_dim))
-    if attn_output_gate and gate_out is not None:
-        gate_out.copy_(gate_3d)
-
-    # KV cache update
-    torch.ops.vllm.unified_kv_cache_update(
-        k_rope, v.view(T, num_kv_heads, head_dim), layer_name
+    # Write K/V to cache using the backend's native format.
+    attn_layer.impl.do_kv_cache_update(
+        attn_layer,
+        k_out,
+        v_out,
+        kv_cache,
+        layer_slot_mapping,
     )
 
     return torch.empty(0, device=qkv.device, dtype=qkv.dtype)
@@ -324,7 +320,6 @@ class QkNormRopeKvCachePattern:
         eps: float,
         is_neox: bool,
         rope_flashinfer: bool = False,
-        match_rocm_aiter_rms: bool = False,
         match_rocm_aiter_rope: bool = False,
     ) -> None:
         self.layer_name = layer.layer_name
@@ -340,9 +335,6 @@ class QkNormRopeKvCachePattern:
         self.k_size = self.num_kv_heads * self.head_size
         self.v_size = self.num_kv_heads * self.head_size_v
 
-        self.rmsnorm_matcher = MatcherRMSNorm(
-            eps, match_rocm_aiter=match_rocm_aiter_rms
-        )
         self.rope_matcher = MatcherRotaryEmbedding(
             is_neox=is_neox,
             head_size=self.head_size,
@@ -377,7 +369,6 @@ class QkNormRopeKvCachePattern:
         eps = self.eps
         is_neox = self.is_neox
 
-        rmsnorm_matcher = self.rmsnorm_matcher
         rope_matcher = self.rope_matcher
 
         def pattern(
@@ -391,11 +382,11 @@ class QkNormRopeKvCachePattern:
             q, k, v = qkv.split([q_size, k_size, v_size], dim=-1)
 
             q_by_head = q.view(T, q_size // head_dim, head_dim)
-            q_normed = rmsnorm_matcher(q_by_head, q_weight)
+            q_normed = vllm.ir.ops.rms_norm(q_by_head, q_weight, eps)
             q_flat = q_normed.view(T, q_size)
 
             k_by_head = k.view(T, k_size // head_dim, head_dim)
-            k_normed = rmsnorm_matcher(k_by_head, k_weight)
+            k_normed = vllm.ir.ops.rms_norm(k_by_head, k_weight, eps)
             k_flat = k_normed.view(T, k_size)
 
             q_rope, k_rope = rope_matcher(positions, q_flat, k_flat, cos_sin_cache)
@@ -490,7 +481,6 @@ class Qwen3NextQkNormRopeKvCachePattern:
         is_neox: bool,
         attn_output_gate: bool,
         rope_flashinfer: bool = False,
-        match_rocm_aiter_rms: bool = False,
         match_rocm_aiter_rope: bool = False,
     ) -> None:
         self.layer_name = layer.layer_name
@@ -507,9 +497,6 @@ class Qwen3NextQkNormRopeKvCachePattern:
         self.k_size = self.num_kv_heads * self.head_size
         self.v_size = self.num_kv_heads * self.head_size_v
 
-        self.rmsnorm_matcher = MatcherRMSNorm(
-            eps, match_rocm_aiter=match_rocm_aiter_rms
-        )
         self.rope_matcher = MatcherRotaryEmbedding(
             is_neox=is_neox,
             head_size=self.head_size,
@@ -525,8 +512,12 @@ class Qwen3NextQkNormRopeKvCachePattern:
         q_portion = self.q_size * 2 if self.attn_output_gate else self.q_size
         qkv = empty_bf16(T, q_portion + self.k_size + self.v_size)
         positions = empty_i64(T)
-        q_weight = empty_bf16(1, self.head_size)
-        k_weight = empty_bf16(1, self.head_size)
+        # Raw GemmaRMSNorm weight (bf16, before the +1.0 adjustment).
+        # The pattern includes the .float()+1.0 so those nodes are consumed;
+        # the replacement passes the raw weight to the AITER kernel which
+        # applies (1+w) internally.
+        q_weight = empty_bf16(self.head_size)
+        k_weight = empty_bf16(self.head_size)
         if self.rope_flashinfer:
             cos_sin_cache = empty_fp32(L, self.head_size)
         else:
@@ -546,22 +537,17 @@ class Qwen3NextQkNormRopeKvCachePattern:
         is_neox = self.is_neox
         attn_output_gate = self.attn_output_gate
 
-        rmsnorm_matcher = self.rmsnorm_matcher
         rope_matcher = self.rope_matcher
 
         if attn_output_gate:
             # --- gated pattern: q_gate split + GemmaRMSNorm + RoPE + KV cache
             #
-            # GemmaRMSNorm (used as Qwen3NextRMSNorm) decomposes during
-            # torch.compile into:
-            #   x_fp32 = x.float()
-            #   var = x_fp32.pow(2).mean(-1, keepdim=True)
-            #   x_normed = x_fp32 * rsqrt(var + eps)
-            #   out = (x_normed * (1 + weight.float())).to(orig_dtype)
-            #
-            # The compiler also eliminates canceling reshape pairs
-            # (q_3d.reshape(T, q_size) → view(T, heads, dim)) so the
-            # RMSNorm input comes directly from the chunk result.
+            # After Inductor optimizations on the GemmaRMSNorm forward:
+            #   1. The reshape roundtrip (3D→flat→3D) is eliminated,
+            #      leaving only a clone on the chunk result.
+            #   2. The no-op .to(bf16) cast after rms_norm is removed.
+            #   3. The gate is only consumed after attention, so it stays
+            #      as a raw getitem from the chunk within this scope.
 
             def pattern(
                 qkv: torch.Tensor,
@@ -582,26 +568,24 @@ class Qwen3NextQkNormRopeKvCachePattern:
                 q_gate_3d = q_gate.view(T, num_heads, 2 * head_dim)
                 q_3d, gate_3d = q_gate_3d.chunk(2, dim=-1)
 
-                # Q GemmaRMSNorm (on q_3d: [T, num_heads, head_dim])
-                q_c = q_3d.clone()
-                q_fp = q_c.float()
-                q_var = q_fp.pow(2).mean(dim=-1, keepdim=True)
-                q_n = q_fp * torch.rsqrt(q_var + eps)
-                q_n = q_n * (1.0 + q_weight.float())
-                q_n = q_n.to(qkv.dtype)
-                q_flat = q_n.view(T, q_size)
+                # After Inductor, the reshape roundtrip
+                # (q.reshape(flat).view(3D)) collapses to a contiguity
+                # clone since the chunk result is strided.
+                q_3d = q_3d.contiguous()
+                # GemmaRMSNorm applies (1+w) before calling rms_norm;
+                # match those nodes so the replacement receives the raw weight.
+                q_w = q_weight.float() + 1.0
+                q_normed = vllm.ir.ops.rms_norm(q_3d, q_w, eps)
+                q_normed_flat = q_normed.view(T, q_size)
 
-                # K GemmaRMSNorm (on k: [T, k_size] → view to
-                # [T, num_kv_heads, head_dim])
                 k_3d = k.view(T, num_kv_heads, head_dim)
-                k_fp = k_3d.float()
-                k_var = k_fp.pow(2).mean(dim=-1, keepdim=True)
-                k_n = k_fp * torch.rsqrt(k_var + eps)
-                k_n = k_n * (1.0 + k_weight.float())
-                k_n = k_n.to(qkv.dtype)
-                k_flat = k_n.view(T, k_size)
+                k_w = k_weight.float() + 1.0
+                k_normed = vllm.ir.ops.rms_norm(k_3d, k_w, eps)
+                k_flat = k_normed.view(T, k_size)
 
-                q_rope, k_rope = rope_matcher(positions, q_flat, k_flat, cos_sin_cache)
+                q_rope, k_rope = rope_matcher(
+                    positions, q_normed_flat, k_flat, cos_sin_cache
+                )
 
                 q_rope = q_rope.view(T, num_heads, head_dim)
                 k_rope = k_rope.view(T, num_kv_heads, head_dim)
@@ -671,9 +655,10 @@ class Qwen3NextQkNormRopeKvCachePattern:
                 )
 
                 # results: (dummy, q_out, k_out, v_out, gate_out)
+                # gate_out is [T, num_heads, head_dim] matching gate_3d shape
                 return results[0], results[1], results[2], results[3], results[4]
         else:
-            # --- non-gated: same as QkNormRopeKvCachePattern ---
+            # --- non-gated: GemmaRMSNorm via IR op ---
 
             def pattern(  # type: ignore[misc]
                 qkv: torch.Tensor,
@@ -686,11 +671,13 @@ class Qwen3NextQkNormRopeKvCachePattern:
                 q, k, v = qkv.split([q_size, k_size, v_size], dim=-1)
 
                 q_by_head = q.view(T, q_size // head_dim, head_dim)
-                q_normed = rmsnorm_matcher(q_by_head, q_weight)
+                q_w = q_weight.float() + 1.0
+                q_normed = vllm.ir.ops.rms_norm(q_by_head, q_w, eps)
                 q_flat = q_normed.view(T, q_size)
 
                 k_by_head = k.view(T, k_size // head_dim, head_dim)
-                k_normed = rmsnorm_matcher(k_by_head, k_weight)
+                k_w = k_weight.float() + 1.0
+                k_normed = vllm.ir.ops.rms_norm(k_by_head, k_w, eps)
                 k_flat = k_normed.view(T, k_size)
 
                 q_rope, k_rope = rope_matcher(positions, q_flat, k_flat, cos_sin_cache)
@@ -810,10 +797,6 @@ class QkNormRopeKvCacheFusionPass(VllmPatternMatcherPass):
             rms_custom_enabled,
         )
 
-        aiter_rms_variants = [False]
-        if rocm_aiter_ops.is_rmsnorm_enabled():
-            aiter_rms_variants.append(True)
-
         aiter_rope_variants = [False]
         if rocm_aiter_ops.is_triton_rotary_embed_enabled():
             aiter_rope_variants.append(True)
@@ -821,58 +804,55 @@ class QkNormRopeKvCacheFusionPass(VllmPatternMatcherPass):
         for _, layer in attn_layers.items():
             if not layer.impl.fused_qk_norm_rope_kvcache_supported():
                 continue
-            layer.impl.set_fused_kv_cache_layout()
-            for aiter_rms in aiter_rms_variants:
-                for aiter_rope in aiter_rope_variants:
-                    for epsilon in [1e-5, 1e-6]:
-                        for neox in [True, False]:
-                            if RotaryEmbedding.enabled():
-                                for rope_flashinfer in [False, True]:
-                                    try:
-                                        QkNormRopeKvCachePattern(
-                                            layer=layer,
-                                            eps=epsilon,
-                                            is_neox=neox,
-                                            rope_flashinfer=rope_flashinfer,
-                                            match_rocm_aiter_rms=aiter_rms,
-                                            match_rocm_aiter_rope=aiter_rope,
-                                        ).register(self.patterns)
-                                    except RuntimeError as e:
-                                        if "Duplicate pattern" in str(e):
-                                            logger.debug(
-                                                "Skipping duplicate pattern: "
-                                                "aiter_rms=%s aiter_rope=%s "
-                                                "eps=%s neox=%s fi=%s",
-                                                aiter_rms,
-                                                aiter_rope,
-                                                epsilon,
-                                                neox,
-                                                rope_flashinfer,
-                                            )
-                                        else:
-                                            raise
-                            else:
+            # Don't call set_fused_kv_cache_layout() — the AITER Triton
+            # kernel writes V in standard (non-interleaved) format, which
+            # must match the attention kernel's read expectations.
+            for aiter_rope in aiter_rope_variants:
+                for epsilon in [1e-5, 1e-6]:
+                    for neox in [True, False]:
+                        if RotaryEmbedding.enabled():
+                            for rope_flashinfer in [False, True]:
                                 try:
                                     QkNormRopeKvCachePattern(
                                         layer=layer,
                                         eps=epsilon,
                                         is_neox=neox,
-                                        match_rocm_aiter_rms=aiter_rms,
+                                        rope_flashinfer=rope_flashinfer,
                                         match_rocm_aiter_rope=aiter_rope,
                                     ).register(self.patterns)
                                 except RuntimeError as e:
                                     if "Duplicate pattern" in str(e):
                                         logger.debug(
                                             "Skipping duplicate pattern: "
-                                            "aiter_rms=%s aiter_rope=%s "
-                                            "eps=%s neox=%s fi=N/A",
-                                            aiter_rms,
+                                            "aiter_rope=%s "
+                                            "eps=%s neox=%s fi=%s",
                                             aiter_rope,
                                             epsilon,
                                             neox,
+                                            rope_flashinfer,
                                         )
                                     else:
                                         raise
+                        else:
+                            try:
+                                QkNormRopeKvCachePattern(
+                                    layer=layer,
+                                    eps=epsilon,
+                                    is_neox=neox,
+                                    match_rocm_aiter_rope=aiter_rope,
+                                ).register(self.patterns)
+                            except RuntimeError as e:
+                                if "Duplicate pattern" in str(e):
+                                    logger.debug(
+                                        "Skipping duplicate pattern: "
+                                        "aiter_rope=%s "
+                                        "eps=%s neox=%s fi=N/A",
+                                        aiter_rope,
+                                        epsilon,
+                                        neox,
+                                    )
+                                else:
+                                    raise
 
         # Qwen3Next-specific patterns with attn_output_gate handling.
         hf_config = config.model_config.hf_text_config
@@ -890,40 +870,37 @@ class QkNormRopeKvCacheFusionPass(VllmPatternMatcherPass):
                 for _, layer in attn_layers.items():
                     if not layer.impl.fused_qk_norm_rope_kvcache_supported():
                         continue
-                    for aiter_rms in aiter_rms_variants:
-                        for aiter_rope in aiter_rope_variants:
-                            for epsilon in [1e-5, 1e-6]:
-                                for neox in [True, False]:
-                                    fi_variants = (
-                                        [False, True]
-                                        if RotaryEmbedding.enabled()
-                                        else [False]
-                                    )
-                                    for rope_fi in fi_variants:
-                                        try:
-                                            Qwen3NextQkNormRopeKvCachePattern(
-                                                layer=layer,
-                                                eps=epsilon,
-                                                is_neox=neox,
-                                                attn_output_gate=gate_val,
-                                                rope_flashinfer=rope_fi,
-                                                match_rocm_aiter_rms=aiter_rms,
-                                                match_rocm_aiter_rope=aiter_rope,
-                                            ).register(self.patterns)
-                                        except RuntimeError as e:
-                                            if "Duplicate pattern" not in str(e):
-                                                raise
-                                            logger.debug(
-                                                "Skipping duplicate Qwen3Next "
-                                                "pattern: gate=%s rms=%s "
-                                                "rope=%s eps=%s neox=%s fi=%s",
-                                                gate_val,
-                                                aiter_rms,
-                                                aiter_rope,
-                                                epsilon,
-                                                neox,
-                                                rope_fi,
-                                            )
+                    for aiter_rope in aiter_rope_variants:
+                        for epsilon in [1e-5, 1e-6]:
+                            for neox in [True, False]:
+                                fi_variants = (
+                                    [False, True]
+                                    if RotaryEmbedding.enabled()
+                                    else [False]
+                                )
+                                for rope_fi in fi_variants:
+                                    try:
+                                        Qwen3NextQkNormRopeKvCachePattern(
+                                            layer=layer,
+                                            eps=epsilon,
+                                            is_neox=neox,
+                                            attn_output_gate=gate_val,
+                                            rope_flashinfer=rope_fi,
+                                            match_rocm_aiter_rope=aiter_rope,
+                                        ).register(self.patterns)
+                                    except RuntimeError as e:
+                                        if "Duplicate pattern" not in str(e):
+                                            raise
+                                        logger.debug(
+                                            "Skipping duplicate Qwen3Next "
+                                            "pattern: gate=%s "
+                                            "rope=%s eps=%s neox=%s fi=%s",
+                                            gate_val,
+                                            aiter_rope,
+                                            epsilon,
+                                            neox,
+                                            rope_fi,
+                                        )
 
         # Backends that set _use_interleaved_v_cache (e.g. ROCM_ATTN)
         # require a consistent V-cache layout across ALL compile ranges.
