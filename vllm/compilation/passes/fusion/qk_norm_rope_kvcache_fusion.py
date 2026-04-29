@@ -627,8 +627,16 @@ class Qwen3NextQkNormRopeKvCachePattern:
                     layer_name=layer_name,
                 )
 
-                # results: (dummy, q, k, v, gate)
-                return results[0], results[1], results[2], results[3], results[4]
+                # Use v as a strided view of qkv to avoid a copy kernel.
+                # v is unmodified (no norm/RoPE), so it's identical to the
+                # split from qkv.  Keeping it as a view preserves the
+                # original stride layout that Inductor's memory planner
+                # expects, eliminating the triton_poi_fused_view copy.
+                _, _, v = qkv.split([q_size * 2, k_size, v_size], dim=-1)
+                v = v.view(qkv.shape[0], num_kv_heads, head_dim_v)
+
+                # results: (dummy, q, k, _, gate) — v from qkv view
+                return results[0], results[1], results[2], v, results[4]
         else:
             # --- non-gated: GemmaRMSNorm via IR op ---
 
@@ -682,8 +690,12 @@ class Qwen3NextQkNormRopeKvCachePattern:
                     layer_name=layer_name,
                 )
 
-                # results: (dummy, q, k, v, gate) — gate unused
-                return results[0], results[1], results[2], results[3]
+                # Use v as a strided view of qkv (see gated replacement).
+                _, _, v = qkv.split([q_size, k_size, v_size], dim=-1)
+                v = v.view(qkv.shape[0], num_kv_heads, head_dim_v)
+
+                # results: (dummy, q, k, _, gate) — v from qkv, gate unused
+                return results[0], results[1], results[2], v
 
         def fwd_and_view_to_reshape(*args, **kwargs) -> fx.GraphModule:
             gm = pm.fwd_only(*args, **kwargs)
