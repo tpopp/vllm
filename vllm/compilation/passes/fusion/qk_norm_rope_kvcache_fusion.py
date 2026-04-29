@@ -185,10 +185,6 @@ direct_register_custom_op(
 
 
 def fused_triton_qk_norm_rope_kvcache_update_impl(
-    q_out: torch.Tensor,
-    k_out: torch.Tensor,
-    v_out: torch.Tensor,
-    gate_out: torch.Tensor | None,
     qkv: torch.Tensor,
     positions: torch.Tensor,
     q_weight: torch.Tensor,
@@ -197,15 +193,26 @@ def fused_triton_qk_norm_rope_kvcache_update_impl(
     cos_sin_cache: torch.Tensor,
     is_neox: bool,
     attn_output_gate: bool,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
     layer_name: str = "",
-) -> torch.Tensor:
-    _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(layer_name)
-    if layer_slot_mapping is None:
-        return torch.empty(0, device=qkv.device, dtype=qkv.dtype)
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    from aiter.ops.triton.rope.fused_qkv_split_qk_norm_rope_cache import (
+        fused_qkv_split_qk_norm_rope_cache,
+    )
 
-    num_heads = q_out.shape[1]
-    head_dim = q_out.shape[2]
-    num_kv_heads = k_out.shape[1]
+    _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(layer_name)
+
+    T = qkv.shape[0]
+    dummy = torch.empty(0, device=qkv.device, dtype=qkv.dtype)
+
+    if layer_slot_mapping is None:
+        q = torch.empty(T, num_heads, head_dim, device=qkv.device, dtype=qkv.dtype)
+        k = torch.empty(T, num_kv_heads, head_dim, device=qkv.device, dtype=qkv.dtype)
+        v = torch.empty(T, num_kv_heads, head_dim, device=qkv.device, dtype=qkv.dtype)
+        gate = torch.empty(T, num_heads, head_dim, device=qkv.device, dtype=qkv.dtype)
+        return dummy, q, k, v, gate
 
     # Split cos_sin_cache into cos and sin WITHOUT position indexing.
     # The AITER kernel indexes by position internally, so we must pass
@@ -214,57 +221,47 @@ def fused_triton_qk_norm_rope_kvcache_update_impl(
     cos_full = cos_sin_cache[:, :rdh]
     sin_full = cos_sin_cache[:, rdh:]
 
-    # Skip cache writes inside the AITER kernel (slot_mapping of -1).
-    # reshape_and_cache_flash writes in a packed layout (BHDSX) that
-    # differs from plain NHD; the backend's do_kv_cache_update uses
-    # the correct format for the active attention backend.
-    skip_slots = torch.full_like(layer_slot_mapping, -1)
-
     key_cache, value_cache = kv_cache.unbind(0)
-    key_cache_hnd = key_cache.permute(0, 2, 1, 3)
-    value_cache_hnd = value_cache.permute(0, 2, 1, 3)
 
-    rocm_aiter_ops.fused_qkv_split_qk_norm_rope_cache(
+    k_scale_f = getattr(attn_layer, "_k_scale_float", 1.0)
+    v_scale_f = getattr(attn_layer, "_v_scale_float", 1.0)
+    k_scale_t = (
+        None
+        if k_scale_f == 1.0
+        else torch.tensor(k_scale_f, dtype=torch.float32, device=qkv.device)
+    )
+    v_scale_t = (
+        None
+        if v_scale_f == 1.0
+        else torch.tensor(v_scale_f, dtype=torch.float32, device=qkv.device)
+    )
+
+    # The AITER wrapper allocates q, k, v, gate internally and handles
+    # both HND and NHD cache layouts via dynamic stride detection.
+    q, gate, k, v = fused_qkv_split_qk_norm_rope_cache(
         qkv=qkv,
         q_weight=q_weight,
         k_weight=k_weight,
         cos=cos_full,
         sin=sin_full,
         positions=positions,
-        key_cache=key_cache_hnd,
-        value_cache=value_cache_hnd,
-        slot_mapping=skip_slots,
-        q_out=q_out,
-        k_out=k_out,
-        v_out=v_out,
-        gate_out=gate_out,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        slot_mapping=layer_slot_mapping,
         qh=num_heads,
         kvh=num_kv_heads,
         head_dim=head_dim,
         is_neox=is_neox,
         attn_output_gate=attn_output_gate,
-        k_scale=None,
-        v_scale=None,
+        k_scale=k_scale_t,
+        v_scale=v_scale_t,
         eps=rms_norm_eps,
     )
 
-    # Write K/V to cache using the backend's native format.
-    attn_layer.impl.do_kv_cache_update(
-        attn_layer,
-        k_out,
-        v_out,
-        kv_cache,
-        layer_slot_mapping,
-    )
-
-    return torch.empty(0, device=qkv.device, dtype=qkv.dtype)
+    return dummy, q, k, v, gate
 
 
 def fused_triton_qk_norm_rope_kvcache_update_fake(
-    q_out: torch.Tensor,
-    k_out: torch.Tensor,
-    v_out: torch.Tensor,
-    gate_out: torch.Tensor | None,
     qkv: torch.Tensor,
     positions: torch.Tensor,
     q_weight: torch.Tensor,
@@ -273,15 +270,24 @@ def fused_triton_qk_norm_rope_kvcache_update_fake(
     cos_sin_cache: torch.Tensor,
     is_neox: bool,
     attn_output_gate: bool,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
     layer_name: str = "",
-) -> torch.Tensor:
-    return torch.empty(0, device=qkv.device, dtype=qkv.dtype)
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    T = qkv.shape[0]
+    dummy = torch.empty(0, device=qkv.device, dtype=qkv.dtype)
+    q = torch.empty(T, num_heads, head_dim, device=qkv.device, dtype=qkv.dtype)
+    k = torch.empty(T, num_kv_heads, head_dim, device=qkv.device, dtype=qkv.dtype)
+    v = torch.empty(T, num_kv_heads, head_dim, device=qkv.device, dtype=qkv.dtype)
+    gate = torch.empty(T, num_heads, head_dim, device=qkv.device, dtype=qkv.dtype)
+    return dummy, q, k, v, gate
 
 
 direct_register_custom_op(
     op_name="fused_triton_qk_norm_rope_kvcache_update",
     op_func=fused_triton_qk_norm_rope_kvcache_update_impl,
-    mutates_args=["q_out", "k_out", "v_out", "gate_out"],
+    mutates_args=[],
     fake_impl=fused_triton_qk_norm_rope_kvcache_update_fake,
 )
 
@@ -606,43 +612,7 @@ class Qwen3NextQkNormRopeKvCachePattern:
                 torch.Tensor,
                 torch.Tensor,
             ]:
-                T = qkv.shape[0]
-
-                q_out = torch.empty(
-                    T,
-                    num_heads,
-                    head_dim,
-                    device=qkv.device,
-                    dtype=qkv.dtype,
-                )
-                k_out = torch.empty(
-                    T,
-                    num_kv_heads,
-                    head_dim,
-                    device=qkv.device,
-                    dtype=qkv.dtype,
-                )
-                v_out = torch.empty(
-                    T,
-                    num_kv_heads,
-                    head_dim_v,
-                    device=qkv.device,
-                    dtype=qkv.dtype,
-                )
-                gate_out = torch.empty(
-                    T,
-                    num_heads,
-                    head_dim,
-                    device=qkv.device,
-                    dtype=qkv.dtype,
-                )
-
-                results = auto_functionalized(
-                    self.FUSED_OP,
-                    q_out=q_out,
-                    k_out=k_out,
-                    v_out=v_out,
-                    gate_out=gate_out,
+                results = self.FUSED_OP(
                     qkv=qkv,
                     positions=positions,
                     q_weight=q_weight,
@@ -651,11 +621,13 @@ class Qwen3NextQkNormRopeKvCachePattern:
                     cos_sin_cache=cos_sin_cache,
                     is_neox=is_neox,
                     attn_output_gate=True,
+                    num_heads=num_heads,
+                    num_kv_heads=num_kv_heads,
+                    head_dim=head_dim,
                     layer_name=layer_name,
                 )
 
-                # results: (dummy, q_out, k_out, v_out, gate_out)
-                # gate_out is [T, num_heads, head_dim] matching gate_3d shape
+                # results: (dummy, q, k, v, gate)
                 return results[0], results[1], results[2], results[3], results[4]
         else:
             # --- non-gated: GemmaRMSNorm via IR op ---
@@ -695,35 +667,7 @@ class Qwen3NextQkNormRopeKvCachePattern:
                 k_weight: torch.Tensor,
                 cos_sin_cache: torch.Tensor,
             ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-                T = qkv.shape[0]
-                q_out = torch.empty(
-                    T,
-                    num_heads,
-                    head_dim,
-                    device=qkv.device,
-                    dtype=qkv.dtype,
-                )
-                k_out = torch.empty(
-                    T,
-                    num_kv_heads,
-                    head_dim,
-                    device=qkv.device,
-                    dtype=qkv.dtype,
-                )
-                v_out = torch.empty(
-                    T,
-                    num_kv_heads,
-                    head_dim_v,
-                    device=qkv.device,
-                    dtype=qkv.dtype,
-                )
-
-                results = auto_functionalized(
-                    self.FUSED_OP,
-                    q_out=q_out,
-                    k_out=k_out,
-                    v_out=v_out,
-                    gate_out=None,
+                results = self.FUSED_OP(
                     qkv=qkv,
                     positions=positions,
                     q_weight=q_weight,
@@ -732,10 +676,13 @@ class Qwen3NextQkNormRopeKvCachePattern:
                     cos_sin_cache=cos_sin_cache,
                     is_neox=is_neox,
                     attn_output_gate=False,
+                    num_heads=num_heads,
+                    num_kv_heads=num_kv_heads,
+                    head_dim=head_dim,
                     layer_name=layer_name,
                 )
 
-                # results: (dummy, q_out, k_out, v_out)
+                # results: (dummy, q, k, v, gate) — gate unused
                 return results[0], results[1], results[2], results[3]
 
         def fwd_and_view_to_reshape(*args, **kwargs) -> fx.GraphModule:
