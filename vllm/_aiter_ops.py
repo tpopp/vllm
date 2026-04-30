@@ -247,12 +247,20 @@ def _rocm_aiter_topk_softmax_impl(
 
     if num_shared_experts > 0:
         topk_softmax(
-            topk_weights, topk_indices, token_expert_indices, gating_output,
-            renormalize, num_shared_experts, shared_expert_scoring_func,
+            topk_weights,
+            topk_indices,
+            token_expert_indices,
+            gating_output,
+            renormalize,
+            num_shared_experts,
+            shared_expert_scoring_func,
         )
     else:
         topk_softmax(
-            topk_weights, topk_indices, token_expert_indices, gating_output,
+            topk_weights,
+            topk_indices,
+            token_expert_indices,
+            gating_output,
             renormalize,
         )
 
@@ -1184,110 +1192,44 @@ def _rocm_aiter_fused_qkv_split_qk_norm_rope_cache_impl(
     v_scale: torch.Tensor | None = None,
     eps: float = 1e-5,
 ) -> None:
-    import triton
-    from aiter.ops.triton._triton_kernels.rope.fused_qkv_split_qk_norm_rope_cache import (
-        _fused_qkv_split_qk_norm_rope_cache_kernel,
+    from aiter.ops.triton.rope.fused_qkv_split_qk_norm_rope_cache import (
+        fused_qkv_split_qk_norm_rope_cache,
     )
 
-    qkv = qkv.contiguous()
-    q_weight = q_weight.contiguous()
-    k_weight = k_weight.contiguous()
-    cos = cos.contiguous()
-    sin = sin.contiguous()
-    positions = positions.contiguous()
-    slot_mapping = slot_mapping.contiguous()
-
-    T = qkv.shape[0]
-    BLOCK_D = head_dim
-    BLOCK_D_HALF = head_dim // 2
-    ROTARY_DIM_HALF = cos.shape[-1]
-    BLOCK_T = 32
-    num_warps = 4
-    grid = (triton.cdiv(T, BLOCK_T), qh)
-
-    # Detect KV cache layout by matching kvh to the correct dimension.
-    # Paged attention: [num_blocks, num_kv_heads, block_size, head_dim]
-    # Flash attention: [num_pages, page_size, num_kv_heads, head_dim]
-    if key_cache.shape[1] == kvh:
-        block_size = key_cache.shape[2]
-        kc_stride_t = key_cache.stride(0)
-        kc_stride_h = key_cache.stride(1)
-        kc_stride_b = key_cache.stride(2)
-        kc_stride_d = key_cache.stride(3)
-        vc_stride_t = value_cache.stride(0)
-        vc_stride_h = value_cache.stride(1)
-        vc_stride_b = value_cache.stride(2)
-        vc_stride_d = value_cache.stride(3)
-    elif key_cache.shape[2] == kvh:
-        block_size = key_cache.shape[1]
-        kc_stride_t = key_cache.stride(0)
-        kc_stride_h = key_cache.stride(2)
-        kc_stride_b = key_cache.stride(1)
-        kc_stride_d = key_cache.stride(3)
-        vc_stride_t = value_cache.stride(0)
-        vc_stride_h = value_cache.stride(2)
-        vc_stride_b = value_cache.stride(1)
-        vc_stride_d = value_cache.stride(3)
-    else:
-        raise ValueError(
-            f"Cannot determine KV cache layout: key_cache.shape="
-            f"{key_cache.shape}, kvh={kvh}"
-        )
-
-    _fused_qkv_split_qk_norm_rope_cache_kernel[grid](
-        qkv_ptr=qkv,
-        q_weight_ptr=q_weight,
-        k_weight_ptr=k_weight,
-        cos_ptr=cos,
-        sin_ptr=sin,
-        pos_ptr=positions,
-        off_ptr=offsets,
-        q_ptr=q_out,
-        gate_ptr=gate_out,
-        k_ptr=k_out,
-        v_ptr=v_out,
-        key_cache_ptr=key_cache,
-        value_cache_ptr=value_cache,
-        slot_mapping_ptr=slot_mapping,
-        T=T,
+    results = fused_qkv_split_qk_norm_rope_cache(
+        qkv=qkv,
+        q_weight=q_weight,
+        k_weight=k_weight,
+        cos=cos,
+        sin=sin,
+        positions=positions,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        slot_mapping=slot_mapping,
+        qh=qh,
+        kvh=kvh,
+        head_dim=head_dim,
+        is_neox=is_neox,
+        offsets=offsets,
+        reuse_freqs_front_part=reuse_freqs_front_part,
+        attn_output_gate=attn_output_gate,
+        k_scale=k_scale,
+        v_scale=v_scale,
         eps=eps,
-        k_scale_ptr=k_scale,
-        v_scale_ptr=v_scale,
-        stride_qkv_t=qkv.stride(0),
-        stride_qkv_d=qkv.stride(1),
-        stride_cos_t=cos.stride(0),
-        stride_cos_d=cos.stride(-1),
-        stride_pos_t=positions.stride(0),
-        stride_q_t=q_out.stride(0),
-        stride_q_h=q_out.stride(1),
-        stride_q_d=q_out.stride(2),
-        stride_kv_t=k_out.stride(0),
-        stride_kv_h=k_out.stride(1),
-        stride_kv_d=k_out.stride(2),
-        key_cache_stride_t=kc_stride_t,
-        key_cache_stride_h=kc_stride_h,
-        key_cache_stride_d=kc_stride_d,
-        key_cache_stride_b=kc_stride_b,
-        value_cache_stride_t=vc_stride_t,
-        value_cache_stride_h=vc_stride_h,
-        value_cache_stride_d=vc_stride_d,
-        value_cache_stride_b=vc_stride_b,
-        REUSE_FREQS_FRONT_PART=reuse_freqs_front_part,
-        IS_NEOX=is_neox,
-        HAVE_POS=(positions is not None),
-        HAVE_OFFS=(offsets is not None),
-        ENABLE_GATED_Q=attn_output_gate,
-        QH=qh,
-        KVH=kvh,
-        BLOCK_T=BLOCK_T,
-        BLOCK_D=BLOCK_D,
-        BLOCK_D_HALF=BLOCK_D_HALF,
-        BLOCK_SIZE=block_size,
-        ROTARY_DIM_HALF=ROTARY_DIM_HALF,
-        HAVE_K_SCALE=k_scale is not None,
-        HAVE_V_SCALE=v_scale is not None,
-        num_warps=num_warps,
     )
+
+    if attn_output_gate:
+        q, gate, k, v = results
+        q_out.copy_(q)
+        k_out.copy_(k)
+        v_out.copy_(v)
+        if gate_out is not None:
+            gate_out.copy_(gate)
+    else:
+        q, k, v = results
+        q_out.copy_(q)
+        k_out.copy_(k)
+        v_out.copy_(v)
 
 
 def _rocm_aiter_fused_qkv_split_qk_norm_rope_cache_fake(
@@ -1532,7 +1474,9 @@ class rocm_aiter_ops:
         if cls._TOPK_SOFTMAX_FUSED_SIGMOID is None:
             try:
                 import inspect
+
                 from aiter import topk_softmax
+
                 params = inspect.signature(topk_softmax).parameters
                 if "num_shared_experts" in params:
                     cls._TOPK_SOFTMAX_FUSED_SIGMOID = True
@@ -1540,15 +1484,12 @@ class rocm_aiter_ops:
                     # @compile_ops wrapper loses the original signature.
                     # Fall back to the torch custom op schema.
                     import torch
+
                     schema = getattr(
-                        getattr(
-                            torch.ops.aiter, "topk_softmax", None
-                        ), "default", None
+                        getattr(torch.ops.aiter, "topk_softmax", None), "default", None
                     )
                     schema_str = str(getattr(schema, "_schema", ""))
-                    cls._TOPK_SOFTMAX_FUSED_SIGMOID = (
-                        "num_shared_experts" in schema_str
-                    )
+                    cls._TOPK_SOFTMAX_FUSED_SIGMOID = "num_shared_experts" in schema_str
             except (ImportError, ValueError):
                 cls._TOPK_SOFTMAX_FUSED_SIGMOID = False
         return cls._TOPK_SOFTMAX_FUSED_SIGMOID
@@ -2108,8 +2049,13 @@ class rocm_aiter_ops:
         shared_expert_scoring_func: str = "",
     ) -> tuple[torch.Tensor, ...]:
         torch.ops.vllm.rocm_aiter_topk_softmax(
-            topk_weights, topk_indices, token_expert_indices, gating_output,
-            renormalize, num_shared_experts, shared_expert_scoring_func,
+            topk_weights,
+            topk_indices,
+            token_expert_indices,
+            gating_output,
+            renormalize,
+            num_shared_experts,
+            shared_expert_scoring_func,
         )
         return topk_weights, topk_indices
 
