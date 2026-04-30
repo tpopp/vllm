@@ -189,7 +189,6 @@ def fused_qkv_split_qk_norm_rope_cache(
         BLOCK_D_HALF=BLOCK_D_HALF,
         BLOCK_SIZE=block_size,
         ROTARY_DIM_HALF=ROTARY_DIM_HALF,
-        BLOCKED_GATED_LAYOUT=(attn_output_gate and gated_qkv_layout == "blocked"),
         HAVE_K_SCALE=k_scale is not None,
         HAVE_V_SCALE=v_scale is not None,
         num_warps=num_warps,
