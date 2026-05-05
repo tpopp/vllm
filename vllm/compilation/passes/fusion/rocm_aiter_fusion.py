@@ -28,8 +28,8 @@ from ..vllm_inductor_pass import (
     VllmInductorPass,
     VllmPatternMatcherPass,
     VllmPatternReplacement,
-    _fx_view_to_reshape,
     fold_consecutive_reshapes,
+    fx_view_to_reshape,
 )
 from .matcher_utils import (
     MatcherQuantFP8,
@@ -397,7 +397,7 @@ class AiterRMSNormGatedFp8GroupQuantPattern(AiterRMSNormQuantPattern):
 
         def trace_fn(*args, **kwargs):
             gm = pm.fwd_only(*args, **kwargs)
-            _fx_view_to_reshape(gm)
+            fx_view_to_reshape(gm)
             fold_consecutive_reshapes(gm)
             return gm
 
@@ -449,18 +449,32 @@ class RocmAiterRMSNormQuantFusionPass(VllmPatternMatcherPass):
             [True, False] if is_quant_fp8_enabled else [False]
         )
 
+        # use_triton selects between the triton and CK group quant ops.
+        # It only affects the search pattern when quant_fp8 is enabled
+        # (the matcher uses forward_custom which references QUANT_OP).
+        # When disabled, forward_native is the same for both, so a set
+        # avoids duplicate-pattern errors just like match_aiter_quant_values.
+        use_triton_values: set[bool] = {False, True} if QuantFP8.enabled() else {False}
+
         # Make sure fused add patterns are before simple rms norm,
         # as the latter is a subset of the former in torch ops
         for epsilon in [1e-5, 1e-6]:
             # Group quant patterns only work with the aiter quant op
             # (kFp8Dynamic128Sym is not in QUANT_OPS on ROCm).
-            AiterRMSFp8GroupQuantPattern(
-                epsilon, FP8_DTYPE, GroupShape(1, 128)
-            ).register(self.patterns)
+            for use_triton in use_triton_values:
+                AiterRMSFp8GroupQuantPattern(
+                    epsilon,
+                    FP8_DTYPE,
+                    GroupShape(1, 128),
+                    use_triton=use_triton,
+                ).register(self.patterns)
 
-            AiterFusedAddRMSFp8GroupQuantPattern(
-                epsilon, FP8_DTYPE, GroupShape(1, 128)
-            ).register(self.patterns)
+                AiterFusedAddRMSFp8GroupQuantPattern(
+                    epsilon,
+                    FP8_DTYPE,
+                    GroupShape(1, 128),
+                    use_triton=use_triton,
+                ).register(self.patterns)
 
             for match_aiter_quant in match_aiter_quant_options:
                 # Fuse aiter rms_norm + (aiter / vllm built-in)
@@ -481,15 +495,23 @@ class RocmAiterRMSNormQuantFusionPass(VllmPatternMatcherPass):
             # Fuse decomposed RMSNormGated + group fp8 quant.
             # The replacement op (fused_rms_gated_fp8_group_quant) requires
             # an aiter version that includes the GDN triton kernel renames.
+            # This pattern uses kFp8Dynamic128Sym and passes head_dim as the
+            # fused kernel's group_size, so head_dim must equal 128.
+            # Like other group quant patterns, this only works with the aiter
+            # quant op (kFp8Dynamic128Sym is not in QUANT_OPS on ROCm).
             if gated_norm_shapes and rocm_aiter_ops.are_gdn_triton_kernels_available():
                 for num_heads, head_dim in gated_norm_shapes:
-                    AiterRMSNormGatedFp8GroupQuantPattern(
-                        epsilon,
-                        FP8_DTYPE,
-                        GroupShape(1, 128),
-                        num_heads=num_heads,
-                        head_dim=head_dim,
-                    ).register(self.patterns)
+                    if head_dim != 128:
+                        continue
+                    for use_triton in use_triton_values:
+                        AiterRMSNormGatedFp8GroupQuantPattern(
+                            epsilon,
+                            FP8_DTYPE,
+                            GroupShape(1, 128),
+                            num_heads=num_heads,
+                            head_dim=head_dim,
+                            use_triton=use_triton,
+                        ).register(self.patterns)
 
         self.dump_patterns(config, self.patterns)
 
