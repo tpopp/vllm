@@ -297,7 +297,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         if current_platform.is_xpu():
             self._forward_method = self.forward_xpu
         elif current_platform.is_rocm():
-            self._forward_method = self.forward_rocm
+            self._forward_method = self.forward_hip
         else:
             self._forward_method = self.forward_cuda
 
@@ -694,7 +694,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
         output[:num_tokens], _ = self.out_proj(core_attn_out)
 
-    def forward_rocm(
+    def forward_hip(
         self,
         hidden_states: torch.Tensor,
         output: torch.Tensor,
