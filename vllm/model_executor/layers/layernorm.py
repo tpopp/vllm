@@ -242,9 +242,9 @@ class RMSNormGated(CustomOp):
     ) -> torch.Tensor:
         """Pure-PyTorch RMS normalization with optional gating.
 
-        This static method contains the full native logic so that both
-        ``forward_native`` and ``MatcherRMSNormGated`` (used by the
-        compilation pattern matcher) can share the same implementation.
+        This static method contains the full native logic used as
+        fallback when the ``rms_norm_gated`` IR op is not applicable
+        (e.g. unsupported activation).
 
         If *z* is not None and *norm_before_gate* is True:
             ``out = rms_norm(x) * act(z)``
@@ -283,6 +283,17 @@ class RMSNormGated(CustomOp):
         self, x: torch.Tensor, z: torch.Tensor | None = None
     ) -> torch.Tensor:
         """PyTorch-native implementation equivalent to forward()."""
+        if z is not None and self.activation in ("silu", "swish"):
+            if self.group_size is None and self.norm_before_gate:
+                return ir.ops.rms_norm_gated(x, z, self.weight, self.eps)
+            return ir.ops.rms_norm_gated(
+                x,
+                z,
+                self.weight,
+                self.eps,
+                self.group_size,
+                self.norm_before_gate,
+            )
         return self.forward_static(
             x,
             z,

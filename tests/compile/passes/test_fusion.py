@@ -555,7 +555,7 @@ def test_aiter_fusion_rmsnorm_gated_quant(
         model_config=ModelConfig(dtype=dtype),
         compilation_config=CompilationConfig(
             mode=CompilationMode.VLLM_COMPILE,
-            custom_ops=["-rms_norm", "-silu_and_mul", "+quant_fp8"],
+            custom_ops=["-rms_norm", "-rms_norm_gated", "-silu_and_mul", "+quant_fp8"],
             pass_config=PassConfig(fuse_norm_quant=True, eliminate_noops=True),
         ),
     )
@@ -639,7 +639,7 @@ def test_aiter_fusion_rmsnorm_gated_quant_no_gdn_layers(
         model_config=ModelConfig(dtype=dtype),
         compilation_config=CompilationConfig(
             mode=CompilationMode.VLLM_COMPILE,
-            custom_ops=["-rms_norm", "-silu_and_mul", "+quant_fp8"],
+            custom_ops=["-rms_norm", "-rms_norm_gated", "-silu_and_mul", "+quant_fp8"],
             pass_config=PassConfig(fuse_norm_quant=True, eliminate_noops=True),
         ),
     )

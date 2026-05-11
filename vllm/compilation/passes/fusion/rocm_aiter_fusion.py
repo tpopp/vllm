@@ -33,7 +33,6 @@ from ..vllm_inductor_pass import (
 )
 from .matcher_utils import (
     MatcherQuantFP8,
-    MatcherRMSNormGated,
     MatcherSiluAndMul,
 )
 from .rms_quant_fusion import (
@@ -316,14 +315,11 @@ class AiterFusedAddRMSFp8GroupQuantPattern(AiterRMSNormQuantPattern):
 
 class AiterRMSNormGatedFp8GroupQuantPattern(AiterRMSNormQuantPattern):
     """
-    Matches decomposed RMSNormGated + reshape + group FP8 quant and replaces
+    Matches vllm_ir.rms_norm_gated + reshape + group FP8 quant and replaces
     with rocm_aiter_fused_rms_gated_fp8_group_quant.
 
-    The norm operates per-head on (N*H, D) tensors. The compiler folds the
-    reshape chain so after norm the result goes through reshape→merge→quant.
-    The pattern reshapes from (N*H, D) to (N, H*D) before calling
-    MatcherQuantFP8 so that _quantize_group_native sees the full hidden dim
-    and computes the correct num_groups.
+    The norm operates per-head on (N*H, D) tensors via the rms_norm_gated IR
+    op.  After norm the result is reshaped to (N, H*D) for group quantization.
     """
 
     FUSED_OP = rocm_aiter_ops.get_fused_rms_gated_fp8_group_quant_op()
@@ -344,7 +340,6 @@ class AiterRMSNormGatedFp8GroupQuantPattern(AiterRMSNormQuantPattern):
             quant=QuantKey(dtype=quant_dtype, scale=scale, symmetric=symmetric),
         )
         super().__init__(epsilon, key, use_triton=use_triton)
-        self.rmsnorm_gated_matcher = MatcherRMSNormGated(epsilon)
         self.quant_matcher = MatcherQuantFP8(
             quant_key=kFp8Dynamic128Sym,
             match_rocm_aiter=True,
@@ -357,6 +352,7 @@ class AiterRMSNormGatedFp8GroupQuantPattern(AiterRMSNormQuantPattern):
         num_heads = self.num_heads
         head_dim = self.head_dim
         hidden_dim = num_heads * head_dim
+        epsilon = self.epsilon
         quant_matcher = self.quant_matcher
 
         def pattern(
@@ -364,7 +360,7 @@ class AiterRMSNormGatedFp8GroupQuantPattern(AiterRMSNormQuantPattern):
             z: torch.Tensor,
             weight: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            normed = self.rmsnorm_gated_matcher(x, z, weight)
+            normed = vllm.ir.ops.rms_norm_gated(x, z, weight, epsilon)
             merged = normed.reshape(-1, hidden_dim)
             quant_out, scales_out = quant_matcher(merged)
             return quant_out, scales_out
@@ -379,7 +375,7 @@ class AiterRMSNormGatedFp8GroupQuantPattern(AiterRMSNormQuantPattern):
                 weight=weight,
                 bias=None,
                 z=z,
-                eps=self.epsilon,
+                eps=epsilon,
                 norm_before_gate=True,
                 activation="silu",
                 group_size=head_dim,

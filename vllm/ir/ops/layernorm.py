@@ -36,6 +36,58 @@ def _rms_norm_input_generator(
 rms_norm.override_tolerance(torch.float16, atol=1e-2, rtol=2e-3)
 
 
+@register_op
+def rms_norm_gated(
+    x: Tensor,
+    z: Tensor,
+    weight: Tensor,
+    epsilon: float,
+    group_size: int | None = None,
+    norm_before_gate: bool = True,
+) -> Tensor:
+    """RMS normalization with SiLU-gated output.
+
+    When norm_before_gate is True:  out = rms_norm(x) * silu(z)
+    When norm_before_gate is False: out = rms_norm(x * silu(z))
+    """
+    import torch.nn.functional as F
+
+    orig_dtype = x.dtype
+    x = x.to(torch.float32)
+    z = z.to(torch.float32)
+
+    if not norm_before_gate:
+        x = x * F.silu(z)
+
+    if group_size is None:
+        variance = x.pow(2).mean(dim=-1, keepdim=True)
+        x_normed = x * torch.rsqrt(variance + epsilon)
+        out = x_normed * weight.float()
+    else:
+        x_group = x.unflatten(-1, (-1, group_size))
+        variance = x_group.pow(2).mean(dim=-1, keepdim=True)
+        x_normed = x_group * torch.rsqrt(variance + epsilon)
+        out = x_normed.flatten(-2) * weight.float()
+
+    if norm_before_gate:
+        out = out * F.silu(z)
+
+    return out.to(orig_dtype)
+
+
+rms_norm_gated.override_tolerance(torch.float16, atol=1e-2, rtol=2e-3)
+
+
+@rms_norm_gated.register_input_generator
+def _rms_norm_gated_input_generator(
+    num_tokens: int, hidden_size: int, dtype: torch.dtype, epsilon: float = 1e-5
+) -> tuple:
+    x = torch.randn(num_tokens, hidden_size, dtype=dtype)
+    z = torch.randn(num_tokens, hidden_size, dtype=dtype)
+    weight = torch.randn(hidden_size, dtype=dtype)
+    return x, z, weight, epsilon
+
+
 @register_op(allow_inplace=True)
 def fused_add_rms_norm(
     x: Tensor,
