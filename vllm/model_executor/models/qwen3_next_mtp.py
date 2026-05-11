@@ -7,7 +7,6 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 
-from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_pp_group
@@ -25,6 +24,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.qwen3_next import (
     Qwen3NextDecoderLayer,
     Qwen3NextRMSNorm,
+    Qwen3NextSparseMoeBlock,
     QwenNextMixtureOfExperts,
 )
 from vllm.sequence import IntermediateTensors
@@ -148,7 +148,10 @@ class Qwen3NextMultiTokenPredictor(nn.Module):
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
-        is_fse = rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
+        is_fse = any(
+            isinstance(layer.mlp, Qwen3NextSparseMoeBlock) and layer.mlp.is_fse_enabled
+            for layer in self.layers
+        )
         num_experts = self.config.num_experts
         if is_fse:
             num_experts += 1

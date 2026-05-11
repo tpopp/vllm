@@ -6,6 +6,7 @@ from collections.abc import Iterable
 from itertools import islice
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from vllm._aiter_ops import rocm_aiter_ops
@@ -136,10 +137,12 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             prefix=f"{prefix}.shared_expert_gate",
         )
 
-        if (
+        self.is_fse_enabled = (
             rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
-            or config.shared_expert_intermediate_size <= 0
-        ):
+            and config.shared_expert_intermediate_size > 0
+        )
+
+        if self.is_fse_enabled or config.shared_expert_intermediate_size <= 0:
             self.shared_expert = None
         else:
             self.shared_expert = Qwen3NextMLP(
@@ -155,7 +158,6 @@ class Qwen3NextSparseMoeBlock(nn.Module):
 
         self.experts = FusedMoE(
             shared_experts=self.shared_expert,
-            gate=self.gate,
             num_experts=self.n_routed_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
@@ -166,11 +168,19 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,
             is_sequence_parallel=self.is_sequence_parallel,
-            n_shared_experts=1 if self.shared_expert is None else None,
-            shared_expert_gate=self.shared_expert_gate
-            if self.shared_expert is None
-            else None,
+            n_shared_experts=1 if self.is_fse_enabled else 0,
         )
+
+        # Gate weight fusion is deferred to the first forward pass because
+        # gate weights are populated by weight_loader after construction.
+        self._combined_gate_weight: torch.Tensor | None = None
+
+    def _maybe_fuse_gate_weights(self):
+        if self._combined_gate_weight is None:
+            self._combined_gate_weight = torch.cat(
+                [self.gate.weight, self.shared_expert_gate.weight],
+                dim=0,
+            )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
@@ -181,17 +191,15 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
 
-        if self.experts.is_internal_router:
-            # In this case, the gate/router runs inside the FusedMoE class
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states, router_logits=hidden_states
-            )
+        if self.is_fse_enabled:
+            self._maybe_fuse_gate_weights()
+            router_logits = F.linear(hidden_states, self._combined_gate_weight)
         else:
-            # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states, router_logits=router_logits
-            )
+
+        final_hidden_states = self.experts(
+            hidden_states=hidden_states, router_logits=router_logits
+        )
 
         if self.is_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(
@@ -541,11 +549,19 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
             return hidden_states, aux_hidden_states
         return hidden_states
 
+    @property
+    def _is_fse_enabled(self) -> bool:
+        """Check if any MoE layer has fused shared experts enabled."""
+        for layer in self.layers:
+            if isinstance(layer.mlp, Qwen3NextSparseMoeBlock):
+                return layer.mlp.is_fse_enabled
+        return False
+
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
         num_experts = getattr(self.config, "num_experts", 0)
-        if rocm_aiter_ops.is_fusion_moe_shared_experts_enabled():
+        if self._is_fse_enabled:
             num_experts += 1
         return fused_moe_make_expert_params_mapping(
             self,
@@ -570,7 +586,7 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
         loaded_params: set[str] = set()
         expert_params_mapping = self.get_expert_mapping()
 
-        is_fse = rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
+        is_fse = self._is_fse_enabled
         num_routed = getattr(self.config, "num_experts", 0)
 
         for name, loaded_weight in weights:

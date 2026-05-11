@@ -281,11 +281,10 @@ class FusedMoE(PluggableLayer):
         has_bias: bool = False,
         is_sequence_parallel=False,
         expert_mapping: list[tuple[str, str, int, str]] | None = None,
-        n_shared_experts: int | None = None,
+        n_shared_experts: int = 0,
         router_logits_dtype: torch.dtype | None = None,
         gate: torch.nn.Module | None = None,
         shared_experts: torch.nn.Module | None = None,
-        shared_expert_gate: torch.nn.Module | None = None,
         routed_input_transform: torch.nn.Module | None = None,
         routed_output_transform: torch.nn.Module | None = None,
         apply_routed_scale_to_output: bool = False,
@@ -366,21 +365,17 @@ class FusedMoE(PluggableLayer):
             rocm_aiter_ops.is_fusion_moe_shared_experts_enabled() and is_act_and_mul
         )
 
-        self.num_fused_shared_experts = (
-            n_shared_experts
-            if n_shared_experts is not None and self.aiter_fmoe_shared_expert_enabled
-            else 0
-        )
-        self.shared_expert_gate = shared_expert_gate
-
-        if (
-            not self.aiter_fmoe_shared_expert_enabled
-            and self.num_fused_shared_experts != 0
-        ):
-            raise ValueError(
-                "n_shared_experts is only supported on ROCm aiter when "
-                "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS is enabled"
+        if n_shared_experts > 0 and not self.aiter_fmoe_shared_expert_enabled:
+            logger.warning_once(
+                "n_shared_experts=%d requested but AITER shared expert "
+                "fusion is not available; falling back to separate shared "
+                "expert computation.",
+                n_shared_experts,
             )
+
+        self.num_fused_shared_experts = (
+            n_shared_experts if self.aiter_fmoe_shared_expert_enabled else 0
+        )
 
         # Determine expert maps
         if self.use_ep:
@@ -611,7 +606,6 @@ class FusedMoE(PluggableLayer):
             router=self.router,
             gate=gate,
             shared_experts=shared_experts,
-            shared_expert_gate=self.shared_expert_gate,
             quant_method=self.quant_method,
             enable_dbo=self.vllm_config.parallel_config.enable_dbo,
             routed_input_transform=routed_input_transform,
