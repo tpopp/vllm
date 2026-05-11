@@ -1517,32 +1517,10 @@ class rocm_aiter_ops:
 
         These are optional Triton kernels (conv1d fast-path, gated delta net)
         used by GatedDeltaNetAttention's decode fast-path.  They may be absent
-        in older aiter builds.
+        in older aiter builds.  Also checks for the fused RMSNormGated+FP8
+        group quant kernel used by the compilation fusion pass.
         """
         if not cls._AITER_ENABLED:
-            return False
-        try:
-            import aiter.ops.triton.causal_conv1d_update_single_token  # noqa: F401
-            import aiter.ops.triton.gated_delta_net  # noqa: F401
-
-            return True
-        except (ImportError, ModuleNotFoundError):
-            return False
-
-    @staticmethod
-    def are_gdn_triton_kernels_available() -> bool:
-        """Check if AITER Triton kernels for GDN attention are importable.
-
-        These are optional Triton kernels (conv1d fast-path, gated delta net)
-        used by GatedDeltaNetAttention's decode fast-path.  They may be absent
-        in older aiter builds.  Combine with ``is_enabled()`` to also gate on
-        the environment variable::
-
-            if rocm_aiter_ops.is_enabled() and \\
-               rocm_aiter_ops.are_gdn_triton_kernels_available():
-                ...
-        """
-        if not is_aiter_found_and_supported():
             return False
         try:
             import aiter.ops.triton.causal_conv1d_update_single_token  # noqa: F401

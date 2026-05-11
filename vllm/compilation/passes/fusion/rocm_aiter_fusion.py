@@ -445,9 +445,7 @@ class RocmAiterRMSNormQuantFusionPass(VllmPatternMatcherPass):
         is_quant_fp8_enabled = config.compilation_config.is_custom_op_enabled(
             "quant_fp8"
         )
-        match_aiter_quant_options = (
-            [True, False] if is_quant_fp8_enabled else [False]
-        )
+        match_aiter_quant_options = [True, False] if is_quant_fp8_enabled else [False]
 
         # use_triton selects between the triton and CK group quant ops.
         # It only affects the search pattern when quant_fp8 is enabled
