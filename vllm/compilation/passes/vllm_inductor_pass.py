@@ -246,10 +246,37 @@ class VllmPatternReplacement(ABC, Generic[P, R]):
         return torch.empty(*args, dtype=torch.int32, device="cuda", **kwargs)
 
 
-def _fx_view_to_reshape(gm: fx.GraphModule) -> None:
+def fx_view_to_reshape(gm: fx.GraphModule) -> None:
     from torch._inductor.fx_passes.post_grad import view_to_reshape
 
     view_to_reshape(gm)
+
+
+def fold_consecutive_reshapes(gm: fx.GraphModule) -> None:
+    """Fold consecutive reshape ops into a single reshape.
+
+    ``make_fx`` faithfully records every view/reshape the Python code performs,
+    so patterns like ``x.reshape(a, b).reshape(c, d)`` produce two reshape
+    nodes.  Inductor's own optimisation would fold these, but
+    ``pm.register_replacement``'s ``trace_fn`` runs before Inductor, so we
+    must fold them ourselves for the pattern to match the compiled graph.
+
+    When reshape(A, shape1) feeds only into reshape(result, shape2),
+    the first reshape is redundant -- replace with reshape(A, shape2).
+    """
+    aten_reshape = torch.ops.aten.reshape.default
+    for node in list(gm.graph.nodes):
+        if not is_func(node, aten_reshape):
+            continue
+        inp = node.args[0]
+        if not isinstance(inp, fx.Node) or not is_func(inp, aten_reshape):
+            continue
+        if len(inp.users) != 1:
+            continue
+        original_input = inp.args[0]
+        node.args = (original_input, node.args[1])
+        inp.replace_all_uses_with(original_input)
+        gm.graph.erase_node(inp)
 
 
 def _remove_noop_permutes(gm: fx.GraphModule) -> None:
@@ -295,7 +322,7 @@ class VllmFusionPatternMatcherPass(VllmPatternMatcherPass):
     @staticmethod
     def _trace_fn(*args: Any, **kwargs: Any) -> fx.GraphModule:
         gm = pm.fwd_only(*args, **kwargs)
-        _fx_view_to_reshape(gm)
+        fx_view_to_reshape(gm)
         _remove_noop_permutes(gm)
         return gm
 
