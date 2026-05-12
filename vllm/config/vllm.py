@@ -183,6 +183,7 @@ _QK_NORM_MODEL_TYPES = frozenset(
     {
         "qwen3",
         "qwen3_moe",
+        "qwen3_next",
     }
 )
 
