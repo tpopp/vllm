@@ -593,6 +593,31 @@ class QkNormRopeKvCacheFusionPass(VllmPatternMatcherPass):
     separate kernel launches and the intermediate memory traffic.
     """
 
+    def _register_variants(
+        self,
+        pattern_cls: type,
+        layer: Attention,
+        aiter_rope_variants: list[bool],
+        **extra_kwargs,
+    ) -> None:
+        fi_variants = [False, True] if RotaryEmbedding.enabled() else [False]
+        for aiter_rope in aiter_rope_variants:
+            for epsilon in [1e-5, 1e-6]:
+                for neox in [True, False]:
+                    for rope_fi in fi_variants:
+                        try:
+                            pattern_cls(
+                                layer=layer,
+                                eps=epsilon,
+                                is_neox=neox,
+                                rope_flashinfer=rope_fi,
+                                match_rocm_aiter_rope=aiter_rope,
+                                **extra_kwargs,
+                            ).register(self.patterns)
+                        except RuntimeError as e:
+                            if "Duplicate pattern" not in str(e):
+                                raise
+
     @enable_fake_mode
     def __init__(self, config: VllmConfig) -> None:
         super().__init__(config)
@@ -637,98 +662,27 @@ class QkNormRopeKvCacheFusionPass(VllmPatternMatcherPass):
             if not layer.impl.fused_qk_norm_rope_kvcache_supported():
                 continue
             layer.impl.set_fused_kv_cache_layout()
-            for aiter_rope in aiter_rope_variants:
-                for epsilon in [1e-5, 1e-6]:
-                    for neox in [True, False]:
-                        if RotaryEmbedding.enabled():
-                            for rope_flashinfer in [False, True]:
-                                try:
-                                    QkNormRopeKvCachePattern(
-                                        layer=layer,
-                                        eps=epsilon,
-                                        is_neox=neox,
-                                        rope_flashinfer=rope_flashinfer,
-                                        match_rocm_aiter_rope=aiter_rope,
-                                    ).register(self.patterns)
-                                except RuntimeError as e:
-                                    if "Duplicate pattern" in str(e):
-                                        logger.debug(
-                                            "Skipping duplicate pattern: "
-                                            "aiter_rope=%s eps=%s neox=%s fi=%s",
-                                            aiter_rope,
-                                            epsilon,
-                                            neox,
-                                            rope_flashinfer,
-                                        )
-                                    else:
-                                        raise
-                        else:
-                            try:
-                                QkNormRopeKvCachePattern(
-                                    layer=layer,
-                                    eps=epsilon,
-                                    is_neox=neox,
-                                    match_rocm_aiter_rope=aiter_rope,
-                                ).register(self.patterns)
-                            except RuntimeError as e:
-                                if "Duplicate pattern" in str(e):
-                                    logger.debug(
-                                        "Skipping duplicate pattern: "
-                                        "aiter_rope=%s eps=%s neox=%s fi=N/A",
-                                        aiter_rope,
-                                        epsilon,
-                                        neox,
-                                    )
-                                else:
-                                    raise
+            self._register_variants(
+                QkNormRopeKvCachePattern, layer, aiter_rope_variants
+            )
 
         # Qwen3Next-specific patterns with attn_output_gate handling.
         hf_config = config.model_config.hf_text_config
         attn_output_gate = getattr(hf_config, "attn_output_gate", None)
-        if attn_output_gate is None and type(hf_config).__name__ in (
-            "Qwen3NextConfig",
+        if attn_output_gate is None and getattr(hf_config, "model_type", "") in (
+            "qwen3_next",
         ):
             attn_output_gate = True
         if attn_output_gate is not None:
-            for gate_val in (
-                [attn_output_gate]
-                if isinstance(attn_output_gate, bool)
-                else [True, False]
-            ):
-                for _, layer in attn_layers.items():
-                    if not layer.impl.fused_qk_norm_rope_kvcache_supported():
-                        continue
-                    for aiter_rope in aiter_rope_variants:
-                        for epsilon in [1e-5, 1e-6]:
-                            for neox in [True, False]:
-                                fi_variants = (
-                                    [False, True]
-                                    if RotaryEmbedding.enabled()
-                                    else [False]
-                                )
-                                for rope_fi in fi_variants:
-                                    try:
-                                        Qwen3NextQkNormRopeKvCachePattern(
-                                            layer=layer,
-                                            eps=epsilon,
-                                            is_neox=neox,
-                                            attn_output_gate=gate_val,
-                                            rope_flashinfer=rope_fi,
-                                            match_rocm_aiter_rope=aiter_rope,
-                                        ).register(self.patterns)
-                                    except RuntimeError as e:
-                                        if "Duplicate pattern" not in str(e):
-                                            raise
-                                        logger.debug(
-                                            "Skipping duplicate Qwen3Next "
-                                            "pattern: gate=%s "
-                                            "rope=%s eps=%s neox=%s fi=%s",
-                                            gate_val,
-                                            aiter_rope,
-                                            epsilon,
-                                            neox,
-                                            rope_fi,
-                                        )
+            for _, layer in attn_layers.items():
+                if not layer.impl.fused_qk_norm_rope_kvcache_supported():
+                    continue
+                self._register_variants(
+                    Qwen3NextQkNormRopeKvCachePattern,
+                    layer,
+                    aiter_rope_variants,
+                    attn_output_gate=attn_output_gate,
+                )
 
         # Backends that set _use_interleaved_v_cache (e.g. ROCM_ATTN)
         # require a consistent V-cache layout across ALL compile ranges.
