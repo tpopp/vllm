@@ -136,8 +136,14 @@ class PassConfig:
     """Enable flashinfer allreduce fusion."""
     fuse_minimax_qk_norm: bool = None  # type: ignore[assignment]
     """Enable fused allreduce+RMSNorm for MiniMax QK norm."""
-    enable_qk_norm_rope_fusion: bool = None  # type: ignore[assignment]
-    """Enable fused Q/K RMSNorm + RoPE pass."""
+    enable_qk_norm_rope_fusion: bool = Field(default=None)
+    """Enable fused Q/K RMSNorm + RoPE pass.
+    Auto-enabled at O1+ for models with QK-norm layers (e.g. Qwen3)."""
+    fuse_qk_norm_rope_kvcache: bool = Field(default=None)
+    """Fuse QK RMSNorm + RoPE + KV cache update into a single AITER HIP
+    kernel. Supersedes both enable_qk_norm_rope_fusion and fuse_rope_kvcache
+    for layers that support it. Auto-enabled at O1+ on ROCm for models
+    with QK-norm (e.g. Qwen3-MoE)."""
     fuse_rope_kvcache_cat_mla: bool = None  # type: ignore[assignment]
     """Enable fused MLA KV cache update with RoPE."""
 
@@ -230,6 +236,7 @@ class PassConfig:
         "fuse_act_padding",
         "fuse_mla_dual_rms_norm",
         "fuse_rope_kvcache",
+        "fuse_qk_norm_rope_kvcache",
         "fuse_rope_kvcache_cat_mla",
         mode="wrap",
     )
@@ -294,6 +301,12 @@ class PassConfig:
                 "current platform is not CUDA or ROCm. The fusion will be disabled."
             )
             self.fuse_rope_kvcache_cat_mla = False
+        if self.fuse_qk_norm_rope_kvcache and not current_platform.is_rocm():
+            logger.warning_once(
+                "QK-Norm+RoPE+KVCache fusion requires ROCm with AITER. "
+                "The fusion will be disabled."
+            )
+            self.fuse_qk_norm_rope_kvcache = False
 
     def log_enabled_passes(self) -> None:
         """
@@ -302,11 +315,15 @@ class PassConfig:
         after all defaults are finalized.
         TODO also log the compile ranges for which this is enabled.
         """
-        enabled_fusions = [
-            f.name[len("fuse_") :]
-            for f in fields(self)  # type: ignore[arg-type]
-            if getattr(self, f.name) and f.name.startswith("fuse_")
-        ]
+        fusion_prefixes = ("fuse_", "enable_")
+        enabled_fusions = []
+        for f in fields(self):  # type: ignore[arg-type]
+            if not getattr(self, f.name):
+                continue
+            for prefix in fusion_prefixes:
+                if f.name.startswith(prefix):
+                    enabled_fusions.append(f.name[len(prefix) :])
+                    break
 
         if enabled_fusions:
             logger.info_once(
@@ -953,6 +970,17 @@ class CompilationConfig:
             # TODO(Rohan138): support rope native forward match and remove this.
             # Linked issue: https://github.com/vllm-project/vllm/issues/28042
             self.custom_ops.append("+rotary_embedding")
+
+        if self.pass_config.fuse_qk_norm_rope_kvcache:
+            if "+rotary_embedding" not in self.custom_ops:
+                self.custom_ops.append("+rotary_embedding")
+            if not self.use_inductor_graph_partition:
+                self.use_inductor_graph_partition = True
+                logger.info(
+                    "Enabling use_inductor_graph_partition for "
+                    "fuse_qk_norm_rope_kvcache (requires "
+                    "unified_kv_cache_update in compiled graph)."
+                )
 
         if (
             is_torch_equal_or_newer("2.9.0.dev")

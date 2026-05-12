@@ -181,6 +181,65 @@ def enable_mla_dual_rms_norm_fusion(cfg: "VllmConfig") -> bool:
     return rocm_aiter_ops.is_enabled() and check_aiter_fused_qk_rmsnorm()
 
 
+_QK_NORM_MODEL_TYPES = frozenset(
+    {
+        "qwen3",
+        "qwen3_moe",
+        "qwen3_next",
+    }
+)
+
+
+def enable_qk_norm_rope_kvcache(cfg: "VllmConfig") -> bool:
+    """Enable fused QK-norm + RoPE + KV cache update for models with
+    QK-norm on ROCm with AITER. Requires rotary embedding custom op.
+
+    Note: use_inductor_graph_partition is NOT checked here because
+    CompilationConfig.__post_init__ auto-enables it when this flag is
+    True (the callable runs during optimization-level default
+    application, before __post_init__ can set the dependent flags)."""
+    from vllm._aiter_ops import rocm_aiter_ops
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_rocm():
+        return False
+    if not rocm_aiter_ops.is_enabled():
+        return False
+    if cfg.model_config is None:
+        return False
+    hf_config = cfg.model_config.hf_text_config
+    has_qk_norm = getattr(hf_config, "qk_norm", False)
+    model_type = getattr(hf_config, "model_type", "")
+    if not has_qk_norm and model_type not in _QK_NORM_MODEL_TYPES:
+        return False
+    return cfg.compilation_config.is_custom_op_enabled("rotary_embedding")
+
+
+def enable_qk_norm_rope(cfg: "VllmConfig") -> bool:
+    """Enable QK-norm + RoPE fusion for models with QK-norm layers.
+
+    Detection uses two strategies:
+    1. Explicit config: checks ``hf_config.qk_norm`` for models that
+       expose QK-norm as a config option (e.g. BAGEL uses the Qwen2
+       architecture with ``qk_norm=True`` injected at load time).
+    2. Architecture: checks ``hf_config.model_type`` against
+       ``_QK_NORM_MODEL_TYPES`` for models that hardcode QK-norm
+       in their architecture without a config.json field
+       (e.g. Qwen3 and Qwen3-MoE always use QK-norm).
+    """
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_cuda_alike():
+        return False
+    if cfg.model_config is None:
+        return False
+    hf_config = cfg.model_config.hf_text_config
+    if getattr(hf_config, "qk_norm", False):
+        return True
+    model_type = getattr(hf_config, "model_type", "")
+    return model_type in _QK_NORM_MODEL_TYPES
+
+
 OPTIMIZATION_LEVEL_00 = {
     "compilation_config": {
         "pass_config": {
@@ -194,6 +253,8 @@ OPTIMIZATION_LEVEL_00 = {
             "fuse_mla_dual_rms_norm": False,
             "fuse_rope_kvcache": False,
             "fuse_rope_kvcache_cat_mla": False,
+            "fuse_qk_norm_rope_kvcache": False,
+            "enable_qk_norm_rope_fusion": False,
         },
         "cudagraph_mode": CUDAGraphMode.NONE,
         "use_inductor_graph_partition": False,
@@ -215,6 +276,8 @@ OPTIMIZATION_LEVEL_01 = {
             "fuse_mla_dual_rms_norm": enable_mla_dual_rms_norm_fusion,
             "fuse_rope_kvcache": False,
             "fuse_rope_kvcache_cat_mla": False,
+            "fuse_qk_norm_rope_kvcache": False,
+            "enable_qk_norm_rope_fusion": False,
         },
         "cudagraph_mode": CUDAGraphMode.PIECEWISE,
         "use_inductor_graph_partition": False,
@@ -238,6 +301,8 @@ OPTIMIZATION_LEVEL_02 = {
             "fuse_mla_dual_rms_norm": enable_mla_dual_rms_norm_fusion,
             "fuse_rope_kvcache": enable_rope_kvcache_fusion,
             "fuse_rope_kvcache_cat_mla": enable_rope_kvcache_mla_fusion,
+            "fuse_qk_norm_rope_kvcache": enable_qk_norm_rope_kvcache,
+            "enable_qk_norm_rope_fusion": enable_qk_norm_rope,
         },
         "cudagraph_mode": CUDAGraphMode.FULL_AND_PIECEWISE,
         "use_inductor_graph_partition": False,
@@ -261,6 +326,8 @@ OPTIMIZATION_LEVEL_03 = {
             "fuse_mla_dual_rms_norm": enable_mla_dual_rms_norm_fusion,
             "fuse_rope_kvcache": enable_rope_kvcache_fusion,
             "fuse_rope_kvcache_cat_mla": enable_rope_kvcache_mla_fusion,
+            "fuse_qk_norm_rope_kvcache": enable_qk_norm_rope_kvcache,
+            "enable_qk_norm_rope_fusion": enable_qk_norm_rope,
         },
         "cudagraph_mode": CUDAGraphMode.FULL_AND_PIECEWISE,
         "use_inductor_graph_partition": False,

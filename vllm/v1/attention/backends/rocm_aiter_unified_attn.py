@@ -200,15 +200,30 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
         key_cache, value_cache = kv_cache.unbind(0)
 
         softmax_scale = self.scale
+        fp8_post_attn_v_rescale = False
         if is_quantized_kv_cache(self.kv_cache_dtype):
             key_cache = key_cache.view(self.fp8_dtype)
             value_cache = value_cache.view(self.fp8_dtype)
+            # When Q is FP8, triton kernel skips K/V dequant (for fp8xfp8 matmul).
+            # Compensate by absorbing q_scale and k_scale into softmax_scale, and
+            # v_scale into output_scale (or post-multiplying if no fusion).
+            if query.dtype == self.fp8_dtype:
+                softmax_scale = self.scale * layer._q_scale_float * layer._k_scale_float
+                if output_scale is not None:
+                    output_scale = output_scale / layer._v_scale_float
+                else:
+                    fp8_post_attn_v_rescale = True
 
         cu_seqlens_q = attn_metadata.query_start_loc
         seqused_k = attn_metadata.seq_lens
         max_seqlen_q = attn_metadata.max_query_len
         max_seqlen_k = attn_metadata.max_seq_len
         block_table = attn_metadata.block_table
+
+        descale_shape = (
+            cu_seqlens_q.shape[0] - 1,
+            key.shape[1] if key is not None else self.num_kv_heads,
+        )
 
         self.unified_attention(
             q=query[:num_actual_tokens],
@@ -225,12 +240,15 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
             window_size=self.sliding_window,
             block_table=block_table,
             softcap=self.logits_soft_cap,
-            q_descale=layer._q_scale if query.dtype == self.fp8_dtype else None,
-            k_descale=layer._k_scale,
-            v_descale=layer._v_scale,
+            q_descale=None,  # q_scale absorbed into softmax_scale
+            k_descale=layer._k_scale.expand(descale_shape),
+            v_descale=layer._v_scale.expand(descale_shape),
             sinks=self.sinks,
             output_scale=output_scale,
         )
+
+        if fp8_post_attn_v_rescale:
+            output[:num_actual_tokens].mul_(layer._v_scale_float)
 
         return output
 
@@ -262,6 +280,66 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
 
     def fused_rope_kvcache_supported(self):
         return rocm_aiter_ops.is_enabled()
+
+    def set_fused_kv_cache_layout(self):
+        # No-op: this backend uses AITER flash/unified attention for decode,
+        # not the C++ HIP ASM paged attention kernel, so it does not need
+        # the interleaved V-cache read path that the parent would enable.
+        pass
+
+    def do_triton_qk_norm_rope_kvcache_update(
+        self,
+        layer: AttentionLayer,
+        qkv: torch.Tensor,
+        q_out: torch.Tensor,
+        k_out: torch.Tensor,
+        v_out: torch.Tensor,
+        gate_out: torch.Tensor | None,
+        positions: torch.Tensor,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        rms_norm_eps: float,
+        cos_sin_cache: torch.Tensor,
+        is_neox: bool,
+        kv_cache: torch.Tensor,
+        layer_slot_mapping: torch.Tensor,
+        attn_output_gate: bool = False,
+    ):
+        key_cache, value_cache = kv_cache.unbind(0)
+
+        is_fp8_kv_cache = self.kv_cache_dtype.startswith("fp8")
+        if is_fp8_kv_cache:
+            key_cache = key_cache.view(self.fp8_dtype)
+            value_cache = value_cache.view(self.fp8_dtype)
+
+        cos, sin = cos_sin_cache.chunk(2, dim=-1)
+
+        k_scale = layer._k_scale if is_fp8_kv_cache else None
+        v_scale = layer._v_scale if is_fp8_kv_cache else None
+
+        rocm_aiter_ops.fused_qkv_split_qk_norm_rope_cache(
+            qkv=qkv,
+            q_weight=q_weight,
+            k_weight=k_weight,
+            cos=cos,
+            sin=sin,
+            positions=positions,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            slot_mapping=layer_slot_mapping,
+            q_out=q_out,
+            k_out=k_out,
+            v_out=v_out,
+            gate_out=gate_out,
+            qh=self.num_heads,
+            kvh=self.num_kv_heads,
+            head_dim=self.head_size,
+            is_neox=is_neox,
+            attn_output_gate=attn_output_gate,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            eps=rms_norm_eps,
+        )
 
     def do_rope_and_kv_cache_update(
         self,

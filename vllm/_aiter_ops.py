@@ -1133,6 +1133,99 @@ def _triton_rotary_embedding_fake(
     return
 
 
+def _rocm_aiter_fused_qkv_split_qk_norm_rope_cache_impl(
+    qkv: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    positions: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    q_out: torch.Tensor,
+    k_out: torch.Tensor,
+    v_out: torch.Tensor,
+    gate_out: torch.Tensor | None,
+    qh: int,
+    kvh: int,
+    head_dim: int,
+    is_neox: bool = True,
+    offsets: torch.Tensor | None = None,
+    reuse_freqs_front_part: bool = True,
+    attn_output_gate: bool = False,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+    eps: float = 1e-5,
+) -> None:
+    from aiter.ops.triton.rope.fused_qkv_split_qk_norm_rope_cache import (
+        fused_qkv_split_qk_norm_rope_cache,
+    )
+
+    results = fused_qkv_split_qk_norm_rope_cache(
+        qkv=qkv,
+        q_weight=q_weight,
+        k_weight=k_weight,
+        cos=cos,
+        sin=sin,
+        positions=positions,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        slot_mapping=slot_mapping,
+        qh=qh,
+        kvh=kvh,
+        head_dim=head_dim,
+        is_neox=is_neox,
+        offsets=offsets,
+        reuse_freqs_front_part=reuse_freqs_front_part,
+        attn_output_gate=attn_output_gate,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        eps=eps,
+    )
+
+    if attn_output_gate:
+        q, gate, k, v = results
+        q_out.copy_(q)
+        k_out.copy_(k)
+        v_out.copy_(v)
+        if gate_out is not None:
+            gate_out.copy_(gate)
+    else:
+        q, k, v = results
+        q_out.copy_(q)
+        k_out.copy_(k)
+        v_out.copy_(v)
+
+
+def _rocm_aiter_fused_qkv_split_qk_norm_rope_cache_fake(
+    qkv: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    positions: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    q_out: torch.Tensor,
+    k_out: torch.Tensor,
+    v_out: torch.Tensor,
+    gate_out: torch.Tensor | None,
+    qh: int,
+    kvh: int,
+    head_dim: int,
+    is_neox: bool = True,
+    offsets: torch.Tensor | None = None,
+    reuse_freqs_front_part: bool = True,
+    attn_output_gate: bool = False,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+    eps: float = 1e-5,
+) -> None:
+    return
+
+
 # Global flag to ensure ops are registered only once
 _OPS_REGISTERED = False
 
@@ -1675,6 +1768,20 @@ class rocm_aiter_ops:
                 fake_impl=_fused_mla_dual_rms_norm_fake,
             )
 
+            direct_register_custom_op(
+                op_name="rocm_aiter_fused_qkv_split_qk_norm_rope_cache",
+                op_func=_rocm_aiter_fused_qkv_split_qk_norm_rope_cache_impl,
+                mutates_args=[
+                    "q_out",
+                    "k_out",
+                    "v_out",
+                    "gate_out",
+                    "key_cache",
+                    "value_cache",
+                ],
+                fake_impl=_rocm_aiter_fused_qkv_split_qk_norm_rope_cache_fake,
+            )
+
             _OPS_REGISTERED = True
 
     @staticmethod
@@ -1708,6 +1815,119 @@ class rocm_aiter_ops:
     @staticmethod
     def get_triton_add_rmsnorm_pad_op() -> OpOverload:
         return torch.ops.vllm.rocm_aiter_triton_add_rmsnorm_pad.default
+
+    @staticmethod
+    def get_fused_qkv_split_qk_norm_rope_cache_op() -> OpOverload:
+        return torch.ops.vllm.rocm_aiter_fused_qkv_split_qk_norm_rope_cache.default
+
+    @staticmethod
+    def fused_qkv_split_qk_norm_rope_cache(
+        qkv: torch.Tensor,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        positions: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        q_out: torch.Tensor,
+        k_out: torch.Tensor,
+        v_out: torch.Tensor,
+        gate_out: torch.Tensor | None,
+        qh: int,
+        kvh: int,
+        head_dim: int,
+        is_neox: bool = True,
+        offsets: torch.Tensor | None = None,
+        reuse_freqs_front_part: bool = True,
+        attn_output_gate: bool = False,
+        k_scale: torch.Tensor | None = None,
+        v_scale: torch.Tensor | None = None,
+        eps: float = 1e-5,
+    ) -> None:
+        torch.ops.vllm.rocm_aiter_fused_qkv_split_qk_norm_rope_cache(
+            qkv,
+            q_weight,
+            k_weight,
+            cos,
+            sin,
+            positions,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            q_out,
+            k_out,
+            v_out,
+            gate_out,
+            qh,
+            kvh,
+            head_dim,
+            is_neox,
+            offsets,
+            reuse_freqs_front_part,
+            attn_output_gate,
+            k_scale,
+            v_scale,
+            eps,
+        )
+
+    @staticmethod
+    def hip_qk_norm_rope_and_cache(
+        qkv: torch.Tensor,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        positions: torch.Tensor,
+        num_heads_q: int,
+        num_heads_k: int,
+        num_heads_v: int,
+        head_dim: int,
+        is_neox: bool,
+        rms_norm_eps: float,
+        q_out: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        k_scale: torch.Tensor,
+        v_scale: torch.Tensor,
+        k_out: torch.Tensor | None,
+        v_out: torch.Tensor | None,
+        return_kv: bool,
+        use_shuffle_layout: bool,
+        block_size: int,
+        x: int,
+    ):
+        from aiter.ops.fused_qk_norm_rope_cache_quant import (
+            fused_qk_norm_rope_cache_pts_quant_shuffle,
+        )
+
+        fused_qk_norm_rope_cache_pts_quant_shuffle(
+            qkv,
+            q_weight,
+            k_weight,
+            cos_sin_cache,
+            positions,
+            qkv.size(0),
+            num_heads_q,
+            num_heads_k,
+            num_heads_v,
+            head_dim,
+            is_neox,
+            rms_norm_eps,
+            q_out,
+            k_cache,
+            v_cache,
+            slot_mapping,
+            k_scale,
+            v_scale,
+            k_out,
+            v_out,
+            return_kv,
+            use_shuffle_layout,
+            block_size,
+            x,
+        )
 
     @staticmethod
     def get_triton_rotary_embedding_op() -> OpOverload:

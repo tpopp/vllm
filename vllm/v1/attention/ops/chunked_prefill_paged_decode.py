@@ -21,22 +21,6 @@ logger = init_logger(__name__)
 float8_info = torch.finfo(current_platform.fp8_dtype())
 
 
-def has_native_kv_cache_layout(
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-) -> bool:
-    """Return whether KV cache blocks can use the native ROCm pairing.
-
-    The native reshape_and_cache writer assumes packed blocks. If cache update
-    needs reshape_and_cache_flash for a stride-padded hybrid layout, decode
-    should use the matching Triton path too.
-    """
-    return (
-        key_cache.stride(0) == key_cache.shape[1:].numel()
-        and value_cache.stride(0) == value_cache.shape[1:].numel()
-    )
-
-
 @triton.jit
 def cdiv_fn(x, y):
     return (x + y - 1) // y
@@ -84,6 +68,7 @@ def kernel_paged_attention_2d(
     query_start_len_ptr,  # [num_seqs+1]
     USE_SINKS: tl.constexpr,  # bool
     USE_FP8: tl.constexpr,
+    INTERLEAVED_V_KX: tl.constexpr = 0,
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
@@ -170,13 +155,24 @@ def kernel_paged_attention_2d(
             + (offs_d[:, None] % x) * stride_k_cache_4
         )
 
-        # 4D addressing logic of V (Slot is innermost)
-        v_offset = (
-            p_block_idx[:, None] * stride_v_cache_0
-            + kv_head_idx * stride_v_cache_1
-            + offs_d[None, :] * stride_v_cache_2
-            + internal_offsets[:, None] * stride_v_cache_3
-        )
+        # V addressing: standard 4D or interleaved 5D
+        if INTERLEAVED_V_KX > 0:
+            v_offset = (
+                p_block_idx[:, None] * stride_v_cache_0
+                + kv_head_idx * stride_v_cache_1
+                + (internal_offsets[:, None] // INTERLEAVED_V_KX)
+                * HEAD_SIZE
+                * INTERLEAVED_V_KX
+                + offs_d[None, :] * INTERLEAVED_V_KX
+                + (internal_offsets[:, None] % INTERLEAVED_V_KX)
+            )
+        else:
+            v_offset = (
+                p_block_idx[:, None] * stride_v_cache_0
+                + kv_head_idx * stride_v_cache_1
+                + offs_d[None, :] * stride_v_cache_2
+                + internal_offsets[:, None] * stride_v_cache_3
+            )
 
         # K : (HEAD_SIZE, BLOCK_SIZE)
         K_load = tl.load(
@@ -286,6 +282,7 @@ def chunked_prefill_paged_decode(
     sinks=None,
     is_block_table_ptr: bool = False,
     causal: bool = True,
+    use_interleaved_v_cache: bool = False,
 ):
     if sm_scale is None:
         sm_scale = 1.0 / (query.shape[2] ** 0.5)
@@ -294,6 +291,10 @@ def chunked_prefill_paged_decode(
 
     if sliding_window is None or sliding_window <= 0:
         sliding_window = 0
+
+    interleaved_v_kx = (
+        (16 // value_cache.element_size()) if use_interleaved_v_cache else 0
+    )
 
     if max_query_len > 1:
         context_attention_fwd(
@@ -318,6 +319,7 @@ def chunked_prefill_paged_decode(
             fp8_out_scale=output_scale,
             sinks=sinks,
             causal=causal,
+            interleaved_v_kx=interleaved_v_kx,
         )
 
     block_size = value_cache.shape[3]
@@ -362,12 +364,14 @@ def chunked_prefill_paged_decode(
         alibi_slopes,
         sinks,
     )
-    has_native_layout = has_native_kv_cache_layout(key_cache, value_cache)
-    # Force Triton for non-standard blocks like Qwen3's 544 and for
-    # stride-padded hybrid layouts. The latter use reshape_and_cache_flash
-    # during cache update, so keep decode on the matching stride-aware path.
+    # Triton is only forced when encountering a non-standard block
+    # like Qwen3 with a size of 544.
+    # 1. Check if block_size is a power of 2 (16, 32, 64...)
+    # 2. If it's a power of 2, we trust the vLLM's native use_custom decision.
+    # 3. If it's not a power of 2 (such as Qwen3's 544),
+    # then our Triton path is forced.
     is_pow2 = block_size > 0 and (block_size & (block_size - 1) == 0)
-    if not is_pow2 or not has_native_layout:
+    if not is_pow2:
         use_custom = False
 
     if use_custom:
@@ -409,6 +413,7 @@ def chunked_prefill_paged_decode(
             k_scale=k_scale,
             v_scale=v_scale,
             fp8_out_scale=output_scale,
+            use_interleaved_v_cache=use_interleaved_v_cache,
         )
     else:
         logger.warning_once(
@@ -418,12 +423,7 @@ def chunked_prefill_paged_decode(
         real_block_size = value_cache.shape[3]
         # The standard model directly uses the original block_size.
         # Non-standard 544 uses 32 to accommodate integer division logic.
-        # Cap at 128 to avoid exceeding GPU shared memory limits
-        # (e.g. hybrid Mamba models inflate block_size to 2048).
-        # The kernel handles TRITON_BLOCK_SIZE != PHYSICAL_BLOCK_SIZE
-        # via the l_block_idx/internal_offsets addressing logic.
-        MAX_TRITON_BLOCK_SIZE = 128
-        TRITON_BLOCK_SIZE = min(block_size, MAX_TRITON_BLOCK_SIZE) if is_pow2 else 32
+        TRITON_BLOCK_SIZE = block_size if is_pow2 else 32
         if is_block_table_ptr:
             # Using the physical base address of tensors
             kv_element_size = key_cache.element_size()
@@ -485,4 +485,5 @@ def chunked_prefill_paged_decode(
             query_start_len_ptr=query_start_loc,
             USE_SINKS=sinks is not None,
             USE_FP8=output_scale is not None,
+            INTERLEAVED_V_KX=interleaved_v_kx,
         )
