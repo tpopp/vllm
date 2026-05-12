@@ -7,9 +7,11 @@ import torch
 from torch._higher_order_ops import auto_functionalized
 from torch._ops import OpOverload
 
+from vllm import ir
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import get_current_vllm_config
 from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
@@ -23,8 +25,12 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4Dynamic,
 )
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
+from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
+    DeepseekScalingRotaryEmbedding,
+)
 from vllm.platforms import current_platform
 
+RMS_OP = torch.ops._C.rms_norm.default
 RMS_ADD_OP = torch.ops._C.fused_add_rms_norm.default
 ROTARY_OP = torch.ops._C.rotary_embedding.default
 FLASHINFER_ROTARY_OP = torch.ops.vllm.flashinfer_rotary_embedding.default
@@ -146,6 +152,129 @@ class MatcherRotaryEmbedding(MatcherCustomOp):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         result: tuple[torch.Tensor, torch.Tensor | None] = (
             RotaryEmbedding.forward_static(
+                positions,
+                query,
+                key,
+                self.head_size,
+                self.rotary_dim,
+                cos_sin_cache,
+                self.is_neox,
+            )
+        )
+        return result
+
+
+class MatcherRMSNorm(MatcherCustomOp):
+    """Matcher for plain RMS norm (no residual add).
+
+    Dispatches through ``vllm.ir.ops.rms_norm`` so the traced pattern
+    follows the same IR lowering path as the model's ``RMSNorm`` layer
+    (native / vllm_c / aiter / oink / ...), whichever one the current
+    ``IrOpPriorityConfig`` selects.  This keeps the pattern aligned with
+    whatever impl actually appears in the target graph at runtime; callers
+    therefore do not need to register per-backend variants.
+    """
+
+    def __init__(
+        self,
+        epsilon: float,
+        enabled: bool | None = None,
+    ) -> None:
+        if enabled is None:
+            enabled = RMSNorm.enabled()
+
+        super().__init__(enabled)
+        self.epsilon = epsilon
+
+    def inputs(self) -> list[torch.Tensor]:
+        input = self.empty(5, 16) if self.enabled else self.empty_f32(5, 16)
+        weight = self.empty(16)
+        return [input, weight]
+
+    def forward_custom(
+        self,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> torch.Tensor:
+        return ir.ops.rms_norm(input, weight, self.epsilon)
+
+    def forward_native(
+        self,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> torch.Tensor:
+        return ir.ops.rms_norm(input, weight, self.epsilon)
+
+
+class MatcherDeepseekScalingRotaryEmbedding(MatcherCustomOp):
+    def __init__(
+        self,
+        is_neox: bool,
+        head_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        use_flashinfer: bool = False,
+        enabled: bool | None = None,
+    ) -> None:
+        if enabled is None:
+            enabled = DeepseekScalingRotaryEmbedding.enabled()
+
+        super().__init__(enabled)
+        self.is_neox = is_neox
+        self.head_size = head_size
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.q_size = self.num_heads * self.head_size
+        self.kv_size = self.num_kv_heads * self.head_size
+        self.rotary_dim = head_size
+        self.use_flashinfer = use_flashinfer
+
+    def inputs(self) -> list[torch.Tensor]:
+        positions = self.empty_int64(5)
+        query = self.empty(5, self.num_heads, self.head_size)
+        key = self.empty(5, self.num_kv_heads, self.head_size)
+        cos_sin_cache = self.empty(4096, self.rotary_dim)
+        return [positions, query, key, cos_sin_cache]
+
+    def forward_custom(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor | None,
+        cos_sin_cache: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if self.use_flashinfer:
+            torch.ops.vllm.flashinfer_rotary_embedding(
+                positions,
+                query,
+                key,
+                self.head_size,
+                cos_sin_cache,
+                self.is_neox,
+            )
+            return query, key
+        result: tuple[torch.Tensor, torch.Tensor | None] = (
+            DeepseekScalingRotaryEmbedding.forward_static(
+                positions,
+                query,
+                key,
+                self.head_size,
+                self.rotary_dim,
+                cos_sin_cache,
+                self.is_neox,
+            )
+        )
+        return result
+
+    def forward_native(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor | None,
+        cos_sin_cache: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        result: tuple[torch.Tensor, torch.Tensor | None] = (
+            DeepseekScalingRotaryEmbedding.forward_static(
                 positions,
                 query,
                 key,
