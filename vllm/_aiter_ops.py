@@ -2031,6 +2031,52 @@ class rocm_aiter_ops:
         return y
 
     @staticmethod
+    def triton_qk_norm_rope_kvcache(
+        qkv: torch.Tensor,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        positions: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        is_neox: bool,
+        attn_output_gate: bool,
+        rms_norm_eps: float,
+        k_scale: torch.Tensor | None,
+        v_scale: torch.Tensor | None,
+        kv_cache_layout: str,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        from aiter.ops.triton.rope.fused_qkv_split_qk_norm_rope_cache import (
+            fused_qkv_split_qk_norm_rope_cache,
+        )
+
+        return fused_qkv_split_qk_norm_rope_cache(
+            qkv=qkv,
+            q_weight=q_weight,
+            k_weight=k_weight,
+            cos=cos,
+            sin=sin,
+            positions=positions,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            slot_mapping=slot_mapping,
+            qh=num_heads,
+            kvh=num_kv_heads,
+            head_dim=head_dim,
+            is_neox=is_neox,
+            attn_output_gate=attn_output_gate,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            eps=rms_norm_eps,
+            kv_cache_layout=kv_cache_layout,
+        )
+
+    @staticmethod
     def triton_rope_and_cache(
         query: torch.Tensor,
         key: torch.Tensor,
