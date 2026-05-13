@@ -106,10 +106,6 @@ def fused_triton_qk_norm_rope_kvcache_update_impl(
     head_dim: int,
     layer_name: str = "",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    from aiter.ops.triton.rope.fused_qkv_split_qk_norm_rope_cache import (
-        fused_qkv_split_qk_norm_rope_cache,
-    )
-
     _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(layer_name)
 
     T = qkv.shape[0]
@@ -123,9 +119,6 @@ def fused_triton_qk_norm_rope_kvcache_update_impl(
         return dummy, q, k, v, gate
 
     rdh = cos_sin_cache.shape[-1] // 2
-    cos_full = cos_sin_cache[:, :rdh]
-    sin_full = cos_sin_cache[:, rdh:]
-
     key_cache, value_cache = kv_cache.unbind(0)
 
     k_scale_f = getattr(attn_layer, "_k_scale_float", 1.0)
@@ -143,24 +136,24 @@ def fused_triton_qk_norm_rope_kvcache_update_impl(
 
     kv_layout = "HND" if key_cache.shape[1] == num_kv_heads else "NHD"
 
-    q, gate, k, v = fused_qkv_split_qk_norm_rope_cache(
+    q, gate, k, v = rocm_aiter_ops.triton_qk_norm_rope_kvcache(
         qkv=qkv,
         q_weight=q_weight,
         k_weight=k_weight,
-        cos=cos_full,
-        sin=sin_full,
+        cos=cos_sin_cache[:, :rdh],
+        sin=cos_sin_cache[:, rdh:],
         positions=positions,
         key_cache=key_cache,
         value_cache=value_cache,
         slot_mapping=layer_slot_mapping,
-        qh=num_heads,
-        kvh=num_kv_heads,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
         head_dim=head_dim,
         is_neox=is_neox,
         attn_output_gate=attn_output_gate,
+        rms_norm_eps=rms_norm_eps,
         k_scale=k_scale_t,
         v_scale=v_scale_t,
-        eps=rms_norm_eps,
         kv_cache_layout=kv_layout,
     )
     return dummy, q, k, v, gate
