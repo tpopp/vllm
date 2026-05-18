@@ -1205,6 +1205,7 @@ class rocm_aiter_ops:
     _MLA_ENABLED = envs.VLLM_ROCM_USE_AITER_MLA
     _MHA_ENABLED = envs.VLLM_ROCM_USE_AITER_MHA
     _SHUFFLE_KV_CACHE_ENABLED = envs.VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT
+    _GLUON_DECODE_ENABLED = envs.VLLM_ROCM_USE_GLUON_DECODE
     _TRITON_UNIFIED_ATTN_ENABLED = envs.VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION
     # TODO: Consolidate under _LINEAR_ENABLED
     _FP8BMM_ENABLED = envs.VLLM_ROCM_USE_AITER_FP8BMM
@@ -1238,6 +1239,7 @@ class rocm_aiter_ops:
         cls._MLA_ENABLED = envs.VLLM_ROCM_USE_AITER_MLA
         cls._MHA_ENABLED = envs.VLLM_ROCM_USE_AITER_MHA
         cls._SHUFFLE_KV_CACHE_ENABLED = envs.VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT
+        cls._GLUON_DECODE_ENABLED = envs.VLLM_ROCM_USE_GLUON_DECODE
         cls._TRITON_UNIFIED_ATTN_ENABLED = envs.VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION
         cls._FP8BMM_ENABLED = envs.VLLM_ROCM_USE_AITER_FP8BMM
         cls._FP4BMM_ENABLED = envs.VLLM_ROCM_USE_AITER_FP4BMM
@@ -1395,6 +1397,11 @@ class rocm_aiter_ops:
     @if_aiter_supported
     def is_shuffle_kv_cache_enabled(cls) -> bool:
         return cls._SHUFFLE_KV_CACHE_ENABLED
+
+    @classmethod
+    @if_aiter_supported
+    def is_gluon_decode_enabled(cls) -> bool:
+        return cls._GLUON_DECODE_ENABLED
 
     @classmethod
     @if_aiter_supported

@@ -7,6 +7,7 @@ from typing import ClassVar
 
 import torch
 
+from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.config.cache import CacheDType
@@ -127,13 +128,13 @@ if current_platform.is_rocm():
             # V: [num_blocks, num_head, page_size // x, head_dim, x]
             key_cache_ptr_offset = (
                 key_cache_ptr
-                + block_id * num_heads * head_size * PAGE_SIZE
+                + block_id * k_cache_stride0
                 + head_id * head_size * PAGE_SIZE
                 + slot_id * x
             )
             value_cache_ptr_offset = (
                 value_cache_ptr
-                + block_id * num_heads * head_size * PAGE_SIZE
+                + block_id * v_cache_stride0
                 + head_id * head_size * PAGE_SIZE
                 + (slot_id // x) * head_size * x
                 + slot_id % x
@@ -228,6 +229,7 @@ if current_platform.is_rocm():
         block_size,
         head_size,
         num_kv_heads,
+        kv_block_stride,
         BLOCK_SIZE: tl.constexpr,
         QUANT: tl.constexpr,
     ):
@@ -241,10 +243,7 @@ if current_platform.is_rocm():
             return
         block_id = slot_id // block_size
         block_offset = slot_id % block_size
-        dst_offset = (
-            block_id * num_kv_heads * head_size * block_size
-            + head_id * head_size * block_size
-        )
+        dst_offset = block_id * kv_block_stride + head_id * head_size * block_size
         dst_k_shuffle_offset = (
             dst_offset + offset // x * block_size * x + block_offset * x + offset % x
         )
@@ -292,6 +291,7 @@ if current_platform.is_rocm():
         )
         new_key_cache = key_cache.view_as(k_cache_template)
         new_value_cache = value_cache.view_as(v_cache_template)
+        kv_block_stride = new_key_cache.stride(0)
         QUANT = False
         if is_quantized_kv_cache(kv_cache_dtype):
             QUANT = True
@@ -313,6 +313,7 @@ if current_platform.is_rocm():
             block_size,
             head_size,
             num_kv_heads,
+            kv_block_stride,
             BLOCK_SIZE=head_size,
             QUANT=QUANT,
         )
@@ -735,6 +736,8 @@ class AiterFlashAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        if envs.VLLM_ROCM_USE_GLUON_DECODE:
+            return [16, 64]
         return [16, 32]
 
     @classmethod
@@ -1262,20 +1265,6 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 elif rocm_aiter_ops.is_shuffle_kv_cache_enabled():
                     _, num_heads, head_size = query.shape
                     num_seqs = attn_metadata.seq_lens.shape[0]
-                    max_num_partitions = (
-                        attn_metadata.max_seq_len + _PARTITION_SIZE_ROCM - 1
-                    ) // _PARTITION_SIZE_ROCM
-                    tmp_out = torch.empty(
-                        (num_seqs, num_heads, max_num_partitions, head_size),
-                        dtype=query.dtype,
-                        device=query.device,
-                    )
-                    exp_sums = torch.empty(
-                        (num_seqs, num_heads, max_num_partitions),
-                        dtype=torch.float32,
-                        device=query.device,
-                    )
-                    max_logits = torch.empty_like(exp_sums)
                     num_blocks, block_size, num_kv_heads, _ = key_cache.shape
                     x = 16 // key_cache.element_size()
                     k_cache_template = torch.empty(
@@ -1290,37 +1279,87 @@ class AiterFlashAttentionImpl(AttentionImpl):
                     )
                     new_key_cache = key_cache.view_as(k_cache_template)
                     new_value_cache = value_cache.view_as(v_cache_template)
-                    k_qscale = (
-                        layer._k_scale
-                        if attn_metadata.k_scale is None
-                        else attn_metadata.k_scale
-                    )
-                    v_qscale = (
-                        layer._v_scale
-                        if attn_metadata.v_scale is None
-                        else attn_metadata.v_scale
-                    )
-                    rocm_aiter_ops.paged_attention_common(
-                        Q=query[:num_decode_tokens],
-                        K=new_key_cache,
-                        V=new_value_cache,
-                        tmp_out=tmp_out,
-                        max_logits=max_logits,
-                        exp_sums=exp_sums,
-                        max_seq_len=attn_metadata.max_seq_len,
-                        block_tables=attn_metadata.block_table[:num_decodes],
-                        context_lens=attn_metadata.seq_lens[:num_decodes],
-                        block_tables_stride0=attn_metadata.block_table[
-                            :num_decodes
-                        ].stride(0),
-                        scale=self.scale,
-                        K_QScale_hip=k_qscale,
-                        V_QScale_hip=v_qscale,
-                        K_QScale_asm=k_qscale,
-                        V_QScale_asm=v_qscale,
-                        out_=output[:num_decode_tokens],
-                        kv_cache_dtype=self.kv_cache_dtype,
-                    )
+
+                    if rocm_aiter_ops.is_gluon_decode_enabled():
+                        import aiter  # noqa: F401
+
+                        max_num_partitions = (
+                            attn_metadata.max_seq_len + _PARTITION_SIZE_ROCM - 1
+                        ) // _PARTITION_SIZE_ROCM
+                        sliding_window = (
+                            0
+                            if self.sliding_window[0] == -1
+                            else self.sliding_window[0] + 1
+                        )
+                        torch.ops.aiter.pa_decode_gluon(
+                            output[:num_decode_tokens],
+                            query[:num_decode_tokens],
+                            new_key_cache,
+                            new_value_cache,
+                            attn_metadata.seq_lens[:num_decodes],
+                            attn_metadata.block_table[:num_decodes],
+                            self.scale,
+                            1,  # query_length
+                            max_num_partitions,
+                            _PARTITION_SIZE_ROCM,
+                            query.dtype,
+                            None,  # query_scale
+                            None,  # key_scale
+                            None,  # value_scale
+                            None,  # exp_sums
+                            None,  # max_logits
+                            None,  # temporary_output
+                            self.alibi_slopes,
+                            None,  # sinks
+                            sliding_window,
+                            True,  # ps
+                        )
+                    else:
+                        max_num_partitions = (
+                            attn_metadata.max_seq_len + _PARTITION_SIZE_ROCM - 1
+                        ) // _PARTITION_SIZE_ROCM
+                        tmp_out = torch.empty(
+                            (num_seqs, num_heads, max_num_partitions, head_size),
+                            dtype=query.dtype,
+                            device=query.device,
+                        )
+                        exp_sums = torch.empty(
+                            (num_seqs, num_heads, max_num_partitions),
+                            dtype=torch.float32,
+                            device=query.device,
+                        )
+                        max_logits = torch.empty_like(exp_sums)
+                        k_qscale = (
+                            layer._k_scale
+                            if attn_metadata.k_scale is None
+                            else attn_metadata.k_scale
+                        )
+                        v_qscale = (
+                            layer._v_scale
+                            if attn_metadata.v_scale is None
+                            else attn_metadata.v_scale
+                        )
+                        rocm_aiter_ops.paged_attention_common(
+                            Q=query[:num_decode_tokens],
+                            K=new_key_cache,
+                            V=new_value_cache,
+                            tmp_out=tmp_out,
+                            max_logits=max_logits,
+                            exp_sums=exp_sums,
+                            max_seq_len=attn_metadata.max_seq_len,
+                            block_tables=attn_metadata.block_table[:num_decodes],
+                            context_lens=attn_metadata.seq_lens[:num_decodes],
+                            block_tables_stride0=attn_metadata.block_table[
+                                :num_decodes
+                            ].stride(0),
+                            scale=self.scale,
+                            K_QScale_hip=k_qscale,
+                            V_QScale_hip=v_qscale,
+                            K_QScale_asm=k_qscale,
+                            V_QScale_asm=v_qscale,
+                            out_=output[:num_decode_tokens],
+                            kv_cache_dtype=self.kv_cache_dtype,
+                        )
                 else:
                     _, num_heads, head_size = query.shape
                     nbytes_per_qo_elem = torch.finfo(query.dtype).bits // 8
