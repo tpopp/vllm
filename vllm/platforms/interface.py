@@ -650,6 +650,30 @@ class Platform:
 
         if cache_config.mamba_cache_mode == "align":
             cache_config.mamba_block_size = cache_config.block_size
+        elif (
+            not cache_config.user_specified_mamba_block_size
+            and cache_config.mamba_block_size is not None
+            and cache_config.mamba_block_size > cache_config.block_size
+        ):
+            # iter-4 patch (attn-claude): without prefix caching the verify-model
+            # config defaults mamba_block_size to max_model_len. That makes the
+            # mamba KV cache group carry block_size=max_model_len, which inflates
+            # `scheduler_block_size = lcm(attn_block, mamba_block)` in
+            # `vllm/v1/core/kv_cache_utils.py:603` up to max_model_len. Force
+            # mamba's logical block size down to the attention block size so the
+            # scheduler LCM collapses, all KV cache groups carry the same
+            # block_size, and the FULL-decode cudagraph capture cannot pick up an
+            # inflated stride anywhere in its dummy-data plumbing. Mamba memory
+            # usage in `mamba_cache_mode == "none"` is independent of block_size
+            # (see `MambaSpec.max_memory_usage_bytes`), so this is layout-only.
+            old_mamba_block_size = cache_config.mamba_block_size
+            cache_config.mamba_block_size = cache_config.block_size
+            logger.info(
+                "Aligning mamba_block_size to attention block_size=%d "
+                "(was %d, the no-prefix-caching default of max_model_len).",
+                cache_config.block_size,
+                old_mamba_block_size,
+            )
 
         # Pad mamba page size to exactly match attention page size
         attn_page_size = cache_config.block_size * attn_page_size_1_token
