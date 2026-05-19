@@ -737,25 +737,15 @@ class AiterFlashAttentionBackend(AttentionBackend):
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
         if envs.VLLM_ROCM_USE_GLUON_DECODE:
-            # iter-2 attempt 1 used [1024] alone: framework_block_size resolved
-            # to an LCM of 1024 and the mamba/attention hybrid stride (e.g.
-            # lcm(544,1024) = 17408 — or some other non-1024 multiple). The
-            # gluon large_block kernel then ran with a block size != 1024 and
-            # GPU-memory-faulted during FULL decode cudagraph capture
-            # (matches "Gluon decode: GPU memory access fault" in known-issues.md).
-            #
-            # iter-2 attempt 2: revert to the commit author's tested choice
-            # `[16, 64]`. Per the commit message of `8e5406d56 Fix shuffle KV
-            # cache stride bug and add gluon decode support`, this passes
-            # gsm8k 5-shot at 85.29% (vs 85.67% baseline) on this exact stack.
-            # Hybrid alignment will pick the smallest framework block_size
-            # (likely 16 unless mamba math allows 64), which routes the gluon
-            # kernel to its short_block path (not large_block), sidestepping
-            # the 1024-only static_assert and avoiding the FULL-decode fault.
-            # Perf will likely lose to FA baseline because of 34x virtual
-            # block-table splitting, but a profile-confirmed kernel firing
-            # gives us a verdict and a starting point for future iterations.
-            return [16, 64]
+            # iter-3 step 1 (diagnostic): force [1024] to test whether the
+            # cycle-2 18% gap to Baseline A is caused by virtual block-table
+            # splitting at framework block_size=16. Combined with
+            # `--enforce-eager` (FULL-decode cudagraph capture skipped, which
+            # was the iter-2 crash site). If perf jumps significantly vs the
+            # [16, 64] config (214.91 tok/s), the block-size hypothesis is
+            # alive and Step 2 (structural fix to hybrid alignment) is
+            # justified.
+            return [1024]
         return [16, 32]
 
     @classmethod
