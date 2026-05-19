@@ -737,7 +737,14 @@ class AiterFlashAttentionBackend(AttentionBackend):
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
         if envs.VLLM_ROCM_USE_GLUON_DECODE:
-            return [16, 64]
+            # The gluon decode triton kernel (`aiter.ops.triton.gluon.pa_decode_gluon`)
+            # contains gl.static_assert(KV_BLOCK_SIZE == 1024) in its large_block path.
+            # Patching only the Python-level allow-list does not help; the kernel's
+            # internal tiling is also hard-coded for 1024. Therefore force 1024 as
+            # the *only* supported size when gluon decode is enabled, so the
+            # framework's hybrid (mamba+attention) block-size selection produces
+            # something the unmodified gluon kernel can actually run.
+            return [1024]
         return [16, 32]
 
     @classmethod
