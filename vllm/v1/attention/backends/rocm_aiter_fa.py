@@ -737,14 +737,25 @@ class AiterFlashAttentionBackend(AttentionBackend):
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
         if envs.VLLM_ROCM_USE_GLUON_DECODE:
-            # The gluon decode triton kernel (`aiter.ops.triton.gluon.pa_decode_gluon`)
-            # contains gl.static_assert(KV_BLOCK_SIZE == 1024) in its large_block path.
-            # Patching only the Python-level allow-list does not help; the kernel's
-            # internal tiling is also hard-coded for 1024. Therefore force 1024 as
-            # the *only* supported size when gluon decode is enabled, so the
-            # framework's hybrid (mamba+attention) block-size selection produces
-            # something the unmodified gluon kernel can actually run.
-            return [1024]
+            # iter-2 attempt 1 used [1024] alone: framework_block_size resolved
+            # to an LCM of 1024 and the mamba/attention hybrid stride (e.g.
+            # lcm(544,1024) = 17408 — or some other non-1024 multiple). The
+            # gluon large_block kernel then ran with a block size != 1024 and
+            # GPU-memory-faulted during FULL decode cudagraph capture
+            # (matches "Gluon decode: GPU memory access fault" in known-issues.md).
+            #
+            # iter-2 attempt 2: revert to the commit author's tested choice
+            # `[16, 64]`. Per the commit message of `8e5406d56 Fix shuffle KV
+            # cache stride bug and add gluon decode support`, this passes
+            # gsm8k 5-shot at 85.29% (vs 85.67% baseline) on this exact stack.
+            # Hybrid alignment will pick the smallest framework block_size
+            # (likely 16 unless mamba math allows 64), which routes the gluon
+            # kernel to its short_block path (not large_block), sidestepping
+            # the 1024-only static_assert and avoiding the FULL-decode fault.
+            # Perf will likely lose to FA baseline because of 34x virtual
+            # block-table splitting, but a profile-confirmed kernel firing
+            # gives us a verdict and a starting point for future iterations.
+            return [16, 64]
         return [16, 32]
 
     @classmethod
