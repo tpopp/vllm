@@ -943,7 +943,7 @@ class AiterAllreduceFusedRMSNormPattern(BasePattern, VllmPatternReplacement):
             allreduce = self.FUSED_AR_RMSNORM_OP(
                 input_=input,
                 residual=residual,
-                weight=weight,
+                weight=weight.to(input.dtype),
                 epsilon=self.epsilon,
             )
             return allreduce[0], allreduce[1]
@@ -989,7 +989,7 @@ class AiterAllreduceFusedAddRMSNormPattern(BasePattern, VllmPatternReplacement):
             allreduce = self.FUSED_AR_RMSNORM_OP(
                 input_=input,
                 residual=residual,
-                weight=weight,
+                weight=weight.to(input.dtype),
                 epsilon=self.epsilon,
             )
             return allreduce[0], allreduce[1]
