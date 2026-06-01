@@ -4,6 +4,7 @@
 
 import torch
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import (
     rocm_aiter_ops,
@@ -335,4 +336,135 @@ class AiterFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
 
         return gemm_a8w8_blockscale_op(
             A, B, As, Bs, list(self.weight_group_shape), output_dtype=out_dtype
+        )
+
+
+class AiterBpreshuffleFp8BlockScaledMMKernel(AiterFp8BlockScaledMMKernel):
+    """Dense block-FP8 (128x128 weight, 1x128 activation) MM via aiter
+    B-preshuffle GEMM.
+
+    Weights are shuffled to (16,16) layout at load time and dispatch goes
+    through `aiter.gemm_a8w8_blockscale_bpreshuffle` (which itself selects
+    between CK / CKTile / ASM backends from the bpreshuffle tuned CSV).
+
+    Opt-in via `VLLM_ROCM_USE_AITER_BPRESHUFFLE_FP8_BLOCKSCALE=1`. When the
+    env is unset, `can_implement` returns False so the existing
+    `AiterFp8BlockScaledMMKernel` path is used unchanged.
+    """
+
+    def __init__(self, config: FP8ScaledMMLinearLayerConfig):
+        # Skip AiterFp8BlockScaledMMKernel.__init__'s triton-tuning probe;
+        # the bpreshuffle dispatcher always goes through aiter's CK family.
+        Fp8BlockScaledMMLinearKernel.__init__(self, config)
+        self.use_triton = False
+
+    @classmethod
+    def is_supported(
+        cls, compute_capability: int | None = None
+    ) -> tuple[bool, str | None]:
+        if not current_platform.is_rocm():
+            return False, "requires ROCm platform."
+        if not rocm_aiter_ops.is_linear_enabled():
+            return (
+                False,
+                "requires `VLLM_ROCM_USE_AITER=1` and "
+                "`VLLM_ROCM_USE_AITER_LINEAR=1` (default True).",
+            )
+        if not envs.VLLM_ROCM_USE_AITER_BPRESHUFFLE_FP8_BLOCKSCALE:
+            return (
+                False,
+                "requires `VLLM_ROCM_USE_AITER_BPRESHUFFLE_FP8_BLOCKSCALE=1`.",
+            )
+        try:
+            import aiter  # noqa: F401
+        except Exception:
+            return False, "requires the `aiter` package to be installed."
+        return True, None
+
+    @classmethod
+    def can_implement(
+        cls, config: FP8ScaledMMLinearLayerConfig
+    ) -> tuple[bool, str | None]:
+        # Reuse the base block-scaled checks (dynamic activation, etc.) and
+        # the AITER activation-group-shape check (1, 128) from the parent.
+        can_implement_base, reason = super().can_implement(config)
+        if not can_implement_base:
+            return can_implement_base, reason
+
+        weight_quant_desc = config.weight_quant_key.scale
+        if weight_quant_desc.group_shape != GroupShape(128, 128):
+            return (
+                False,
+                "Supports only block-FP8 weight quantization with "
+                "group_shape=(128,128).",
+            )
+        return True, None
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # Idempotence guard: skip re-shuffling on reload (LoRA / RLHF /
+        # sleep-restart) by checking a marker on the live Parameter.
+        if getattr(layer.weight, "_bpreshuffled", False):
+            return
+
+        # Run the standard padding + fnuz-normalization first so we shuffle
+        # the canonicalized weight.
+        super().process_weights_after_loading(layer)
+
+        weight = layer.weight
+        # GDN conv1d-style 3D weights must not be shuffled. The bpreshuffle
+        # CK kernel is for dense 2D GEMM only.
+        if weight.data.dim() != 2:
+            return
+
+        shuffled = rocm_aiter_ops.shuffle_weight(weight.data, layout=(16, 16))
+        # Tensor-level marker survives the replace_parameter wrap and is set
+        # again on the resulting Parameter below for fast attribute access.
+        shuffled._bpreshuffled = True
+        replace_parameter(layer, "weight", shuffled)
+        layer.weight._bpreshuffled = True
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        out_dtype = self.config.out_dtype
+        params = self._get_layer_params(layer)
+        weight = params.weight
+        weight_scale = (
+            params.weight_scale
+            if params.weight_scale_inv is None
+            else params.weight_scale_inv
+        )
+
+        input_2d = x.view(-1, x.shape[-1])
+        output_shape = [*x.shape[:-1], weight.shape[0]]
+
+        # Emit per-1x128 FP8 quant with column-major scale layout, so the
+        # bpreshuffle GEMM consumes it without a per-call transpose.
+        q_input, input_scale = rocm_aiter_ops.group_fp8_quant_transposed(input_2d, 128)
+
+        output = rocm_aiter_ops.gemm_a8w8_blockscale_bpreshuffle(
+            q_input, weight, input_scale, weight_scale, out_dtype
+        )
+
+        if bias is not None:
+            output = output + bias
+        return output.to(dtype=out_dtype).view(*output_shape)
+
+    def apply_block_scaled_mm(
+        self,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        As: torch.Tensor,
+        Bs: torch.Tensor,
+    ) -> torch.Tensor:
+        # Unused: apply_weights() is overridden to bypass the row-major quant
+        # in the parent class. Kept for ABC contract; transposes As to be safe
+        # if anyone calls this directly.
+        As_t = As.transpose(0, 1).contiguous().view_as(As)
+        return rocm_aiter_ops.gemm_a8w8_blockscale_bpreshuffle(
+            A, B, As_t, Bs, self.config.out_dtype
         )

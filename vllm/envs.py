@@ -127,6 +127,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: bool = False
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
+    VLLM_ROCM_USE_AITER_BPRESHUFFLE_FP8_BLOCKSCALE: bool = False
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
@@ -1166,6 +1167,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # By default is enabled.
     "VLLM_ROCM_USE_AITER_TRITON_GEMM": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_TRITON_GEMM", "True").lower() in ("true", "1")
+    ),
+    # Whether to use aiter B-preshuffle GEMM for dense block-FP8 (128x128 weight /
+    # 1x128 activation) linear layers on ROCm. When enabled, weights are shuffled
+    # at load time to (16,16) layout and dispatched via
+    # `aiter.gemm_a8w8_blockscale_bpreshuffle`. The activation scale layout is
+    # transformed per-call to the column-major form expected by the kernel.
+    # By default is disabled.
+    "VLLM_ROCM_USE_AITER_BPRESHUFFLE_FP8_BLOCKSCALE": lambda: (
+        os.getenv("VLLM_ROCM_USE_AITER_BPRESHUFFLE_FP8_BLOCKSCALE", "False").lower()
+        in ("true", "1")
     ),
     # use rocm skinny gemms
     "VLLM_ROCM_USE_SKINNY_GEMM": lambda: (
