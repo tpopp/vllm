@@ -1,11 +1,26 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
 from rocm_tracker.backends.base import AnalysisResult
+
+
+def resolve_agent_bin(configured: str) -> str:
+    """Resolve agent executable: prefer standalone `agent` CLI over `cursor agent`."""
+    if configured and configured != "cursor":
+        return configured
+    agent_path = shutil.which("agent")
+    if agent_path:
+        return agent_path
+    cursor_path = shutil.which("cursor")
+    if cursor_path:
+        return cursor_path
+    return configured or "agent"
 
 
 class CursorCliBackend:
@@ -17,7 +32,11 @@ class CursorCliBackend:
         workspace: Path,
         timeout_seconds: int = 600,
     ) -> None:
-        self.cursor_bin = cursor_bin
+        self.agent_bin = resolve_agent_bin(cursor_bin)
+        self.use_cursor_subcommand = (
+            Path(self.agent_bin).name == "cursor"
+            or self.agent_bin.endswith("Cursor.exe")
+        )
         self.model = model
         self.workspace = workspace
         self.timeout_seconds = timeout_seconds
@@ -29,35 +48,73 @@ class CursorCliBackend:
             f"{user_prompt.strip()}\n\n"
             f"Respond with JSON only."
         )
-        cmd = [
-            self.cursor_bin,
-            "agent",
-            "--model",
-            self.model,
-            "--print",
-            "--workspace",
-            str(self.workspace),
-            prompt,
-        ]
+        if self.use_cursor_subcommand:
+            cmd = [
+                self.agent_bin,
+                "agent",
+                "--model",
+                self.model,
+                "--print",
+                "--workspace",
+                str(self.workspace),
+                prompt,
+            ]
+        else:
+            cmd = [
+                self.agent_bin,
+                "-p",
+                "--output-format",
+                "json",
+                "--mode",
+                "ask",
+                "--model",
+                self.model,
+                "--workspace",
+                str(self.workspace),
+                prompt,
+            ]
+        env = os.environ.copy()
         try:
             result = subprocess.run(
                 cmd,
-                check=True,
+                check=False,
                 capture_output=True,
                 text=True,
                 timeout=self.timeout_seconds,
                 cwd=self.workspace,
+                env=env,
             )
         except FileNotFoundError as exc:
             raise RuntimeError(
-                f"Cursor CLI not found: {self.cursor_bin}. "
-                "Install Cursor and ensure `cursor` is on PATH."
+                f"Cursor agent CLI not found: {self.agent_bin}. "
+                "Install with: curl https://cursor.com/install -fsS | bash "
+                "Then run: agent login (or set CURSOR_API_KEY)."
             ) from exc
         except subprocess.TimeoutExpired as exc:
-            raise RuntimeError("Cursor agent timed out") from exc
+            stderr = (exc.stderr or "").strip()
+            stdout = (exc.stdout or "").strip()
+            detail = stderr or stdout or "(no output before timeout)"
+            raise RuntimeError(
+                f"Cursor agent timed out after {self.timeout_seconds}s. "
+                f"Last output: {detail[:500]}"
+            ) from exc
+
+        if result.returncode != 0:
+            stderr = (result.stderr or "").strip()
+            stdout = (result.stdout or "").strip()
+            detail = stderr or stdout or f"exit code {result.returncode}"
+            if "Authentication required" in detail or "agent login" in detail:
+                raise RuntimeError(
+                    "Cursor agent authentication required. "
+                    "Run `agent login` in WSL, or set CURSOR_API_KEY in "
+                    "~/.config/rocm-tracker/env"
+                )
+            raise RuntimeError(
+                f"Cursor agent failed ({result.returncode}): {detail[:800]}"
+            )
 
         output = (result.stdout or result.stderr).strip()
-        payload = _extract_json(output)
+        payload = _extract_json_from_agent_output(output)
         summary = payload.get("summary", "").strip()
         _validate_summary(summary)
         return AnalysisResult(
@@ -66,9 +123,23 @@ class CursorCliBackend:
             summary=summary,
             model_impacts=list(payload.get("model_impacts") or []),
             action_hint=payload.get("action_hint"),
-            backend="cursor_cli",
+            backend="agent_cli",
             model_used=self.model,
         )
+
+
+def _extract_json_from_agent_output(text: str) -> dict:
+    # agent --output-format json wraps result; try direct parse first.
+    try:
+        envelope = json.loads(text)
+        if isinstance(envelope, dict):
+            if "result" in envelope and isinstance(envelope["result"], str):
+                return _extract_json(envelope["result"])
+            if "categories" in envelope:
+                return envelope
+    except json.JSONDecodeError:
+        pass
+    return _extract_json(text)
 
 
 def _extract_json(text: str) -> dict:

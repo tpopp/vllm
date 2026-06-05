@@ -28,7 +28,16 @@ Ensure:
 
 - `upstream` remote points to `https://github.com/vllm-project/vllm.git`
 - `gh` CLI is authenticated
-- `cursor` CLI is on PATH with Sonnet enabled
+- **Cursor Agent CLI** installed and authenticated in WSL:
+
+```bash
+curl https://cursor.com/install -fsS | bash
+agent login
+# or set CURSOR_API_KEY in ~/.config/rocm-tracker/env
+agent -p "Reply with JSON: {\"ok\": true}"
+```
+
+Set `ROCM_TRACKER_CURSOR_BIN=agent` (not `cursor` — the headless CLI is the `agent` command).
 
 ## Install laptop scheduler (systemd)
 
