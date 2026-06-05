@@ -1,0 +1,10 @@
+[Unit]
+Description=ROCm upstream tracker daily timer (08:00 Europe/Berlin)
+
+[Timer]
+OnCalendar=*-*-* 08:00:00 Europe/Berlin
+Persistent=true
+Unit=rocm-tracker.service
+
+[Install]
+WantedBy=timers.target

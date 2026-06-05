@@ -1,0 +1,18 @@
+[project]
+name = "rocm-upstream-tracker"
+version = "0.1.0"
+description = "Local ROCm-focused upstream vLLM change tracker"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+rocm-tracker = "rocm_tracker.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["rocm_tracker*"]

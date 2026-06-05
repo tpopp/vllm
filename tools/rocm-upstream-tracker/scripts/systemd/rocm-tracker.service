@@ -1,0 +1,12 @@
+[Unit]
+Description=ROCm upstream tracker daily job
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-%h/.config/rocm-tracker/env
+ExecStart=%h/.local/share/rocm-tracker/bin/rocm-tracker-daily.sh
+# Install script copies rocm-tracker-daily.sh to ~/.local/share/rocm-tracker/bin/
+
+[Install]
+WantedBy=default.target
