@@ -82,6 +82,27 @@ rocm-tracker query --category perf_immediate --since 14d
 rocm-tracker export --format jsonl --model DeepseekV2ForCausalLM
 ```
 
+## Two-stage workflow (light DB → deep triage)
+
+**Stage 1 (daily):** cheap Sonnet pass builds the SQLite database with short summaries.
+
+**Stage 2 (triage):** a more capable model reviews query results and produces a
+prioritized ROCm action plan (ignore / investigate / evaluate / implement),
+evaluation steps, and `vllm serve` notes.
+
+```bash
+# Deep triage for Qwen3Next (uses ROCM_TRACKER_DEEP_MODEL=opus by default)
+rocm-tracker triage --model Qwen3NextForCausalLM --since 30d -v
+
+# JSON to stdout; reports also saved under ~/.local/share/rocm-tracker/reports/
+rocm-tracker triage --model Qwen3NextForCausalLM --format json
+
+# Feed the markdown/json report to a follow-up implementation agent
+cat ~/.local/share/rocm-tracker/reports/triage-qwen3nextforcausallm-*.md
+```
+
+Summaries longer than 8 sentences are **truncated**, not discarded.
+
 ## Visibility / debugging
 
 By default, scheduled runs via `rocm-tracker-daily.sh` write **only to a log file** (no terminal output):

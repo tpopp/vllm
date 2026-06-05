@@ -18,6 +18,7 @@ from rocm_tracker.state import (
 )
 from rocm_tracker.logutil import Logger
 from rocm_tracker.sync import sync_fork
+from rocm_tracker.triage import run_triage
 
 
 def _logger(args: argparse.Namespace) -> Logger:
@@ -201,6 +202,37 @@ def cmd_export(args: argparse.Namespace) -> int:
         db.close()
 
 
+def cmd_triage(args: argparse.Namespace) -> int:
+    log = _logger(args)
+    config = load_config()
+    ensure_data_dirs(config)
+    db = Database(config.db_path, _schema_path())
+    try:
+        report, json_path, md_path = run_triage(
+            config,
+            db,
+            focus_model=args.model,
+            since_days=_parse_since_days(args.since),
+            category=args.category,
+            deep_model=args.deep_model,
+            limit=args.limit,
+            log=log,
+        )
+        if args.format == "json":
+            print(json.dumps(report, indent=2))
+        else:
+            print((md_path).read_text(encoding="utf-8"))
+        log.debug(f"report_json={json_path}")
+        return 0
+    except Exception as exc:  # noqa: BLE001
+        log.info(f"triage failed: {exc}")
+        if log.verbose:
+            raise
+        return 1
+    finally:
+        db.close()
+
+
 def cmd_if_missed_today(args: argparse.Namespace) -> int:
     """Catch-up helper for login/cron-fallback paths."""
     config = load_config()
@@ -251,6 +283,27 @@ def build_parser() -> argparse.ArgumentParser:
     export.add_argument("--since")
     export.add_argument("--format", choices=["jsonl", "json"], default="jsonl")
     export.set_defaults(func=cmd_export)
+
+    triage = sub.add_parser(
+        "triage",
+        help="Deep ROCm triage: prioritize changes and propose evaluation plans",
+    )
+    triage.add_argument("--model", help="Focus architecture, e.g. Qwen3NextForCausalLM")
+    triage.add_argument("--since", help="Limit to last N days, e.g. 30d")
+    triage.add_argument("--category")
+    triage.add_argument(
+        "--deep-model",
+        help="Capable model for triage (default: ROCM_TRACKER_DEEP_MODEL / opus)",
+    )
+    triage.add_argument("--limit", type=int, help="Max changes to triage (default 30)")
+    triage.add_argument(
+        "--format",
+        choices=["markdown", "json"],
+        default="markdown",
+        help="Output format to stdout",
+    )
+    triage.add_argument("-v", "--verbose", action="store_true")
+    triage.set_defaults(func=cmd_triage, verbose=False)
 
     missed = sub.add_parser("if-missed-today", help="Run daily only if not yet successful today")
     missed.add_argument("-v", "--verbose", action="store_true")

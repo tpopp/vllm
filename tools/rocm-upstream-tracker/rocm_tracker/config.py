@@ -26,6 +26,8 @@ class TrackerConfig:
     max_llm_commits_per_run: int
     timezone: str
     cursor_bin: str
+    deep_model: str
+    triage_max_items: int
 
     @property
     def db_path(self) -> Path:
@@ -54,6 +56,14 @@ class TrackerConfig:
     @property
     def system_prompt_path(self) -> Path:
         return Path(__file__).resolve().parent.parent / "prompts" / "analyze_change.txt"
+
+    @property
+    def triage_prompt_path(self) -> Path:
+        return Path(__file__).resolve().parent.parent / "prompts" / "triage_rocm.txt"
+
+    @property
+    def reports_dir(self) -> Path:
+        return self.data_dir / "reports"
 
 
 def load_config() -> TrackerConfig:
@@ -85,7 +95,9 @@ def load_config() -> TrackerConfig:
             os.environ.get("ROCM_TRACKER_MAX_LLM_COMMITS_PER_RUN", "20")
         ),
         timezone=os.environ.get("ROCM_TRACKER_TIMEZONE", "Europe/Berlin"),
-        cursor_bin=os.environ.get("ROCM_TRACKER_CURSOR_BIN", "cursor"),
+        cursor_bin=os.environ.get("ROCM_TRACKER_CURSOR_BIN", "agent"),
+        deep_model=os.environ.get("ROCM_TRACKER_DEEP_MODEL", "opus"),
+        triage_max_items=int(os.environ.get("ROCM_TRACKER_TRIAGE_MAX_ITEMS", "30")),
     )
 
 
@@ -93,3 +105,4 @@ def ensure_data_dirs(config: TrackerConfig) -> None:
     config.data_dir.mkdir(parents=True, exist_ok=True)
     config.logs_dir.mkdir(parents=True, exist_ok=True)
     config.prompts_dir.mkdir(parents=True, exist_ok=True)
+    config.reports_dir.mkdir(parents=True, exist_ok=True)

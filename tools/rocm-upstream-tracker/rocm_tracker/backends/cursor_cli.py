@@ -8,6 +8,7 @@ import subprocess
 from pathlib import Path
 
 from rocm_tracker.backends.base import AnalysisResult
+from rocm_tracker.summary_util import truncate_summary
 
 
 def resolve_agent_bin(configured: str) -> str:
@@ -41,7 +42,24 @@ class CursorCliBackend:
         self.workspace = workspace
         self.timeout_seconds = timeout_seconds
 
+    def run_json_prompt(self, system_prompt: str, user_prompt: str) -> dict:
+        output = self._run_prompt(system_prompt, user_prompt)
+        return _extract_json_from_agent_output(output)
+
     def analyze(self, system_prompt: str, user_prompt: str) -> AnalysisResult:
+        payload = self.run_json_prompt(system_prompt, user_prompt)
+        summary = truncate_summary(payload.get("summary", "").strip())
+        return AnalysisResult(
+            categories=list(payload.get("categories") or []),
+            is_breaking_api=bool(payload.get("is_breaking_api")),
+            summary=summary,
+            model_impacts=list(payload.get("model_impacts") or []),
+            action_hint=payload.get("action_hint"),
+            backend="agent_cli",
+            model_used=self.model,
+        )
+
+    def _run_prompt(self, system_prompt: str, user_prompt: str) -> str:
         prompt = (
             f"{system_prompt.strip()}\n\n"
             f"---\n\n"
@@ -113,19 +131,7 @@ class CursorCliBackend:
                 f"Cursor agent failed ({result.returncode}): {detail[:800]}"
             )
 
-        output = (result.stdout or result.stderr).strip()
-        payload = _extract_json_from_agent_output(output)
-        summary = payload.get("summary", "").strip()
-        _validate_summary(summary)
-        return AnalysisResult(
-            categories=list(payload.get("categories") or []),
-            is_breaking_api=bool(payload.get("is_breaking_api")),
-            summary=summary,
-            model_impacts=list(payload.get("model_impacts") or []),
-            action_hint=payload.get("action_hint"),
-            backend="agent_cli",
-            model_used=self.model,
-        )
+        return (result.stdout or result.stderr).strip()
 
 
 def _extract_json_from_agent_output(text: str) -> dict:
@@ -152,8 +158,3 @@ def _extract_json(text: str) -> dict:
         return json.loads(text[start : end + 1])
     raise ValueError(f"No JSON found in model output: {text[:500]}")
 
-
-def _validate_summary(summary: str) -> None:
-    sentences = [s.strip() for s in re.split(r"[.!?]+", summary) if s.strip()]
-    if len(sentences) > 8:
-        raise ValueError(f"Summary exceeds 8 sentences ({len(sentences)})")
