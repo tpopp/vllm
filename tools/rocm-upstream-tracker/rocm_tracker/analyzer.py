@@ -12,6 +12,7 @@ from rocm_tracker.db import ChangeRecord, Database
 from rocm_tracker.github_meta import fetch_pr_for_commit
 from rocm_tracker.heuristics import score_changed_files, should_call_llm
 from rocm_tracker.model_resolver import impacts_from_files, load_model_maps
+from rocm_tracker.logutil import Logger
 from rocm_tracker.prompt_builder import build_user_prompt, write_prompt_package
 
 
@@ -74,6 +75,7 @@ def analyze_commits(
     run_id: int | None,
     *,
     force_reanalyze: bool = False,
+    log: Logger | None = None,
 ) -> tuple[int, int]:
     maps = load_model_maps(config.registry_path)
     backend = CursorCliBackend(
@@ -83,19 +85,30 @@ def analyze_commits(
     )
     system_prompt = config.system_prompt_path.read_text(encoding="utf-8")
 
+    log = log or Logger()
     analyzed = 0
     llm_calls = 0
+    skipped = 0
     pending: list[str] = []
 
-    for commit in commits:
+    log.step(f"Analyzing {len(commits)} commit(s)")
+    for index, commit in enumerate(commits, start=1):
         if db.has_commit(commit.sha) and not force_reanalyze:
+            skipped += 1
+            log.debug(f"[{index}/{len(commits)}] skip cached {commit.sha[:12]} {commit.subject}")
             continue
 
+        log.info(f"[{index}/{len(commits)}] {commit.sha[:12]} {commit.subject}")
         heuristic = score_changed_files(commit.changed_files, commit.subject)
+        log.debug(
+            f"  relevance={heuristic.relevance} score={heuristic.score:.1f} "
+            f"files={len(commit.changed_files)}"
+        )
         impacts = impacts_from_files(maps, commit.changed_files)
         pr_meta = fetch_pr_for_commit(config.upstream_repo, commit.sha)
 
         if should_call_llm(heuristic.relevance) and llm_calls < config.max_llm_commits_per_run:
+            log.debug(f"  calling Sonnet via Cursor CLI ({llm_calls + 1}/{config.max_llm_commits_per_run})")
             diff_paths = _relevant_diff_paths(commit.changed_files)
             diff_excerpt = commit_diff_for_paths(
                 config.repo_path,
@@ -113,6 +126,7 @@ def analyze_commits(
             try:
                 result: AnalysisResult = backend.analyze(system_prompt, user_prompt)
             except Exception as exc:  # noqa: BLE001
+                log.info(f"  LLM failed: {exc}")
                 record = _heuristic_record(commit, pr_meta, heuristic, impacts)
                 record.summary = (
                     f"{record.summary} LLM failed: {exc}"
@@ -144,13 +158,18 @@ def analyze_commits(
             db.upsert_change(run_id, record)
             analyzed += 1
             llm_calls += 1
+            log.debug(f"  stored LLM analysis breaking={result.is_breaking_api}")
         else:
             if should_call_llm(heuristic.relevance):
                 pending.append(commit.sha)
+                log.debug("  queued for later (LLM budget exhausted)")
+            else:
+                log.debug("  stored heuristic-only analysis")
             record = _heuristic_record(commit, pr_meta, heuristic, impacts)
             db.upsert_change(run_id, record)
             analyzed += 1
 
+    log.step(f"Analysis done: analyzed={analyzed} skipped={skipped} llm_calls={llm_calls}")
     if pending:
         config.pending_path.write_text(
             "\n".join(pending) + "\n",

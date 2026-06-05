@@ -64,6 +64,7 @@ systemctl --user list-timers rocm-tracker.timer
 
 ```bash
 rocm-tracker daily              # sync + analyze (scheduled job)
+rocm-tracker daily -v           # verbose progress on stderr
 rocm-tracker daily --dry-run    # no push
 rocm-tracker sync
 rocm-tracker analyze --commit <sha>
@@ -71,6 +72,33 @@ rocm-tracker query --model LlamaForCausalLM --breaking
 rocm-tracker query --category perf_immediate --since 14d
 rocm-tracker export --format jsonl --model DeepseekV2ForCausalLM
 ```
+
+## Visibility / debugging
+
+By default, scheduled runs via `rocm-tracker-daily.sh` write **only to a log file** (no terminal output):
+
+```bash
+tail -f ~/.local/share/rocm-tracker/logs/daily-$(date +%Y-%m-%d).log
+```
+
+For interactive testing, use verbose mode:
+
+```bash
+rocm-tracker daily -v --dry-run --force
+```
+
+Or enable verbose in the scheduler wrapper:
+
+```bash
+export ROCM_TRACKER_VERBOSE=1
+~/.local/share/rocm-tracker/bin/rocm-tracker-daily.sh
+```
+
+Common silent outcomes:
+
+- `skipped: already ran successfully today` — use `--force`
+- `Found 0 new commit(s)` — watermark already at upstream tip
+- Scheduler wrapper redirects stdout/stderr to the daily log file
 
 ## Data location
 

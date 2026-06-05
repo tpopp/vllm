@@ -16,7 +16,12 @@ from rocm_tracker.state import (
     mark_failure,
     mark_success,
 )
+from rocm_tracker.logutil import Logger
 from rocm_tracker.sync import sync_fork
+
+
+def _logger(args: argparse.Namespace) -> Logger:
+    return Logger(verbose=getattr(args, "verbose", False), stream=sys.stderr)
 
 
 def _schema_path() -> Path:
@@ -32,30 +37,44 @@ def _parse_since_days(value: str | None) -> int | None:
 
 
 def cmd_daily(args: argparse.Namespace) -> int:
+    log = _logger(args)
     config = load_config()
     ensure_data_dirs(config)
     state = TrackerState.load(config.state_path)
 
+    log.debug(f"repo={config.repo_path}")
+    log.debug(f"data_dir={config.data_dir}")
+    log.debug(f"state={config.state_path}")
+    log.debug(f"last_upstream_sha={state.last_upstream_sha}")
+
     if not args.force and already_ran_today(config, state):
-        print("skipped: already ran successfully today")
+        log.info("skipped: already ran successfully today (use --force to override)")
         return 0
 
     db = Database(config.db_path, _schema_path())
     try:
+        log.step("Syncing fork with upstream")
+        if args.dry_run:
+            log.debug("dry-run: rebase and push will be skipped")
         sync = sync_fork(config, dry_run=args.dry_run)
         if not sync.success:
             mark_failure(config, state)
-            print(sync.message, file=sys.stderr)
+            log.info(sync.message)
             return 1
+        log.info(sync.message)
+        log.debug(f"upstream_before={sync.upstream_sha_before}")
+        log.debug(f"upstream_after={sync.upstream_sha_after}")
+        log.debug(f"fork_sha={sync.fork_sha}")
 
         upstream_after = sync.upstream_sha_after
         if upstream_after is None:
             mark_failure(config, state)
-            print("missing upstream sha after sync", file=sys.stderr)
+            log.info("missing upstream sha after sync")
             return 1
 
         start_sha = state.last_upstream_sha
         commits = list_commits_between(config.repo_path, start_sha, upstream_after)
+        log.step(f"Found {len(commits)} new commit(s) since watermark")
         run_id = db.start_sync_run(sync.upstream_sha_before, upstream_after)
 
         analyzed, llm_calls = analyze_commits(
@@ -64,6 +83,7 @@ def cmd_daily(args: argparse.Namespace) -> int:
             commits,
             run_id,
             force_reanalyze=args.force_reanalyze,
+            log=log,
         )
 
         db.finish_sync_run(
@@ -77,27 +97,33 @@ def cmd_daily(args: argparse.Namespace) -> int:
         state.last_upstream_sha = upstream_after
         state.last_fork_main_sha = sync.fork_sha
         mark_success(config, state)
-        print(
+        log.info(
             f"daily ok: commits={len(commits)} analyzed={analyzed} "
             f"llm_calls={llm_calls} upstream={upstream_after[:12]}"
         )
+        log.debug(f"db={config.db_path}")
         return 0
     except Exception as exc:  # noqa: BLE001
         mark_failure(config, state)
-        print(f"daily failed: {exc}", file=sys.stderr)
+        log.info(f"daily failed: {exc}")
+        if log.verbose:
+            raise
         return 1
     finally:
         db.close()
 
 
 def cmd_sync(args: argparse.Namespace) -> int:
+    log = _logger(args)
     config = load_config()
+    log.step("Syncing fork")
     result = sync_fork(config, dry_run=args.dry_run)
-    print(result.message)
+    log.info(result.message)
     return 0 if result.success else 1
 
 
 def cmd_analyze(args: argparse.Namespace) -> int:
+    log = _logger(args)
     config = load_config()
     ensure_data_dirs(config)
     db = Database(config.db_path, _schema_path())
@@ -119,6 +145,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             commits,
             run_id,
             force_reanalyze=args.force_reanalyze,
+            log=log,
         )
         db.finish_sync_run(
             run_id,
@@ -127,7 +154,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             status="success",
             message=f"manual analyze analyzed={analyzed}",
         )
-        print(f"analyze ok: commits={len(commits)} analyzed={analyzed} llm={llm_calls}")
+        log.info(f"analyze ok: commits={len(commits)} analyzed={analyzed} llm={llm_calls}")
         return 0
     finally:
         db.close()
@@ -181,9 +208,12 @@ def cmd_if_missed_today(args: argparse.Namespace) -> int:
     if already_ran_today(config, state):
         print("skipped: already ran today")
         return 0
-    args.force = False
-    args.dry_run = False
-    args.force_reanalyze = False
+    if not hasattr(args, "dry_run"):
+        args.dry_run = False
+    if not hasattr(args, "force"):
+        args.force = False
+    if not hasattr(args, "force_reanalyze"):
+        args.force_reanalyze = False
     return cmd_daily(args)
 
 
@@ -195,16 +225,19 @@ def build_parser() -> argparse.ArgumentParser:
     daily.add_argument("--dry-run", action="store_true")
     daily.add_argument("--force", action="store_true", help="Run even if already succeeded today")
     daily.add_argument("--force-reanalyze", action="store_true")
-    daily.set_defaults(func=cmd_daily)
+    daily.add_argument("-v", "--verbose", action="store_true", help="Progress and debug output on stderr")
+    daily.set_defaults(func=cmd_daily, verbose=False)
 
     sync = sub.add_parser("sync", help="Sync fork only")
     sync.add_argument("--dry-run", action="store_true")
-    sync.set_defaults(func=cmd_sync)
+    sync.add_argument("-v", "--verbose", action="store_true")
+    sync.set_defaults(func=cmd_sync, verbose=False)
 
     analyze = sub.add_parser("analyze", help="Analyze commits")
     analyze.add_argument("--commit")
     analyze.add_argument("--force-reanalyze", action="store_true")
-    analyze.set_defaults(func=cmd_analyze)
+    analyze.add_argument("-v", "--verbose", action="store_true")
+    analyze.set_defaults(func=cmd_analyze, verbose=False)
 
     query = sub.add_parser("query", help="Query database")
     query.add_argument("--model")
@@ -220,7 +253,8 @@ def build_parser() -> argparse.ArgumentParser:
     export.set_defaults(func=cmd_export)
 
     missed = sub.add_parser("if-missed-today", help="Run daily only if not yet successful today")
-    missed.set_defaults(func=cmd_if_missed_today)
+    missed.add_argument("-v", "--verbose", action="store_true")
+    missed.set_defaults(func=cmd_if_missed_today, verbose=False)
 
     return parser
 
