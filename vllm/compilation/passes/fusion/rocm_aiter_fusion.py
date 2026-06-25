@@ -236,6 +236,72 @@ class AiterRMSFp8GroupQuantPattern(AiterRMSNormQuantPattern):
         )
 
 
+class AiterRMSTritonFp8GroupQuantPattern:
+    """Fuses rms_norm + native Triton group-FP8 quant into the AITER fused op.
+
+    Covers consumers that select the Triton GEMM path (``use_triton=True``)
+    and therefore emit ``triton_per_token_group_quant_fp8`` for input
+    activation quantization instead of ``rocm_aiter_group_fp8_quant``.
+
+    Example: DSv3.2 MLA ``q_a_layernorm`` has two consumers of the same
+    rms_norm output.  One (``q_b_proj``) uses the AITER quant kernel and is
+    handled by :class:`AiterRMSFp8GroupQuantPattern`.  The other
+    (``indexer.wq_b``) uses ``triton_per_token_group_quant_fp8`` and is
+    handled here.  Both replacements use the same AITER fused kernel; the
+    outputs are numerically equivalent.
+
+    This class avoids :class:`MatcherQuantFP8` / ``QUANT_OPS`` entirely
+    because ``QUANT_OPS`` only registers the group-quant key on platforms
+    where ``torch.ops._C.per_token_group_fp8_quant`` is available (older
+    ROCm images gate it on ``current_platform.is_cuda()``).
+    """
+
+    FUSED_OP = rocm_aiter_ops.get_rmsnorm_group_fused_quant_op()
+
+    def __init__(self, epsilon: float, group_size: int = 128) -> None:
+        self.epsilon = epsilon
+        self.group_size = group_size
+        self.device = torch.device("cuda")
+
+    def empty(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+        return torch.empty(*args, dtype=torch.bfloat16, device=self.device, **kwargs)
+
+    def register(self, pm_pass: PatternMatcherPass) -> None:
+        epsilon = self.epsilon
+        group_size = self.group_size
+        fused_op = self.FUSED_OP
+
+        def pattern(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            result_rms = torch.ops.vllm_ir.rms_norm(input, weight, epsilon)
+            result, scale = torch.ops.vllm.triton_per_token_group_quant_fp8(
+                result_rms, group_size
+            )
+            return result, scale
+
+        def replacement(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            at = fused_op(
+                x=input,
+                weight=weight,
+                variance_epsilon=epsilon,
+                group_size=group_size,
+            )
+            return at[0], at[1]
+
+        pm.register_replacement(
+            pattern,
+            replacement,
+            [self.empty(5, 16), self.empty(16)],
+            pm.fwd_only,
+            pm_pass,
+        )
+
+
 class AiterFusedAddRMSFp8GroupQuantPattern(AiterRMSNormQuantPattern):
     """
     This pattern fuses aiter rms_norm_with_add & group fp8 quant custom ops
@@ -606,6 +672,13 @@ class RocmAiterRMSNormQuantFusionPass(VllmPatternMatcherPass):
                 epsilon, FP8_DTYPE, GroupShape(1, 128)
             ).register(self.patterns)
 
+            # Fuse rms_norm + native Triton group-FP8 quant into the AITER
+            # fused op.  Covers consumers (e.g. DSv3.2 MLA indexer.wq_b) that
+            # select the Triton GEMM path and therefore emit
+            # triton_per_token_group_quant_fp8 instead of
+            # rocm_aiter_group_fp8_quant for input activation quantization.
+            AiterRMSTritonFp8GroupQuantPattern(epsilon).register(self.patterns)
+
             # Fuse aiter fused_add_rms_norm + aiter dynamic group fp8 quant
             AiterFusedAddRMSFp8GroupQuantPattern(
                 epsilon, FP8_DTYPE, GroupShape(1, 128)
@@ -654,6 +727,14 @@ class RocmAiterRMSNormQuantFusionPass(VllmPatternMatcherPass):
 
     @VllmInductorPass.time_and_log
     def __call__(self, graph: fx.Graph) -> None:
+        # Normalize aten.view -> aten.reshape so the view-tolerant patterns
+        # (e.g. DoubleAiterRMSFp8GroupQuantViewPattern) can match the actual
+        # graph, which uses aten.view from Fp8BlockScaledMMLinearKernel's
+        # 2D-flatten boilerplate. The patterns were registered with
+        # trace_with_view_to_reshape, so their pattern graphs already use
+        # aten.reshape; without this step the op-types never agree.
+        _fx_view_to_reshape(graph.owning_module)
+
         normalized_count = normalize_single_dynamic_dim_reshapes(graph)
         if normalized_count:
             logger.debug(
