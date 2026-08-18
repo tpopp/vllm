@@ -395,9 +395,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.mhc_pre = MHCPreOp()
         self.mhc_post = MHCPostOp()
         self.mhc_fused_post_pre = MHCFusedPostPreOp()
-        self.use_fused_mhc = HAS_TILELANG_MHC and not (
-            HAS_AITER_MHC and self.hidden_size % 256 == 0
-        )
+        self.use_fused_mhc = (
+            HAS_AITER_MHC and self.hc_mult == 4 and self.hidden_size % 256 == 0
+        ) or HAS_TILELANG_MHC
 
     def hc_pre(
         self,

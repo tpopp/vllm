@@ -3393,13 +3393,12 @@ class rocm_aiter_ops:
         fn: torch.Tensor,
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
-        out: torch.Tensor,
         hidden_size: int,
         rms_eps: float,
         hc_eps: float,
         hc_mult: int,
-    ) -> None:
-        """Run hc_head through AITER mhc_pre and write the result to out."""
+    ) -> torch.Tensor:
+        """Run hc_head through AITER's compact ``mhc_pre`` head mode."""
         assert hs_flat.dtype == torch.bfloat16
         assert fn.dtype == torch.float32
         assert hc_scale.dtype == torch.float32
@@ -3411,36 +3410,106 @@ class rocm_aiter_ops:
 
         num_tokens = hs_flat.shape[0]
         if num_tokens == 0:
-            return
+            return torch.empty(
+                num_tokens,
+                hidden_size,
+                dtype=torch.bfloat16,
+                device=hs_flat.device,
+            )
 
-        hc_mult3 = hc_mult * 2 + hc_mult * hc_mult
+        from aiter.ops.mhc import mhc_pre
 
-        full_fn = torch.zeros(
-            hc_mult3,
-            hc_mult * hidden_size,
-            dtype=fn.dtype,
-            device=fn.device,
+        # AITER accepts the compact hc_mult-row gate matrix when
+        # sinkhorn_repeat=0. Calling it directly avoids constructing
+        # zero-padded full MHC parameters on every draft step.
+        with torch.device(hs_flat.device):
+            _, _, layer_input = mhc_pre(
+                hs_flat,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_eps,
+                0.0,
+                1.0,
+                0,
+            )
+        return layer_input
+
+    @staticmethod
+    def mhc_fused_post_pre(
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post_layer_mix: torch.Tensor,
+        comb_res_mix: torch.Tensor,
+        fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        rms_eps: float,
+        hc_pre_eps: float,
+        hc_sinkhorn_eps: float,
+        hc_post_mult_value: float,
+        sinkhorn_repeat: int,
+        norm_weight: torch.Tensor | None = None,
+        norm_eps: float = 0.0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run AITER fused MHC post+pre and return vLLM's output order."""
+        from aiter.ops.mhc import mhc_fused_post_pre
+
+        hc_mult = residual.shape[-2]
+        hidden_size = residual.shape[-1]
+        outer_shape = residual.shape[:-2]
+        residual_flat = residual.contiguous().view(-1, hc_mult, hidden_size)
+        num_tokens = residual_flat.shape[0]
+
+        if num_tokens == 0:
+            return (
+                torch.empty_like(residual),
+                torch.empty(
+                    *outer_shape,
+                    hc_mult,
+                    1,
+                    dtype=torch.float32,
+                    device=residual.device,
+                ),
+                torch.empty(
+                    *outer_shape,
+                    hc_mult,
+                    hc_mult,
+                    dtype=torch.float32,
+                    device=residual.device,
+                ),
+                torch.empty(
+                    *outer_shape,
+                    hidden_size,
+                    dtype=torch.bfloat16,
+                    device=residual.device,
+                ),
+            )
+
+        with torch.device(residual.device):
+            post_mix, comb_mix, layer_input, next_residual = mhc_fused_post_pre(
+                x.contiguous().view(num_tokens, hidden_size),
+                residual_flat,
+                post_layer_mix.contiguous().view(num_tokens, hc_mult, 1),
+                comb_res_mix.contiguous().view(num_tokens, hc_mult, hc_mult),
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                norm_weight,
+                norm_eps,
+            )
+        return (
+            next_residual.view_as(residual),
+            post_mix.view(*outer_shape, hc_mult, 1),
+            comb_mix.view(*outer_shape, hc_mult, hc_mult),
+            layer_input.view(*outer_shape, hidden_size),
         )
-        full_fn[:hc_mult] = fn
-
-        full_base = torch.zeros(hc_mult3, dtype=hc_base.dtype, device=hc_base.device)
-        full_base[:hc_mult] = hc_base
-
-        full_scale = torch.zeros(3, dtype=hc_scale.dtype, device=hc_scale.device)
-        full_scale[0] = hc_scale[0]
-
-        _, _, layer_input = rocm_aiter_ops.mhc_pre(
-            hs_flat,
-            full_fn,
-            full_scale,
-            full_base,
-            rms_eps,
-            hc_eps,
-            0.0,
-            1.0,
-            0,
-        )
-        out.copy_(layer_input)
 
     @staticmethod
     def mhc_post(

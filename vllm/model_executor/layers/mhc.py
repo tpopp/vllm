@@ -315,7 +315,16 @@ class HCHeadOp(CustomOp):
         outer_shape = hidden_states.shape[:-2]
         hs_flat = hidden_states.view(-1, hc_mult, hidden_size)
 
-        if HAS_TILELANG_MHC:
+        if HAS_AITER_MHC and hc_mult == 4 and hidden_size % 256 == 0:
+            out = torch.ops.vllm.hc_head_fused_aiter(
+                hs_flat,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                rms_norm_eps,
+                hc_eps,
+            )
+        elif HAS_TILELANG_MHC:
             out = torch.ops.vllm.hc_head_fused_kernel_tilelang(
                 hs_flat,
                 hc_fn,
@@ -444,6 +453,27 @@ class MHCFusedPostPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        hc_mult = residual.shape[-2]
+        hidden_size = residual.shape[-1]
+        if HAS_AITER_MHC and hc_mult == 4 and hidden_size % 256 == 0:
+            return torch.ops.vllm.mhc_fused_post_pre_aiter(
+                x,
+                residual,
+                post_layer_mix,
+                comb_res_mix,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
+                tile_n,
+                norm_weight,
+                norm_eps,
+            )
         if HAS_TILELANG_MHC:
             return torch.ops.vllm.mhc_fused_post_pre_tilelang(
                 x,

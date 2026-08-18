@@ -11,7 +11,7 @@ from vllm.model_executor.kernels.mhc.tilelang import (
     _tilelang_hc_prenorm_gemm,
     _torch_hc_prenorm_gemm,
 )
-from vllm.model_executor.layers.mhc import HAS_TILELANG_MHC
+from vllm.model_executor.layers.mhc import HAS_AITER_MHC, HAS_TILELANG_MHC
 from vllm.models.deepseek_v4.nvidia.model import (
     DeepseekV4DecoderLayer,
     DeepseekV4Model,
@@ -292,6 +292,69 @@ def test_mhc_fused_post_pre(num_tokens, hidden_size, hc_mult):
 
 
 @pytest.mark.skipif(
+    not HAS_AITER_MHC,
+    reason="AITER MHC support required",
+)
+@pytest.mark.parametrize("num_tokens", [1, 8, 128])
+@pytest.mark.parametrize("hidden_size", [4096, 7168])
+@pytest.mark.parametrize("hc_mult", [4])
+def test_mhc_fused_post_pre_aiter(num_tokens, hidden_size, hc_mult):
+    torch.set_default_device(DEVICE)
+    set_random_seed(0)
+
+    x = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16)
+    residual = torch.randn((num_tokens, hc_mult, hidden_size), dtype=torch.bfloat16)
+    post_layer_mix = torch.randn((num_tokens, hc_mult, 1), dtype=torch.float32)
+    comb_res_mix = torch.randn((num_tokens, hc_mult, hc_mult), dtype=torch.float32)
+    hc_mult3 = hc_mult * 2 + hc_mult * hc_mult
+    fn = (
+        torch.randn((hc_mult3, hc_mult, hidden_size), dtype=torch.float32)
+        * 1e-4
+        * (1 + torch.arange(hc_mult).mul(0.01).view(1, -1, 1))
+    ).flatten(1, 2)
+    hc_scale = torch.randn((3,), dtype=torch.float32) * 0.1
+    hc_base = torch.randn((hc_mult3,), dtype=torch.float32) * 0.1
+    rms_eps = hc_pre_eps = hc_sinkhorn_eps = 1e-6
+    hc_post_alpha = 1.0
+    sinkhorn_repeat = 20
+
+    residual_ref = mhc_post_ref(x, residual, post_layer_mix, comb_res_mix)
+    post_mix_ref, res_mix_ref, layer_input_ref = mhc_pre_ref(
+        residual_ref,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_alpha,
+        sinkhorn_repeat,
+    )
+
+    residual_out, post_mix, res_mix, layer_input = (
+        torch.ops.vllm.mhc_fused_post_pre_aiter(
+            x,
+            residual,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_alpha,
+            sinkhorn_repeat,
+        )
+    )
+
+    torch.testing.assert_close(residual_out, residual_ref, atol=5e-2, rtol=1e-2)
+    torch.testing.assert_close(post_mix, post_mix_ref, atol=5e-2, rtol=1e-2)
+    torch.testing.assert_close(res_mix, res_mix_ref, atol=5e-2, rtol=1e-2)
+    torch.testing.assert_close(layer_input, layer_input_ref, atol=5e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(
     not current_platform.is_rocm(),
     reason="ROCm required",
 )
@@ -325,6 +388,36 @@ def test_hc_head_triton(num_tokens, hidden_size, hc_mult):
 
     assert result is None
     assert not torch.isnan(out).any()
+
+    out_ref = hc_head_ref(residual, fn, hc_scale, hc_base, rms_eps, hc_eps)
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(
+    not HAS_AITER_MHC,
+    reason="AITER MHC support required",
+)
+@pytest.mark.parametrize("num_tokens", [1, 8, 128])
+@pytest.mark.parametrize("hidden_size", [4096, 7168])
+@pytest.mark.parametrize("hc_mult", [4])
+def test_hc_head_aiter(num_tokens, hidden_size, hc_mult):
+    torch.set_default_device(DEVICE)
+    set_random_seed(0)
+
+    residual = torch.randn((num_tokens, hc_mult, hidden_size), dtype=torch.bfloat16)
+    fn = torch.randn((hc_mult, hc_mult * hidden_size), dtype=torch.float32) * 1e-4
+    hc_scale = torch.randn((1,), dtype=torch.float32) * 0.1
+    hc_base = torch.randn((hc_mult,), dtype=torch.float32) * 0.1
+    rms_eps = hc_eps = 1e-6
+
+    out = torch.ops.vllm.hc_head_fused_aiter(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_eps,
+    )
 
     out_ref = hc_head_ref(residual, fn, hc_scale, hc_base, rms_eps, hc_eps)
     torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=1e-2)
