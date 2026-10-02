@@ -449,7 +449,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefix=f"{prefix}.in_proj_ba",
         )
         self.disable_tp_for_ba_proj = self.maybe_disable_tp(self.quant_config)
-        self._in_proj_qkvzba_weight = self._maybe_merge_in_proj_weights()
+        # Non-persistent so it stays out of state_dict; layerwise reload recognizes
+        # a non-persistent buffer aliasing parameter storage and leaves it alone.
+        self.register_buffer(
+            "_in_proj_qkvzba_weight",
+            self._maybe_merge_in_proj_weights(vllm_config),
+            persistent=False,
+        )
 
         query_key_settings = (self.key_dim, 0, False)
         value_settings = (self.value_dim, 0, False)
@@ -612,22 +618,52 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             disable_tp=self.maybe_disable_tp(quant_config),
         )
 
-    def _maybe_merge_in_proj_weights(self) -> torch.Tensor | None:
+    def _maybe_merge_in_proj_weights(
+        self, vllm_config: VllmConfig
+    ) -> torch.Tensor | None:
         """On ROCm, make in_proj_qkvz/in_proj_ba weights views of one buffer so decode
         runs a single skinny GEMM instead of two (one launch fewer per GDN layer).
 
         The checkpoint loader writes through the views, and UnquantizedLinearMethod
-        does not reallocate weights after loading on ROCm, so the merged buffer
-        stays in sync.
+        does not reallocate weights after loading on ROCm today, but nothing
+        enforces that, so anything that reassigns ``weight.data`` after this
+        runs (e.g. weight offloading) must be gated off here.
         """
-        from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+        if not (current_platform.is_rocm() and GDN_AITER_TRITON_AVAILABLE):
+            return None
+        reason = self._in_proj_merge_unsupported_reason(vllm_config)
+        if reason is not None:
+            logger.debug_once("GDN in_proj_qkvz + in_proj_ba not merged: %s", reason)
+            return None
+        wq = self.in_proj_qkvz.weight
+        wb = self.in_proj_ba.weight
+        merged = torch.empty(
+            wq.shape[0] + wb.shape[0], wq.shape[1], dtype=wq.dtype, device=wq.device
+        )
+        wq.data = merged[: wq.shape[0]]
+        wb.data = merged[wq.shape[0] :]
+        logger.info_once("GDN in_proj_qkvz + in_proj_ba merged into one GEMM")
+        return merged
 
+    def _in_proj_merge_unsupported_reason(self, vllm_config: VllmConfig) -> str | None:
+        from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+        from vllm.model_executor.offloader import NoopOffloader, get_offloader
+
+        # The merged GEMM bypasses in_proj_qkvz's forward (and so any LoRA
+        # wrapper) and UnquantizedLinearMethod.apply (and so its
+        # VLLM_BATCH_INVARIANT routing).
+        if vllm_config.lora_config is not None:
+            return "LoRA is enabled"
+        if envs.VLLM_BATCH_INVARIANT:
+            return "VLLM_BATCH_INVARIANT is set"
+        # Offloaders reassign weight.data after this runs (make_layers wraps
+        # the decoder layer right after construction), breaking the aliasing.
+        if not isinstance(get_offloader(), NoopOffloader):
+            return "weight offloading is enabled"
         wq = getattr(self.in_proj_qkvz, "weight", None)
         wb = getattr(self.in_proj_ba, "weight", None)
         if not (
-            current_platform.is_rocm()
-            and GDN_AITER_TRITON_AVAILABLE
-            and isinstance(self.in_proj_qkvz.quant_method, UnquantizedLinearMethod)
+            isinstance(self.in_proj_qkvz.quant_method, UnquantizedLinearMethod)
             and isinstance(self.in_proj_ba.quant_method, UnquantizedLinearMethod)
             and not self.disable_tp_for_ba_proj
             and getattr(self.in_proj_qkvz, "bias", None) is None
@@ -639,14 +675,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and wq.device.type == "cuda"
             and wq.shape[1] == wb.shape[1]
         ):
-            return None
-        merged = torch.empty(
-            wq.shape[0] + wb.shape[0], wq.shape[1], dtype=wq.dtype, device=wq.device
-        )
-        wq.data = merged[: wq.shape[0]]
-        wb.data = merged[wq.shape[0] :]
-        logger.info_once("GDN in_proj_qkvz + in_proj_ba merged into one GEMM")
-        return merged
+            return "projections are quantized, biased, or have mismatched weights"
+        return None
 
     def maybe_disable_tp(self, quant_config: QuantizationConfig | None) -> bool:
         """Whether to replicate ba_proj instead of TP-sharding it.
