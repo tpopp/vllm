@@ -449,6 +449,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefix=f"{prefix}.in_proj_ba",
         )
         self.disable_tp_for_ba_proj = self.maybe_disable_tp(self.quant_config)
+        self._in_proj_qkvzba_weight = self._maybe_merge_in_proj_weights()
 
         query_key_settings = (self.key_dim, 0, False)
         value_settings = (self.value_dim, 0, False)
@@ -610,6 +611,42 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefix=prefix,
             disable_tp=self.maybe_disable_tp(quant_config),
         )
+
+    def _maybe_merge_in_proj_weights(self) -> torch.Tensor | None:
+        """On ROCm, make in_proj_qkvz/in_proj_ba weights views of one buffer so decode
+        runs a single skinny GEMM instead of two (one launch fewer per GDN layer).
+
+        The checkpoint loader writes through the views, and UnquantizedLinearMethod
+        does not reallocate weights after loading on ROCm, so the merged buffer
+        stays in sync.
+        """
+        from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+        wq = getattr(self.in_proj_qkvz, "weight", None)
+        wb = getattr(self.in_proj_ba, "weight", None)
+        if not (
+            current_platform.is_rocm()
+            and GDN_AITER_TRITON_AVAILABLE
+            and isinstance(self.in_proj_qkvz.quant_method, UnquantizedLinearMethod)
+            and isinstance(self.in_proj_ba.quant_method, UnquantizedLinearMethod)
+            and not self.disable_tp_for_ba_proj
+            and getattr(self.in_proj_qkvz, "bias", None) is None
+            and getattr(self.in_proj_ba, "bias", None) is None
+            and wq is not None
+            and wb is not None
+            and wq.dtype == wb.dtype
+            and wq.device == wb.device
+            and wq.device.type == "cuda"
+            and wq.shape[1] == wb.shape[1]
+        ):
+            return None
+        merged = torch.empty(
+            wq.shape[0] + wb.shape[0], wq.shape[1], dtype=wq.dtype, device=wq.device
+        )
+        wq.data = merged[: wq.shape[0]]
+        wb.data = merged[wq.shape[0] :]
+        logger.info_once("GDN in_proj_qkvz + in_proj_ba merged into one GEMM")
+        return merged
 
     def maybe_disable_tp(self, quant_config: QuantizationConfig | None) -> bool:
         """Whether to replicate ba_proj instead of TP-sharding it.
@@ -864,8 +901,18 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         available, otherwise falling back to the generic CUDA path."""
         if GDN_AITER_TRITON_AVAILABLE:
             num_tokens = hidden_states.size(0)
-            projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
-            projected_states_ba, _ = self.in_proj_ba(hidden_states)
+            if self._in_proj_qkvzba_weight is not None:
+                from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
+
+                projected = dispatch_unquantized_gemm()(
+                    self.in_proj_qkvz, hidden_states, self._in_proj_qkvzba_weight, None
+                )
+                n_qkvz = self.in_proj_qkvz.weight.shape[0]
+                projected_states_qkvz = projected[:, :n_qkvz]
+                projected_states_ba = projected[:, n_qkvz:]
+            else:
+                projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
+                projected_states_ba, _ = self.in_proj_ba(hidden_states)
             projected_states_qkvz = projected_states_qkvz.view(num_tokens, -1)
             projected_states_ba = projected_states_ba.view(num_tokens, -1)
             core_attn_out = torch.empty(
