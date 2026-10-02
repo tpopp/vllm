@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with AiterFlashAttention."""
 
+import os
 from dataclasses import dataclass, replace
 from typing import ClassVar
 
@@ -791,7 +792,9 @@ class AiterFlashAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
-        return [16, 32]
+        # 64 lets --block-size 64 keep whole 64-token pages, which the FlyDSL NHD decode
+        # (ROCm/aiter#5949) requires.
+        return [16, 32, 64]
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
@@ -1477,6 +1480,77 @@ class AiterFlashAttentionImpl(AttentionImpl):
                         V_QScale_asm=v_qscale,
                         out_=output[:num_decode_tokens],
                         kv_cache_dtype=self.kv_cache_dtype,
+                    )
+                elif (
+                    os.environ.get("VLLM_ROCM_FLYDSL_PA_NHD", "0") == "1"
+                    and key_cache.shape[1] == 64
+                    and self.head_size == 256
+                    and is_quantized_kv_cache(self.kv_cache_dtype)
+                ):
+                    # FlyDSL NHD paged-attention decode (ROCm/aiter#5949, draft). The
+                    # `aiter_pa5949v2` import below is our locally-renamed copy of that
+                    # draft PR's files (patches/aiter_pa5949v2 in the companion work
+                    # item) -- once #5949 merges upstream, update this import to the
+                    # real AITER package path it lands at.
+                    from aiter_pa5949v2.kernels.pa_decode_kernel import (
+                        KV_COMPUTE_BLOCK,
+                    )
+                    from aiter_pa5949v2.pa_decode import (
+                        get_recommended_splits,
+                        pa_decode,
+                    )
+
+                    logger.info_once(
+                        "FlyDSL PA decode (ROCm/aiter#5949 NHD) on the AITER FA cache: "
+                        "K %s stride %s",
+                        tuple(key_cache.shape),
+                        key_cache.stride(),
+                    )
+                    num_kv_heads = key_cache.shape[2]
+                    fly_parts = get_recommended_splits(
+                        num_decodes,
+                        num_kv_heads,
+                        KV_COMPUTE_BLOCK // 64,
+                        None,
+                        max_context_length=attn_metadata.max_seq_len,
+                        ctas_per_cu=1,
+                    )
+                    fly_rows = query.shape[1] // num_kv_heads
+                    fly_psum = torch.empty(
+                        (num_decodes, num_kv_heads, fly_parts, fly_rows),
+                        dtype=torch.float32,
+                        device=query.device,
+                    )
+                    fly_pmax = torch.empty_like(fly_psum)
+                    fly_pout = torch.empty(
+                        (
+                            num_decodes,
+                            num_kv_heads,
+                            fly_parts,
+                            fly_rows,
+                            self.head_size,
+                        ),
+                        dtype=query.dtype,
+                        device=query.device,
+                    )
+                    pa_decode(
+                        output[:num_decode_tokens],
+                        query[:num_decode_tokens],
+                        key_cache,
+                        value_cache,
+                        attn_metadata.seq_lens[:num_decodes],
+                        attn_metadata.block_table[:num_decodes],
+                        self.scale,
+                        1,
+                        fly_parts,
+                        KV_COMPUTE_BLOCK,
+                        current_platform.fp8_dtype(),
+                        None,
+                        layer._k_scale.reshape(1),
+                        layer._v_scale.reshape(1),
+                        fly_psum,
+                        fly_pmax,
+                        fly_pout,
                     )
                 else:
                     _, num_heads, head_size = query.shape
