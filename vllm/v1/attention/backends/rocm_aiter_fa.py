@@ -8,7 +8,11 @@ from typing import ClassVar
 import torch
 
 from vllm._aiter_ops import rocm_aiter_ops
-from vllm.config import VllmConfig, get_layers_from_vllm_config
+from vllm.config import (
+    VllmConfig,
+    get_current_vllm_config_or_none,
+    get_layers_from_vllm_config,
+)
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
@@ -791,7 +795,16 @@ class AiterFlashAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
+        if rocm_aiter_ops.is_flydsl_pa_decode_enabled():
+            # FlyDSL decode only takes 64-token pages.
+            return [16, 32, 64]
         return [16, 32]
+
+    @classmethod
+    def get_preferred_block_size(cls, default_block_size: int) -> int:
+        if rocm_aiter_ops.is_flydsl_pa_decode_enabled():
+            return max(default_block_size, 64)
+        return super().get_preferred_block_size(default_block_size)
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
@@ -910,6 +923,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
 
         assert self.num_heads % self.num_kv_heads == 0
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
+        self.use_flydsl_pa_decode = self._supports_flydsl_pa_decode()
 
         if attn_type != AttentionType.DECODER:
             raise NotImplementedError(
@@ -919,6 +933,32 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 "query_start_loc with causal=True, which is incorrect for "
                 "cross-attention."
             )
+
+    def _supports_flydsl_pa_decode(self) -> bool:
+        if not rocm_aiter_ops.is_flydsl_pa_decode_enabled():
+            return False
+        # Single-token decode only; sliding window, sinks and multi-token
+        # decode already take the unified_attention path.
+        vllm_config = get_current_vllm_config_or_none()
+        block_size = vllm_config.cache_config.block_size if vllm_config else 64
+        requirements = {
+            "a KV cache block size that is a multiple of 64": block_size % 64 == 0,
+            "an FP8 (e4m3) KV cache": self.kv_cache_dtype in ("fp8", "fp8_e4m3"),
+            "head size 256": self.head_size == 256,
+            "at most 16 query heads per KV head": self.num_queries_per_kv <= 16,
+            "no ALiBi": self.alibi_slopes is None,
+            "no logits soft cap": self.logits_soft_cap == 0,
+        }
+        missing = [req for req, ok in requirements.items() if not ok]
+        if missing:
+            logger.warning_once(
+                "FlyDSL paged-attention decode requires %s; using the default "
+                "decode path for this layer.",
+                ", ".join(missing),
+            )
+            return False
+        logger.info_once("Using FlyDSL paged-attention decode for ROCM_AITER_FA.")
+        return True
 
     def _get_kv_cache_descales(
         self,
@@ -1477,6 +1517,19 @@ class AiterFlashAttentionImpl(AttentionImpl):
                         V_QScale_asm=v_qscale,
                         out_=output[:num_decode_tokens],
                         kv_cache_dtype=self.kv_cache_dtype,
+                    )
+                elif self.use_flydsl_pa_decode and key_cache.shape[1] == 64:
+                    rocm_aiter_ops.flydsl_pa_decode(
+                        output=output[:num_decode_tokens],
+                        query=query[:num_decode_tokens],
+                        key_cache=key_cache,
+                        value_cache=value_cache,
+                        seq_lens=attn_metadata.seq_lens[:num_decodes],
+                        block_table=attn_metadata.block_table[:num_decodes],
+                        max_seq_len=attn_metadata.max_seq_len,
+                        scale=self.scale,
+                        k_scale=layer._k_scale,
+                        v_scale=layer._v_scale,
                     )
                 else:
                     _, num_heads, head_size = query.shape

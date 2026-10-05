@@ -1945,6 +1945,8 @@ class rocm_aiter_ops:
         VLLM_ROCM_USE_AITER_MOE_SITUV2: SiTUv2 FlyDSL MoE activation
             dtype (a16w4 | a8w4 | a4w4).
         VLLM_ROCM_USE_AITER_TRITON_GEMM: Controls Triton unquantized GEMM.
+        VLLM_ROCM_USE_AITER_FLYDSL_PA_DECODE: Controls FlyDSL paged-attention
+            decode in the ROCM_AITER_FA backend.
 
     Note:
         The environment variables are assigned when the module is imported,
@@ -2017,6 +2019,7 @@ class rocm_aiter_ops:
     _MOE_SITUV2 = _resolve_situv2_activation()
     # TODO: Consolidate under _LINEAR_ENABLED
     _TRITON_UNQUANT_GEMM = envs.VLLM_ROCM_USE_AITER_TRITON_GEMM
+    _FLYDSL_PA_DECODE_ENABLED = envs.VLLM_ROCM_USE_AITER_FLYDSL_PA_DECODE
     # Lazily probed: whether aiter.topk_softmax supports the
     # num_shared_experts / shared_expert_scoring_func args (7-arg form).
     _TOPK_SOFTMAX_FUSED_SIGMOID: bool | None = None
@@ -2047,6 +2050,7 @@ class rocm_aiter_ops:
         cls._MOE_SITUV2 = _resolve_situv2_activation()
         _sync_aiter_situv2_moe_env()
         cls._TRITON_UNQUANT_GEMM = envs.VLLM_ROCM_USE_AITER_TRITON_GEMM
+        cls._FLYDSL_PA_DECODE_ENABLED = envs.VLLM_ROCM_USE_AITER_FLYDSL_PA_DECODE
         cls._MOE_DISPATCH_POLICY = envs.VLLM_ROCM_AITER_MOE_DISPATCH_POLICY
 
     @staticmethod
@@ -2550,6 +2554,51 @@ class rocm_aiter_ops:
     def fused_moe_supports_heterogeneous_shared_expert(cls, num_tokens: int) -> bool:
         """Whether AITER has DSV4 native-I384 configs through the given M."""
         return cls._probe_dsv4_i384_fhmoe_capability(num_tokens)
+
+    @staticmethod
+    @functools.cache
+    def _flydsl_pa_decode_supports_nhd() -> bool:
+        """Whether AITER's FlyDSL pa_decode accepts the NHD KV cache layout.
+
+        Added in https://github.com/ROCm/aiter/pull/5949. Older AITER builds
+        ship pa_decode for the 5D shuffled layout only.
+        """
+        try:
+            import inspect
+
+            from aiter.ops.flydsl.kernels.pa_decode_kernel import (
+                compile_pa_decode_tile,
+            )
+        except ImportError:
+            return False
+        return "nhd_layout" in inspect.signature(compile_pa_decode_tile).parameters
+
+    @classmethod
+    @if_aiter_supported
+    def is_flydsl_pa_decode_enabled(cls) -> bool:
+        """FlyDSL NHD paged-attention decode for ROCM_AITER_FA (gfx950 only).
+
+        Not gated on VLLM_ROCM_USE_AITER so that it also applies when the
+        backend is selected explicitly.
+        """
+        if not cls._FLYDSL_PA_DECODE_ENABLED:
+            return False
+        from vllm.platforms.rocm import on_gfx950
+
+        if not on_gfx950():
+            logger.warning_once(
+                "VLLM_ROCM_USE_AITER_FLYDSL_PA_DECODE is only supported on gfx950; "
+                "ignoring it."
+            )
+            return False
+        if not cls._flydsl_pa_decode_supports_nhd():
+            logger.warning_once(
+                "VLLM_ROCM_USE_AITER_FLYDSL_PA_DECODE is set but the installed "
+                "AITER/FlyDSL has no NHD pa_decode "
+                "(https://github.com/ROCm/aiter/pull/5949); ignoring it."
+            )
+            return False
+        return True
 
     @classmethod
     @if_aiter_supported
@@ -4101,6 +4150,82 @@ class rocm_aiter_ops:
             V_QScale_asm=V_QScale_asm,
             out_=out_,
             kv_cache_dtype=kv_cache_dtype,
+        )
+
+    @staticmethod
+    def flydsl_pa_decode(
+        output: torch.Tensor,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        seq_lens: torch.Tensor,
+        block_table: torch.Tensor,
+        max_seq_len: int,
+        scale: float,
+        k_scale: torch.Tensor,
+        v_scale: torch.Tensor,
+    ) -> None:
+        """Single-token FP8 paged-attention decode on NHD K/V views.
+
+        Args:
+            output: [num_seqs, num_heads, head_size], written in place.
+            query: [num_seqs, num_heads, head_size], BF16/FP16.
+            key_cache: [num_blocks, block_size, num_kv_heads, head_size] FP8
+                view.
+            value_cache: FP8 view shaped like key_cache.
+            seq_lens: [num_seqs] int32 context lengths.
+            block_table: [num_seqs, max_num_blocks] int32.
+            max_seq_len: Host-side upper bound of seq_lens; only used to
+                choose the context split count.
+            scale: Softmax scale.
+            k_scale: Per-tensor K dequantization scale.
+            v_scale: Per-tensor V dequantization scale.
+
+        """
+        from aiter.ops.flydsl.pa_decode import (
+            KV_COMPUTE_BLOCK,
+            get_recommended_splits,
+            pa_decode,
+        )
+
+        num_seqs, num_heads, head_size = query.shape
+        block_size, num_kv_heads = key_cache.shape[1:3]
+        query_group_size = num_heads // num_kv_heads
+        # Partitions split each sequence's live length on the GPU, so a
+        # count chosen from the host bound stays correct under graph replay.
+        num_partitions = get_recommended_splits(
+            num_seqs,
+            num_kv_heads,
+            KV_COMPUTE_BLOCK // block_size,
+            max_context_length=max_seq_len,
+            ctas_per_cu=1,
+        )
+        exp_sums = torch.empty(
+            (num_seqs, num_kv_heads, num_partitions, query_group_size),
+            dtype=torch.float32,
+            device=query.device,
+        )
+        max_logits = torch.empty_like(exp_sums)
+        tmp_out = torch.empty(
+            (*exp_sums.shape, head_size), dtype=query.dtype, device=query.device
+        )
+        pa_decode(
+            output,
+            query,
+            key_cache,
+            value_cache,
+            seq_lens,
+            block_table,
+            scale,
+            query_length=1,
+            max_context_partition_num=num_partitions,
+            context_partition_size=KV_COMPUTE_BLOCK,
+            compute_type=key_cache.dtype,
+            key_scale=k_scale.reshape(1),
+            value_scale=v_scale.reshape(1),
+            exp_sums=exp_sums,
+            max_logits=max_logits,
+            temporary_output=tmp_out,
         )
 
     @staticmethod
