@@ -14,8 +14,10 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.fused_stages import attach_stages
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
@@ -58,6 +60,8 @@ from vllm.models.common.ops.sequence_parallel import (
 from vllm.models.deepseek_v4.amd.model import (
     DeepseekV4MoE as DeepseekV4MoEBase,
 )
+from vllm.models.deepseek_v41.amd.fused_stages import binding as fused_stage_binding
+from vllm.models.deepseek_v41.amd.fused_stages import stage_specs
 from vllm.models.deepseek_v41.amd.rocm import DeepseekV41ROCMAiterMLAAttention
 from vllm.models.deepseek_v41.attention import DeepseekV4Attention
 from vllm.sequence import IntermediateTensors
@@ -256,6 +260,33 @@ class DeepseekV4DecoderLayer(nn.Module):
         # skipped for the seams it takes.
         self.fuse_seam_norm = HAS_AITER_MHC_FUSED_POST_PRE_DELAYED_RMS_NORM
 
+        # Fused stages (mono kernels), see fused_stages.py. A provider is
+        # chosen per stage by kernel_config.fused_stages; this only declares
+        # the replaceable spans.
+        self.fused_stage_config = (
+            config.num_hidden_layers,
+            vllm_config.cache_config.block_size,
+        )
+        self.decoder_stage, self.ffn_stage = stage_specs(self.hidden_size, self.hc_mult)
+        kv_layers = [self.attn.swa_cache_layer.prefix]
+        if getattr(self.attn, "is_kv_source", False):
+            kv_layers.append(self.attn.prefix)
+        self.stages = attach_stages(
+            self,
+            layer_id=extract_layer_index(prefix),
+            stages=(self.decoder_stage, self.ffn_stage),
+            binding=fused_stage_binding,
+            attention_layers=kv_layers,
+        )
+        # ffn_after_attention enters at wo_b's un-reduced partial sum (seam
+        # option tp_partial_sum). Decided from config alone, identically on
+        # every rank; steps the stage does not take reduce it below.
+        self.ffn_stage_takes_partial = (
+            self.stages.configured(self.ffn_stage) and not self.use_sequence_parallel
+        )
+        if self.ffn_stage_takes_partial:
+            self.attn.wo_b.reduce_results = False
+
     @staticmethod
     def _hc_collapse(x: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
         """Hyper-connection collapse used by DSpark on ROCm."""
@@ -273,6 +304,18 @@ class DeepseekV4DecoderLayer(nn.Module):
         engram_hashes: torch.Tensor | None = None,
         engram_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        out = self.stages.try_run(
+            self.decoder_stage,
+            x=x,
+            residual=residual,
+            post_mix=post_mix,
+            res_mix=res_mix,
+            pre_mix=pre_mix,
+            positions=positions,
+            input_ids=input_ids,
+        )
+        if out is not None:
+            return out
         # Layer 0's attention seam projects the 2-D embedding with the folded
         # hc_attn_fn_broadcast instead of the 4-stream residual with hc_attn_fn.
         # The fused kernel only takes the latter, so that seam keeps the
@@ -371,6 +414,19 @@ class DeepseekV4DecoderLayer(nn.Module):
         x = self.attn(positions, x, None)
         if self.use_sequence_parallel:
             x = sp_reduce_scatter(x)
+        elif self.ffn_stage_takes_partial:
+            out = self.stages.try_run(
+                self.ffn_stage,
+                x=x,
+                residual=residual,
+                post_mix=post_mix,
+                res_mix=res_mix,
+                pre_mix=attn_pre,
+                input_ids=input_ids,
+            )
+            if out is not None:
+                return out
+            x = tensor_model_parallel_all_reduce(x)
 
         residual, post_mix, res_mix, x, ffn_pre = self.mhc_pre_delayed(
             residual,

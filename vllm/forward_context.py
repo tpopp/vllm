@@ -11,6 +11,9 @@ import torch
 
 import vllm.envs as envs
 from vllm.config import CUDAGraphMode, ParallelConfig, VllmConfig
+from vllm.fused_stages.state import (
+    get_active_manager as get_active_fused_stage_manager,
+)
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionMetadata
@@ -196,6 +199,12 @@ class ForwardContext:
 
     additional_kwargs: dict[str, Any] = field(default_factory=dict)
 
+    # Fused-stage plan of this forward (vllm.fused_stages.manager.FusedStep),
+    # or None when every stage runs its reference code. Derived from
+    # batch_descriptor and cudagraph_runtime_mode only, so captured graphs and
+    # every TP rank see the same decision.
+    fused_step: Any = None
+
     def __post_init__(self):
         assert self.cudagraph_runtime_mode.is_valid_runtime_mode(), (
             f"Invalid cudagraph runtime mode: {self.cudagraph_runtime_mode}"
@@ -238,11 +247,23 @@ def create_forward_context(
     additional_kwargs: dict[str, Any] | None = None,
     skip_compiled: bool = False,
     is_padding: torch.Tensor | None = None,
+    fused_batch_descriptor: BatchDescriptor | None = None,
 ):
     if vllm_config.compilation_config.fast_moe_cold_start:
         all_moe_layers = vllm_config.compilation_config.static_all_moe_layers
     else:
         all_moe_layers = None
+
+    fused_step = None
+    if (fused_manager := get_active_fused_stage_manager()) is not None:
+        fused_step = fused_manager.new_step(
+            fused_manager.plan_step(
+                fused_batch_descriptor or batch_descriptor,
+                cudagraph_runtime_mode,
+                ubatch_slices,
+                attn_metadata,
+            )
+        )
 
     return ForwardContext(
         no_compile_layers=vllm_config.compilation_config.static_forward_context,
@@ -256,6 +277,7 @@ def create_forward_context(
         skip_compiled=skip_compiled,
         additional_kwargs=additional_kwargs or {},
         is_padding=is_padding,
+        fused_step=fused_step,
     )
 
 
@@ -286,6 +308,7 @@ def set_forward_context(
     slot_mapping: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None,
     skip_compiled: bool = False,
     is_padding: torch.Tensor | None = None,
+    fused_batch_descriptor: BatchDescriptor | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -355,6 +378,7 @@ def set_forward_context(
         additional_kwargs,
         skip_compiled,
         is_padding=is_padding,
+        fused_batch_descriptor=fused_batch_descriptor,
     )
 
     try:

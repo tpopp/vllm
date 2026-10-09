@@ -12,6 +12,7 @@ instead, since ``can_implement`` does not filter on K.
 import torch
 from torch.nn.parameter import Parameter
 
+from vllm.fused_stages import layouts
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_BLOCK_SIZE,
     MXFP8_SCALE_DTYPE,
@@ -247,15 +248,20 @@ class RocmDotScaledMxfp8LinearKernel(Mxfp8LinearKernel):
         scale_k = K // MXFP8_BLOCK_SIZE
         weight_scale = layer.weight_scale.data[:N, :scale_k].contiguous()
         block_scale = _as_block32_scale(weight_scale)
+        layout = layouts.MXFP8_ROWMAJOR_E8M0_1x32
         if block_scale is not None:
             # Checkpoints with 32x32 scale blocks (DeepSeek V4/V4.1) get them
             # back from the loader expanded per row; keep the blocks and use
             # the block-scaled GEMM, which also handles any K % 32 == 0.
             weight_scale = block_scale
+            layout = layouts.MXFP8_ROWMAJOR_E8M0_32x32
         elif K % _DOT_SCALED_K_ALIGN != 0:
             weight = dequant_mxfp8_to_bf16(weight.contiguous(), weight_scale)
+            layout = layouts.MXFP8_DEQUANT_BF16
         layer.weight = Parameter(weight.contiguous(), requires_grad=False)
         layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+        layouts.tag_layout(layer.weight, layout)
+        layouts.tag_layout(layer.weight_scale, layouts.SCALE_FOLLOWS_WEIGHT)
 
     def apply_weights(
         self,

@@ -13,6 +13,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import get_forward_context
+from vllm.fused_stages import layouts
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
@@ -758,7 +759,10 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
             replace_parameter(
                 linear,
                 "weight",
-                rocm_aiter_ops.shuffle_weight(w.data, layout=(16, 16)),
+                layouts.tag_layout(
+                    rocm_aiter_ops.shuffle_weight(w.data, layout=(16, 16)),
+                    layouts.FP8_BLOCK128_BPRESHUFFLE16,
+                ),
             )
             return ws
 
@@ -1085,7 +1089,11 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
 
     def _wo_b_after_wo_a(self, zf: torch.Tensor) -> torch.Tensor:
         if self._wo_b_scale is not None and zf.dim() == 2:
-            return self._bpre_attn_gemm(self.wo_b.weight, self._wo_b_scale, zf, True)
+            # Honor reduce_results like the linear does: a fused stage whose
+            # entry seam is wo_b's TP partial sum turns it off.
+            return self._bpre_attn_gemm(
+                self.wo_b.weight, self._wo_b_scale, zf, self.wo_b.reduce_results
+            )
         return self.wo_b(zf)
 
     def forward_mqa(

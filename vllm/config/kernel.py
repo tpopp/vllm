@@ -119,6 +119,49 @@ class IrOpPriorityConfig:
         return cls(**kwargs)
 
 
+@config
+class FusedStagesConfig:
+    """Provider selection for fused stages (mono kernels / megakernels): spans
+    of a model's forward that a provider may replace. See
+    docs/design/fused_stages.md.
+
+    Keys are stage ids (``"deepseek_v41.decoder_layer"``), family wildcards
+    (``"deepseek_v41.*"``) or ``"*"``; values are provider ids in priority
+    order. ``"reference"`` (the model's own code) is the implicit last entry.
+    Each provider takes the layers it accepts that no earlier provider took.
+    Empty (the default) means every stage runs its reference code.
+    """
+
+    priority: dict[str, list[str]] = Field(default_factory=dict)
+    """Stage id / wildcard -> provider ids in priority order."""
+
+    verify_rank_consistency: bool = False
+    """Debug: all-gather a digest of every newly computed step plan across the
+    TP group and raise on divergence."""
+
+    def priority_for(self, stage_id: str) -> list[str]:
+        if stage_id in self.priority:
+            return self.priority[stage_id]
+        family = stage_id.split(".", 1)[0]
+        return self.priority.get(f"{family}.*", self.priority.get("*", []))
+
+    def compute_hash(self) -> str:
+        """Provider choice changes the traced/captured program, and so do the
+        installed provider versions (folded in without importing them)."""
+        factors: dict[str, Any] = {"priority": self.priority}
+        if self.priority:
+            from vllm.fused_stages.registry import (
+                discover_providers,
+                installed_provider_versions,
+            )
+
+            factors["distributions"] = installed_provider_versions()
+            factors["providers"] = {
+                pid: p.provider_version for pid, p in discover_providers().items()
+            }
+        return hash_factors(factors)
+
+
 MoEBackend = Literal[
     "auto",
     "triton",
@@ -276,6 +319,11 @@ class KernelConfig:
     Platform defaults appended automatically during VllmConfig.__post_init__.
     """
 
+    fused_stages: FusedStagesConfig = Field(default_factory=FusedStagesConfig)
+    """Provider priority for fused stages (mono kernels). Example:
+    ``--kernel-config '{"fused_stages": {"priority":
+    {"deepseek_v41.*": ["rocm_mono_dsv41"]}}}'``."""
+
     enable_flashinfer_autotune: bool = None  # type: ignore[assignment]
     """If True, run FlashInfer autotuning during kernel warmup."""
 
@@ -415,11 +463,13 @@ class KernelConfig:
             "enable_flashinfer_autotune",
             "enable_rocm_segmented_attn_autotune",
             "ir_op_priority",  # handled separately below
+            "fused_stages",  # handled separately below
         }
         if self.linear_backend_per_quant is None:
             ignored_factors.add("linear_backend_per_quant")
         factors = get_hash_factors(self, ignored_factors)
         factors["ir_op_priority"] = self.ir_op_priority.compute_hash()
+        factors["fused_stages"] = self.fused_stages.compute_hash()
         return hash_factors(factors)
 
     @field_validator(

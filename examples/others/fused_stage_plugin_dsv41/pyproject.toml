@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-dsv41-mono"
+version = "0.1.0"
+description = "DeepSeek-V4.1 mono decode kernels (MI355X) as a vLLM fused-stage provider"
+requires-python = ">=3.10"
+license = "MIT"  # the kernels are adapted from ROCm/ATOM (MIT)
+dependencies = [
+    "vllm",  # needs vllm.fused_stages (interface major 0)
+    "flydsl",
+    "amd-aiter",  # FlyDSL helper modules + UncachedIpcHeap
+]
+
+# The whole integration with vLLM: one entry point. vLLM discovers it in every
+# worker process; VLLM_PLUGINS filters by the name on the left.
+[project.entry-points."vllm.fused_stages"]
+rocm_mono_dsv41 = "vllm_dsv41_mono.provider:Provider"
+
+[tool.setuptools.packages.find]
+include = ["vllm_dsv41_mono*"]

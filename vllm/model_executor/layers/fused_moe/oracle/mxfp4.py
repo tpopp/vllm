@@ -14,6 +14,7 @@ from vllm.config.kernel import (
     MoEBackend,
 )
 from vllm.config.quantization import QuantizationConfigArgs
+from vllm.fused_stages import layouts
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEConfig,
@@ -1654,6 +1655,15 @@ def convert_weight_to_mxfp4_moe_kernel_format(
             w2_scale = e8m0_shuffle(w2_scale_raw.view(-1, w2_scale_raw.shape[-1]))
             w13.is_shuffled = True
             w2.is_shuffled = True
+            layout = (
+                layouts.MXFP4_AITER_A16W4_SITUV2_INTERLEAVED
+                if guinterleave
+                else layouts.MXFP4_AITER_A16W4_SITUV2_SEPARATED
+            )
+            for t in (w13, w2):
+                layouts.tag_layout(t, layout)
+            for t in (w13_scale, w2_scale):
+                layouts.tag_layout(t, layouts.SCALE_FOLLOWS_WEIGHT)
             return (w13, w2, w13_scale, w2_scale, w13_bias, w2_bias)
 
         import os
@@ -1706,6 +1716,15 @@ def convert_weight_to_mxfp4_moe_kernel_format(
 
         w13_weight.is_shuffled = True
         w2_weight.is_shuffled = True
+        layout = (
+            layouts.MXFP4_AITER_A4W4_INTERLEAVED
+            if is_guinterleave
+            else layouts.MXFP4_AITER_A4W4_SEPARATED
+        )
+        for t in (w13_weight, w2_weight):
+            layouts.tag_layout(t, layout)
+        for t in (shuffled_w13_scale, shuffled_w2_scale):
+            layouts.tag_layout(t, layouts.SCALE_FOLLOWS_WEIGHT)
 
         return (
             w13_weight,

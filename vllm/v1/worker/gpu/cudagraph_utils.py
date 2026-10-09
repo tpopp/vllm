@@ -91,6 +91,35 @@ def make_cudagraph_stats(
     )
 
 
+def fused_plan_descriptor(
+    desc: BatchExecutionDescriptor, has_lora: bool
+) -> BatchDescriptor:
+    """Planning key for fused stages (``vllm.fused_stages``): V2 keeps the
+    request count and uniform-decode shape in its own descriptor; fused-stage
+    planning reads them from a ``BatchDescriptor``."""
+    return BatchDescriptor(
+        num_tokens=desc.num_tokens,
+        num_reqs=desc.num_reqs,
+        uniform=desc.uniform_token_count is not None,
+        has_lora=has_lora,
+        num_active_loras=desc.num_active_loras,
+    )
+
+
+def fused_capture_descs(
+    manager: "CudaGraphManager", has_lora: bool
+) -> list[tuple[CUDAGraphMode, list[BatchDescriptor]]]:
+    """The keys ``manager`` will capture, in fused-stage planning form
+    (microbatched captures are excluded: fused stages refuse DBO)."""
+    return [
+        (
+            mode,
+            [fused_plan_descriptor(d, has_lora) for d in descs if d.num_ubatches == 1],
+        )
+        for mode, descs in manager._capture_descs.items()
+    ]
+
+
 class CreateForwardFn(Protocol):
     """Factory that prepares inputs (OUTSIDE the graph) and returns a
     forward_fn. Called with warmup=True for the warmup pass and warmup=False
@@ -748,6 +777,9 @@ class ModelCudaGraphManager(CudaGraphManager):
                     slot_mapping=slot_mappings,
                     batch_descriptor=batch_descriptor,
                     is_padding=input_buffers.is_padding[:num_tokens],
+                    # FULL graphs replay without a forward context: the fused-
+                    # stage plan taken here is what every replay runs.
+                    fused_batch_descriptor=fused_plan_descriptor(desc, has_lora),
                 ):
                     if cg_mode == CUDAGraphMode.PIECEWISE:
                         # PIECEWISE graph (compiled PW or breakable, chosen inside
@@ -1018,6 +1050,10 @@ def _teardown_profiling_state(runner: "GPUModelRunner") -> None:
     """Release the profiling KV cache and captured graphs while keeping model
     weights, so the real ``initialize_kv_cache`` starts from a clean slate."""
     torch.accelerator.synchronize()
+    # Profiling graphs are already cleared; release the providers' view of the
+    # profiling KV cache before it is freed.
+    if (fused := getattr(runner, "fused_stage_manager", None)) is not None:
+        fused.unbind_caches()
     if hasattr(runner.model_state, "_mamba_ctx"):
         runner.model_state._mamba_ctx = None
     # Invalidate the align-mode Mamba group metadata cached from the

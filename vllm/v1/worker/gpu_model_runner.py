@@ -56,6 +56,7 @@ from vllm.forward_context import (
     BatchDescriptor,
     set_forward_context,
 )
+from vllm.fused_stages.manager import FusedStageManager
 from vllm.logger import init_logger
 from vllm.lora.layers import BaseLayerWithLoRA, LoRAMapping, LoRAMappingType
 from vllm.model_executor.layers.attention import Attention
@@ -890,6 +891,10 @@ class GPUModelRunner(
 
         # Cudagraph dispatcher for runtime cudagraph dispatching.
         self.cudagraph_dispatcher = CudagraphDispatcher(self.vllm_config)
+
+        # Fused-stage providers (mono kernels); created in load_model().
+        self.fused_stage_manager: FusedStageManager | None = None
+        self.fused_plan_descriptor: BatchDescriptor | None = None
 
         self.mm_budget = (
             MultiModalBudget(self.vllm_config, self.mm_registry)
@@ -4007,6 +4012,17 @@ class GPUModelRunner(
                 runtime_mode=str(cudagraph_mode),
             )
 
+        # Fused stages plan on the graph key. An eager step's key carries no
+        # request count, so plan eager steps on the (TP-replicated) batch
+        # shape instead; no graph replays an eager decision.
+        self.fused_plan_descriptor = (
+            batch_descriptor
+            if cudagraph_mode != CUDAGraphMode.NONE
+            else BatchDescriptor(
+                batch_descriptor.num_tokens, num_reqs=num_reqs, uniform=uniform_decode
+            )
+        )
+
         return (
             cudagraph_mode,
             batch_descriptor,
@@ -4404,6 +4420,7 @@ class GPUModelRunner(
                 slot_mapping=slot_mappings,
                 skip_compiled=has_encoder_input,
                 is_padding=is_padding,
+                fused_batch_descriptor=self.fused_plan_descriptor,
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(
@@ -5380,6 +5397,18 @@ class GPUModelRunner(
         ):
             self.eplb_state.start_async_loop()
 
+        # Weights are processed: select fused-stage providers and create their
+        # runtimes now, so their allocations are counted by memory profiling
+        # before the KV cache is sized.
+        if self.fused_stage_manager is not None:
+            self.fused_stage_manager.close()
+        self.fused_stage_manager = FusedStageManager.maybe_create(
+            self.vllm_config,
+            self.get_model(),
+            self.device,
+            self.uniform_decode_query_len,
+        )
+
         if (
             self.vllm_config.compilation_config.mode
             == CompilationMode.STOCK_TORCH_COMPILE
@@ -5584,6 +5613,8 @@ class GPUModelRunner(
 
         self.reset_encoder_cache()
         self.reset_mm_cache()
+        if self.fused_stage_manager is not None:
+            self.fused_stage_manager.rebind_layers()
 
     def _get_prompt_logprobs_dict(
         self,
@@ -6120,6 +6151,11 @@ class GPUModelRunner(
                     ubatch_slices=ubatch_slices_padded,
                     slot_mapping=slot_mappings,
                     is_padding=is_padding,
+                    fused_batch_descriptor=(
+                        batch_desc
+                        if cudagraph_runtime_mode != CUDAGraphMode.NONE
+                        else self.fused_plan_descriptor
+                    ),
                 ),
             ):
                 outputs = self.model(
@@ -6523,6 +6559,11 @@ class GPUModelRunner(
         from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
         from vllm.v1.worker.workspace import reset_workspace_manager
 
+        if self.fused_stage_manager is not None:
+            # Provider buffers are baked into captured graphs: drop the graphs
+            # first, then unbind KV caches (below) and close the providers.
+            CUDAGraphWrapper.clear_all_graphs()
+            BreakableCUDAGraphWrapper.clear_all_graphs()
         # Calls torch.accelerator.synchronize()
         self._cleanup_profiling_kv_cache()
         if current_platform.is_rocm():
@@ -6531,6 +6572,10 @@ class GPUModelRunner(
             CUDAGraphWrapper.clear_all_graphs()
             BreakableCUDAGraphWrapper.clear_all_graphs()
             self.encoder_cudagraph_manager = None
+        if self.fused_stage_manager is not None:
+            # After graph teardown: providers release peer memory last.
+            self.fused_stage_manager.close()
+            self.fused_stage_manager = None
         self.compilation_config.static_forward_context.clear()
         self.model = None  # type: ignore[assignment]
         _ROPE_DICT.clear()
@@ -6543,6 +6588,8 @@ class GPUModelRunner(
 
     def _cleanup_profiling_kv_cache(self) -> None:
         torch.accelerator.synchronize()
+        if self.fused_stage_manager is not None:
+            self.fused_stage_manager.unbind_caches()
         if hasattr(self, "kv_caches") and self.kv_caches:
             for i in range(len(self.kv_caches)):
                 self.kv_caches[i] = None  # type: ignore
@@ -6619,6 +6666,10 @@ class GPUModelRunner(
         saved_num_cudagraph_captured = compilation_counter.num_cudagraph_captured
 
         capture_descs = self.cudagraph_dispatcher.get_capture_descs()
+        # Fused-stage providers JIT-compile and allocate per-shape scratch
+        # here, before the first capture and inside memory profiling.
+        if self.fused_stage_manager is not None:
+            self.fused_stage_manager.warmup(capture_descs)
         # Use a temporary manager for memory profiling. The persistent manager
         # is initialized later so it does not keep profiling-only graph state.
         encoder_cudagraph_manager = self._create_encoder_cudagraph_manager()
@@ -6775,6 +6826,13 @@ class GPUModelRunner(
         compilation_counter.num_gpu_runner_capture_triggers += 1
 
         start_time = time.perf_counter()
+
+        # Fused-stage providers JIT-compile and allocate per-shape scratch for
+        # every key about to be captured (nothing may compile under capture).
+        if self.fused_stage_manager is not None:
+            self.fused_stage_manager.warmup(
+                self.cudagraph_dispatcher.get_capture_descs()
+            )
 
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
@@ -7405,6 +7463,10 @@ class GPUModelRunner(
             kv_transfer_group = get_kv_transfer_group()
             kv_transfer_group.register_kv_caches(kv_caches)
             kv_transfer_group.set_host_xfer_buffer_ops(copy_kv_blocks)
+
+        # Hand the (profiling or real) KV cache to fused-stage providers.
+        if self.fused_stage_manager is not None:
+            self.fused_stage_manager.bind_caches()
 
     def may_add_encoder_only_layers_to_kv_cache_config(self) -> None:
         """Add encoder-only layers to the KV cache config."""

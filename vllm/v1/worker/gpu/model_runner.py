@@ -29,8 +29,9 @@ import torch
 import torch.nn as nn
 
 import vllm.envs as envs
+from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphWrapper
 from vllm.compilation.counter import compilation_counter
-from vllm.compilation.cuda_graph import CUDAGraphStat
+from vllm.compilation.cuda_graph import CUDAGraphStat, CUDAGraphWrapper
 from vllm.compilation.wrapper import compile_model_with_stock_torch
 from vllm.config import VllmConfig
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
@@ -40,6 +41,7 @@ from vllm.distributed.aux_output_connector.worker import (
 )
 from vllm.distributed.parallel_state import get_dcp_group, get_pp_group
 from vllm.forward_context import BatchDescriptor, set_forward_context
+from vllm.fused_stages.manager import FusedStageManager
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
@@ -101,6 +103,8 @@ from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     ModelCudaGraphManager,
+    fused_capture_descs,
+    fused_plan_descriptor,
     has_compiled_submodule,
     make_cudagraph_stats,
 )
@@ -266,6 +270,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.ec_connector = get_ec_connector(vllm_config, self.encoder_cache)
 
         self.num_speculative_steps = vllm_config.num_speculative_tokens
+        # Fused-stage providers (mono kernels); created in load_model().
+        self.fused_stage_manager: FusedStageManager | None = None
         num_prefill_lookahead = max(1, vllm_config.num_prefill_lookahead_tokens)
         use_dense_all_token_ids = (
             self.speculative_config is not None and self.speculative_config.use_ngram()
@@ -408,6 +414,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         self.speculator, self.speculative_config, load_dummy_weights
                     )
         time_after_load = time.perf_counter()
+
+        # Weights are processed: select fused-stage providers and create their
+        # runtimes now, so their allocations are counted by memory profiling
+        # before the KV cache is sized.
+        if self.fused_stage_manager is not None:
+            self.fused_stage_manager.close()
+        self.fused_stage_manager = FusedStageManager.maybe_create(
+            self.vllm_config,
+            self.model,
+            self.device,
+            1 + self.num_speculative_steps,
+        )
 
         self.model_memory_usage = m.consumed_memory
         logger.info(
@@ -790,6 +808,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.model, self.vllm_config, kv_cache_config
                 )
 
+        # Hand the (profiling or real) KV cache to fused-stage providers.
+        if self.fused_stage_manager is not None:
+            self.fused_stage_manager.bind_caches()
+
     def _init_kv_zero_meta(self) -> None:
         """Build KV-block zeroing metadata; invoked from gpu_worker."""
         self.kv_block_zeroer = KVBlockZeroer(
@@ -1048,6 +1070,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return 0
 
         compilation_counter.num_gpu_runner_capture_triggers += 1
+
+        # Fused-stage providers JIT-compile and allocate per-shape scratch for
+        # every key about to be captured (first call is inside memory
+        # profiling; warmup is idempotent per key).
+        if self.fused_stage_manager is not None and capture_decoder:
+            self.fused_stage_manager.warmup(
+                fused_capture_descs(
+                    self.cudagraph_manager, has_lora=self.lora_config is not None
+                )
+            )
 
         start_time = time.perf_counter()
         with freeze_gc_for_cudagraph_capture():
@@ -2016,6 +2048,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 slot_mapping=slot_mappings_by_layer,
                 skip_compiled=skip_compiled,
                 is_padding=input_batch.is_padding,
+                fused_batch_descriptor=fused_plan_descriptor(
+                    batch_desc, has_lora=self.lora_config is not None
+                ),
             ):
                 self.kv_connector.pre_forward(**connector_kwargs)
                 if ubatch_state is not None:
@@ -2350,6 +2385,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.aux_output_connector.close()
         set_offloader(None)
         self.cudagraph_manager = None
+        if self.fused_stage_manager is not None:
+            # Graphs dropped above; providers release peer memory last.
+            CUDAGraphWrapper.clear_all_graphs()
+            BreakableCUDAGraphWrapper.clear_all_graphs()
+            self.fused_stage_manager.unbind_caches()
+            self.fused_stage_manager.close()
+            self.fused_stage_manager = None
         self.fast_prefill = None
         self.pooling_runner = None
         if hasattr(self, "kv_caches"):

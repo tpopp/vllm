@@ -278,6 +278,13 @@ class Worker(WorkerBase):
         torch.accelerator.synchronize()
         free_bytes_before_sleep = torch.accelerator.get_memory_info()[0]
 
+        # Fused-stage runtimes hold state the sleep backend does not walk
+        # (scratch, peer memory); providers that support sleep save it here.
+        if (
+            fused := getattr(self.model_runner, "fused_stage_manager", None)
+        ) is not None:
+            fused.on_sleep(level)
+
         # Save the buffers before level 2 sleep
         if level == 2:
             model = self.model_runner.model
@@ -335,6 +342,13 @@ class Worker(WorkerBase):
                     if name in self._sleep_saved_draft_buffers:
                         buffer.data.copy_(self._sleep_saved_draft_buffers[name].data)
             self._sleep_saved_draft_buffers = {}
+
+        if (
+            fused := getattr(self.model_runner, "fused_stage_manager", None)
+        ) is not None:
+            fused.on_wake()
+            if wake_weights:
+                fused.rebind_layers()
 
         self.synchronize_device()
 
@@ -1591,6 +1605,11 @@ class Worker(WorkerBase):
         # Weight transfer bypasses GPUModelRunner.reload_weights().
         if not self._weight_update_is_draft:
             self.model_runner.reset_lora_state()
+        # ...so fused-stage runtimes are rebound here too (tensors may move).
+        if (
+            fused := getattr(self.model_runner, "fused_stage_manager", None)
+        ) is not None:
+            fused.rebind_layers()
 
     def shutdown(self) -> None:
         gc.unfreeze()
