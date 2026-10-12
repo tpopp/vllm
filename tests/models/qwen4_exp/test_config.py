@@ -155,6 +155,35 @@ def test_qwen4_exp_mtp_remaps_mixed_precision_layer_indices(backend: str) -> Non
 
 
 @spawn_new_process_for_each_test
+@pytest.mark.parametrize("backend", ["amd", "nvidia"])
+def test_qwen4_exp_compute_logits_local_skips_gather(backend: str) -> None:
+    """Batch-sharded sampling needs vocab-local logits from the wrapper too."""
+    model_module = import_module(f"vllm.models.qwen4_exp.{backend}.model")
+    calls: list[tuple[torch.nn.Module, torch.Tensor, bool]] = []
+
+    def logits_processor(
+        lm_head: torch.nn.Module,
+        hidden_states: torch.Tensor,
+        *,
+        skip_gather: bool = False,
+    ) -> torch.Tensor:
+        calls.append((lm_head, hidden_states, skip_gather))
+        return hidden_states + 1
+
+    language_model = object.__new__(model_module.Qwen4ExpForCausalLM)
+    torch.nn.Module.__init__(language_model)
+    language_model.lm_head = torch.nn.Identity()
+    language_model.logits_processor = logits_processor
+    wrapper = object.__new__(model_module.Qwen4ExpForConditionalGeneration)
+    torch.nn.Module.__init__(wrapper)
+    wrapper.language_model = language_model
+    hidden_states = torch.tensor([4.0])
+
+    assert torch.equal(wrapper.compute_logits_local(hidden_states), hidden_states + 1)
+    assert calls == [(language_model.lm_head, hidden_states, True)]
+
+
+@spawn_new_process_for_each_test
 def test_qwen4_exp_amd_mtp_remaps_quark_exclude_list() -> None:
     """Quark excludes name checkpoint MTP layer 0; the draft builds layer 48."""
     from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
