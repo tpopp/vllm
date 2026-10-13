@@ -13,6 +13,7 @@ from vllm.model_executor.layers.mamba.checkpoint import (
     MambaPrefillCheckpointBuilder,
     MambaPrefillCheckpointMetadata,
 )
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -72,6 +73,8 @@ class GDNAttentionMetadata:
 
     num_accepted_tokens: torch.Tensor | None = None  # shape: [batch,]
     uniform_spec_sequence_length: int | None = None  # None for ragged batches
+    # Mixed batch whose spec rows are rows [0, num_spec_decodes).
+    spec_rows_prefix: bool = False
 
     # Pre-computed FLA chunk metadata (avoids GPU->CPU sync in prepare_chunk_indices)
     chunk_indices: torch.Tensor | None = None
@@ -140,6 +143,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         if self.supports_update_block_table:
             # Opts into MRV2's CUDA-only aligned-index precompute.
             self.mamba_aligned_state_indices: torch.Tensor | None = None
+        # ROCm: slice instead of host-mask gather when spec rows lead the batch.
+        self.use_spec_rows_prefix_metadata: bool = (
+            self.use_spec_decode
+            and current_platform.is_rocm()
+            and type(self) is GDNAttentionMetadataBuilder
+        )
 
         self.decode_cudagraph_max_bs: int = (
             self.vllm_config.scheduler_config.max_num_seqs * (self.num_spec + 1)
@@ -284,6 +293,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             )
 
         uniform_spec_sequence_length = None
+        spec_rows_prefix = False
         spec_sequence_masks_cpu: torch.Tensor | None = None
         if not self.use_spec_decode or num_decode_draft_tokens_cpu is None:
             spec_sequence_masks = None
@@ -403,6 +413,37 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 spec_query_start_loc = query_start_loc[: num_spec_decodes + 1]
                 non_spec_query_start_loc = None
                 non_spec_query_start_loc_cpu = None
+            elif self.use_spec_rows_prefix_metadata and bool(
+                spec_sequence_masks_cpu[:num_spec_decodes].all()
+            ):
+                spec_rows_prefix = True
+                num_spec_tokens = int(query_start_loc_cpu[num_spec_decodes])
+                device = query_start_loc.device
+                # Same values (and int64 dtype) as the argsort split below.
+                spec_token_indx = torch.arange(
+                    num_spec_tokens, dtype=torch.int64, device=device
+                )
+                non_spec_token_indx = torch.arange(
+                    num_spec_tokens,
+                    int(query_start_loc_cpu[-1]),
+                    dtype=torch.int64,
+                    device=device,
+                )
+                # Contiguous like the gathers: FLA's spec recurrence ignores
+                # the index stride.
+                spec_state_indices_tensor = block_table_tensor[
+                    :num_spec_decodes, : self.num_spec + 1
+                ].contiguous()
+                non_spec_state_indices_tensor = block_table_tensor[
+                    num_spec_decodes:, 0
+                ].contiguous()
+                spec_query_start_loc = query_start_loc[: num_spec_decodes + 1]
+                non_spec_query_start_loc = (
+                    query_start_loc[num_spec_decodes:] - num_spec_tokens
+                )
+                non_spec_query_start_loc_cpu = (
+                    query_start_loc_cpu[num_spec_decodes:] - num_spec_tokens
+                )
             else:
                 spec_token_masks = torch.repeat_interleave(
                     spec_sequence_masks,
@@ -452,7 +493,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 )
 
             assert num_accepted_tokens is not None
-            if num_prefills == 0 and num_decodes == 0:
+            if (num_prefills == 0 and num_decodes == 0) or spec_rows_prefix:
                 num_accepted_tokens = num_accepted_tokens[:num_spec_decodes]
             else:
                 num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
@@ -505,7 +546,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         if num_prefills > 0:
             context_lens_tensor = m.compute_num_computed_tokens()
             has_initial_state = context_lens_tensor > 0
-            if spec_sequence_masks_cpu is not None:
+            if spec_rows_prefix:
+                has_initial_state = has_initial_state[num_spec_decodes:]
+            elif spec_sequence_masks_cpu is not None:
                 has_initial_state = has_initial_state[~spec_sequence_masks_cpu]
                 assert non_spec_query_start_loc_cpu is not None
             nums_dict, batch_ptr, token_chunk_offset_ptr = (
@@ -623,6 +666,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_token_indx=non_spec_token_indx,
             num_accepted_tokens=num_accepted_tokens,
             uniform_spec_sequence_length=uniform_spec_sequence_length,
+            spec_rows_prefix=spec_rows_prefix,
             nums_dict=nums_dict,
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,
@@ -682,6 +726,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         elif m.num_prefills == 0:
             # Same as build(): padded sequences trail the spec decodes.
             spec_indices = blk_table[: m.num_spec_decodes, : self.num_spec + 1]
+        elif m.spec_rows_prefix:
+            n = m.num_spec_decodes
+            spec_indices = blk_table[:n, : self.num_spec + 1].contiguous()
+            non_spec_indices = prefill_indices = blk_table[n:, 0].contiguous()
         else:
             spec_indices = blk_table[masks, : self.num_spec + 1]
             non_spec_indices = prefill_indices = blk_table[~masks, 0]
