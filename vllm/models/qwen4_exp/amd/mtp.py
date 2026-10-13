@@ -288,6 +288,18 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states"], self.hidden_size * self.hc_count
         )
+        self._enable_kv_only_prefill(vllm_config)
+
+    def _enable_kv_only_prefill(self, vllm_config: VllmConfig) -> None:
+        """Draft step 0 samples one row per request, so prefill rows outside
+        the last ``k + 1`` of each request only need their K/V and indexer
+        key cache writes; their QSA selection and sparse attention are
+        skipped. Draft layer only; the target model is unaffected."""
+        speculative_config = vllm_config.speculative_config
+        assert speculative_config is not None
+        rows_per_request = speculative_config.num_speculative_tokens + 1
+        for attention in self._iter_qsa_attentions():
+            attention.kv_only_prefill_rows_per_request = rows_per_request
 
     def _iter_qsa_attentions(self):
         """Yield MTP attention modules that own a QSA indexer."""

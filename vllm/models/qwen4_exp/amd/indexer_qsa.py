@@ -328,12 +328,45 @@ class QSAIndexer(nn.Module):
         )
         return q, main_outputs
 
+    def _select_rows(
+        self,
+        q: torch.Tensor,
+        metadata: QSAForwardMetadata,
+        out: torch.Tensor | None,
+        rows: torch.Tensor,
+    ) -> torch.Tensor:
+        """Per-row selection for ``rows`` only; other rows of ``out`` keep
+        their contents. Rows are scored independently, so each selected row
+        matches a full-batch call bit-exactly. Duplicate rows are allowed."""
+        from .ops.qsa import qsa_select_paged_tokens
+
+        if out is None:
+            out = torch.empty(
+                (q.shape[0], self.output_width), dtype=torch.int32, device=q.device
+            )
+        selected = qsa_select_paged_tokens(
+            q.index_select(0, rows),
+            self.compressed_key_cache.kv_cache,
+            metadata.block_table,
+            metadata.token_to_req.index_select(0, rows),
+            metadata.logical_positions.index_select(0, rows),
+            metadata.seq_lens,
+            self.token_topk,
+            self.compress_ratio,
+        )
+        out.index_copy_(0, rows, selected)
+        return out
+
     def _select(
         self,
         q: torch.Tensor,
         metadata: QSAForwardMetadata,
         out: torch.Tensor | None,
+        tail_rows: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Select every row, or with ``tail_rows`` only the decode rows
+        ``[0, num_decode_tokens)`` plus ``tail_rows`` (rows of ``out``
+        outside that set are left as they were)."""
         from .ops.qsa import qsa_select_paged_tokens
         from .ops.qsa_uniform_indexer import (
             MAX_UNIFORM_QUERY_LEN,
@@ -346,6 +379,15 @@ class QSAIndexer(nn.Module):
         query_len = metadata.decode_query_len
         num_uniform_rows = metadata.num_decode_tokens
         if not (1 < query_len <= MAX_UNIFORM_QUERY_LEN and num_uniform_rows > 0):
+            if tail_rows is not None:
+                head_rows = torch.arange(
+                    metadata.num_decode_tokens,
+                    dtype=tail_rows.dtype,
+                    device=tail_rows.device,
+                )
+                return self._select_rows(
+                    q, metadata, out, torch.cat((head_rows, tail_rows))
+                )
             return qsa_select_paged_tokens(
                 q,
                 self.compressed_key_cache.kv_cache,
@@ -377,18 +419,20 @@ class QSAIndexer(nn.Module):
             query_len,
             out[uniform_rows],
         )
-        if num_uniform_rows < q.shape[0]:
-            tail_rows = slice(num_uniform_rows, q.shape[0])
+        if tail_rows is not None:
+            self._select_rows(q, metadata, out, tail_rows)
+        elif num_uniform_rows < q.shape[0]:
+            tail = slice(num_uniform_rows, q.shape[0])
             qsa_select_paged_tokens(
-                q[tail_rows],
+                q[tail],
                 self.compressed_key_cache.kv_cache,
                 metadata.block_table,
-                metadata.token_to_req[tail_rows],
-                metadata.logical_positions[tail_rows],
+                metadata.token_to_req[tail],
+                metadata.logical_positions[tail],
                 metadata.seq_lens,
                 self.token_topk,
                 self.compress_ratio,
-                out[tail_rows],
+                out[tail],
             )
         return out
 
@@ -402,8 +446,13 @@ class QSAIndexer(nn.Module):
         qkv: torch.Tensor | None = None,
         slot_mapping: torch.Tensor | None = None,
         gate_out: torch.Tensor | None = None,
+        kept_tail_rows: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
         """Return fixed-width request-relative token indices padded with ``-1``.
+
+        With ``kept_tail_rows``, the caches are still written for every row
+        but only the decode rows and ``kept_tail_rows`` are selected; the
+        other rows of ``out`` are left stale (KV-only MTP draft prefill).
 
         With ``attn.use_fused_qsa_prepare``, the same launch also writes
         ``attn``'s K/V into ``attn.kv_cache`` at ``slot_mapping`` and prepares
@@ -458,7 +507,10 @@ class QSAIndexer(nn.Module):
             if out is None:
                 raise RuntimeError("QSA top-k reuse requires an output buffer")
             return out, main_outputs
-        return self._select(q, compressed_metadata, out), main_outputs
+        return (
+            self._select(q, compressed_metadata, out, kept_tail_rows),
+            main_outputs,
+        )
 
 
 __all__ = ["QSAIndexer", "apply_qsa_rope"]
