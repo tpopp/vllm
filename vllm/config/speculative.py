@@ -83,6 +83,10 @@ SpeculativeMethod = Literal[
 ]
 RejectionSampleMethod = Literal["standard", "synthetic", "block"]
 DraftSampleMethod = Literal["greedy", "probabilistic"]
+DraftMoEOnlineQuant = Literal["mxfp4"]
+
+# Draft architectures that apply `draft_moe_online_quant`.
+_DRAFT_MOE_ONLINE_QUANT_ARCHITECTURES = frozenset({"Qwen4ExpMTP"})
 
 _QWEN3_OMNI_TARGET_ARCHITECTURES = frozenset(
     {
@@ -442,6 +446,12 @@ class SpeculativeConfig:
     index_share_for_mtp_iteration: bool | None = None
     """Override whether MTP iterations reuse the first step's sparse indices.
     If `None`, use the value from the draft model's Hugging Face config."""
+    draft_moe_online_quant: DraftMoEOnlineQuant | None = None
+    """Quantize the draft model's unquantized MoE routed experts at load time
+    with this scheme (e.g. BF16 MTP experts next to an MXFP4 target). The rest
+    of the draft and the target model are unchanged. This changes draft
+    numerics, so check the acceptance rate. Currently supported for
+    method='mtp' with Qwen4Exp on ROCm."""
 
     # Advanced control
     disable_padded_drafter_batch: bool = False
@@ -653,6 +663,9 @@ class SpeculativeConfig:
                     False,
                 )
             )
+        if self.draft_moe_online_quant is not None:
+            # The quantized draft experts change the draft's MoE kernels.
+            factors.append(self.draft_moe_online_quant)
 
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
@@ -1580,6 +1593,9 @@ class SpeculativeConfig:
                 self.index_share_for_mtp_iteration
             )
 
+        if self.draft_moe_online_quant is not None:
+            self._validate_draft_moe_online_quant()
+
         if (
             self.method != "dspark"
             and self.enable_adaptive_verification
@@ -1592,6 +1608,25 @@ class SpeculativeConfig:
             )
 
         return self
+
+    def _validate_draft_moe_online_quant(self) -> None:
+        from vllm.platforms import current_platform
+
+        architectures = (
+            self.draft_model_config.architectures
+            if self.draft_model_config is not None
+            else []
+        )
+        if self.method != "mtp" or not (
+            _DRAFT_MOE_ONLINE_QUANT_ARCHITECTURES.intersection(architectures)
+        ):
+            raise ValueError(
+                "draft_moe_online_quant is only supported with method='mtp' and "
+                f"draft architectures {sorted(_DRAFT_MOE_ONLINE_QUANT_ARCHITECTURES)}"
+                f", got method={self.method!r}, architectures={architectures}."
+            )
+        if not current_platform.is_rocm():
+            raise ValueError("draft_moe_online_quant is only supported on ROCm.")
 
     def _validate_suffix_decoding(self):
         if not has_arctic_inference():
