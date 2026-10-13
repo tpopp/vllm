@@ -154,6 +154,56 @@ def test_qwen4_exp_mtp_remaps_mixed_precision_layer_indices(backend: str) -> Non
     }
 
 
+@spawn_new_process_for_each_test
+def test_qwen4_exp_amd_mtp_remaps_quark_exclude_list() -> None:
+    """Quark excludes name checkpoint MTP layer 0; the draft builds layer 48."""
+    from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
+    from vllm.model_executor.layers.quantization.quark.utils import (
+        should_ignore_layer,
+    )
+    from vllm.models.qwen4_exp.amd import mtp as mtp_module
+
+    exclude = [
+        "lm_head",
+        "model.language_model.layers.0.mlp.gate",
+        "mtp.fc_hidden",
+        "mtp.layers.0.self_attn.qkv_proj",
+        "mtp.layers.0.mlp.experts.0.gate_proj",
+        r"re:mtp\.layers\.0\.mlp\.shared_expert\..*",
+        r"re:mtp\.layers\.\d+\.mlp\.gate",
+        r"re:model\.language_model\.layers\.0\..*",
+    ]
+    quark_config = QuarkConfig({"exclude": exclude})
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(draft_model_config=object())
+    )
+    with (
+        patch.object(mtp_module, "get_draft_quant_config", return_value=quark_config),
+        patch.object(
+            mtp_module, "replace", side_effect=lambda cfg, **_: SimpleNamespace()
+        ),
+    ):
+        draft_config = mtp_module._make_draft_vllm_config(vllm_config, 48)
+
+    remapped = draft_config.quant_config.quant_config["exclude"]
+    assert remapped == [
+        "lm_head",
+        "model.language_model.layers.0.mlp.gate",
+        "mtp.fc_hidden",
+        "mtp.layers.48.self_attn.qkv_proj",
+        "mtp.layers.48.mlp.experts.0.gate_proj",
+        r"re:mtp\.layers\.48\.mlp\.shared_expert\..*",
+        r"re:mtp\.layers\.\d+\.mlp\.gate",
+        r"re:model\.language_model\.layers\.0\..*",
+    ]
+    assert exclude[3] == "mtp.layers.0.self_attn.qkv_proj"
+    assert should_ignore_layer(
+        "mtp.layers.48.mlp.experts", remapped, check_children=True
+    )
+    assert should_ignore_layer("mtp.layers.48.mlp.shared_expert.down_proj", remapped)
+    assert not should_ignore_layer("mtp.layers.48.self_attn.o_proj", remapped)
+
+
 @pytest.mark.parametrize("wrapped_config", [False, True])
 def test_qwen4_exp_mtp_override_sets_draft_config(
     wrapped_config: bool,

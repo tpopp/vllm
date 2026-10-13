@@ -29,6 +29,7 @@ from vllm.model_executor.layers.fused_moe.utils import (
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -73,6 +74,31 @@ def _remap_ignored_layers(
             remapped.append(new_name)
         else:
             remapped.append(name)
+    return remapped
+
+
+def _remap_quark_exclude(
+    exclude: list[str],
+    mtp_start_layer_idx: int,
+) -> list[str]:
+    """Remap Quark ``exclude`` entries, including escaped ``re:`` patterns.
+
+    Only literal layer indices are shifted; index wildcards such as
+    ``re:mtp\\.layers\\.\\d+\\..*`` already match the draft layer names.
+    """
+    remapped: list[str] = []
+    for name in exclude:
+        if name.startswith("re:"):
+            pattern = name.removeprefix("re:")
+            if "mtp" in pattern:
+                pattern = re.sub(
+                    r"(?<=layers\\?\.)\d+(?=\\?\.|$)",
+                    lambda m: str(mtp_start_layer_idx + int(m.group(0))),
+                    pattern,
+                )
+            remapped.append(f"re:{pattern}")
+        else:
+            remapped.extend(_remap_ignored_layers([name], mtp_start_layer_idx))
     return remapped
 
 
@@ -151,6 +177,14 @@ def _make_draft_vllm_config(
                 "quantized_layers",
                 _remap_quantized_layers(quantized_layers, mtp_start_layer_idx),
             )
+        if isinstance(draft_quant_config, QuarkConfig) and (
+            exclude := draft_quant_config.quant_config.get("exclude")
+        ):
+            # Copy rather than mutate: the dict may be shared with the HF config.
+            draft_quant_config.quant_config = {
+                **draft_quant_config.quant_config,
+                "exclude": _remap_quark_exclude(exclude, mtp_start_layer_idx),
+            }
 
     draft_vllm_config = replace(
         vllm_config,
