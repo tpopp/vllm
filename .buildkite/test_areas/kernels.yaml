@@ -968,6 +968,28 @@ steps:
   - pytest -v -s kernels/quantization/test_rocm_mxfp8_linear.py
   - pytest -v -s kernels/quantization/test_rocm_skinny_gemms.py -k wvsplitkrc
 
+- label: ":amd: (MI355 DPX) GDN Spec-Decode Kernels"
+  key: amd-gdn-spec-decode-kernels-mi355
+  dind: false
+  device: mi355_dpx
+  num_devices: 1
+  timeout_in_minutes: 30
+  working_dir: /vllm-workspace/tests
+  depends_on:
+  - image-build-amd
+  source_file_dependencies:
+  - vllm/model_executor/layers/mamba/gdn/
+  - vllm/model_executor/layers/mamba/ops/
+  - vllm/v1/attention/backends/gdn_attn.py
+  - vllm/_aiter_ops.py
+  - vllm/platforms/rocm.py
+  - tests/kernels/mamba/test_gdn_spec_decode_rocm.py
+  - tests/kernels/mamba/test_gdn_spec_mixed_rocm.py
+  - tests/v1/attention/utils.py
+  commands:
+  - pytest -v -s kernels/mamba/test_gdn_spec_decode_rocm.py
+  - pytest -v -s kernels/mamba/test_gdn_spec_mixed_rocm.py
+
 - label: ":amd: (MI355 DPX) FP8 MoE Kernels"
   key: amd-fp8-moe-kernels-mi355
   dind: false

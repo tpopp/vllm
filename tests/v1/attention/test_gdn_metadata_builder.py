@@ -262,6 +262,91 @@ def test_update_block_table_matches_build(
             assert actual.data_ptr() == getattr(dst, field).data_ptr()
 
 
+_SPEC_PREFIX_FIELDS = (
+    "num_prefills",
+    "num_prefill_tokens",
+    "num_decodes",
+    "num_spec_decodes",
+    "num_spec_decode_tokens",
+    "spec_token_indx",
+    "non_spec_token_indx",
+    "spec_state_indices_tensor",
+    "non_spec_state_indices_tensor",
+    "spec_query_start_loc",
+    "non_spec_query_start_loc",
+    "num_accepted_tokens",
+    "has_initial_state",
+    "prefill_query_start_loc",
+    "prefill_state_indices",
+    "prefill_has_initial_state",
+    "chunk_indices",
+    "chunk_offsets",
+    "batch_ptr",
+    "token_chunk_offset_ptr",
+    "nums_dict",
+)
+
+
+@pytest.mark.parametrize(
+    ("seq_lens", "query_lens", "draft_tokens", "prefix"),
+    [
+        pytest.param([80, 96, 70, 9], [4, 4, 70, 9], [3, 3, -1, -1], True, id="mtp"),
+        pytest.param(
+            [80, 96, 77, 65, 200],
+            [2, 4, 1, 1, 130],
+            [1, 3, -1, -1, -1],
+            True,
+            id="ragged-1tok",
+        ),
+        pytest.param([80, 70, 96], [4, 70, 4], [3, -1, 3], False, id="interleaved"),
+        pytest.param([70, 80], [4, 4], [-1, 3], False, id="prefill-first"),
+    ],
+)
+def test_spec_prefix_mixed_metadata_matches_gather(
+    seq_lens, query_lens, draft_tokens, prefix
+):
+    """Sliced spec-prefix metadata equals the bool-mask gather it replaces."""
+    batch = BatchSpec(seq_lens=seq_lens, query_lens=query_lens)
+    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE)
+    num_accepted = torch.tensor(
+        [(i % 4) + 1 for i in range(batch.batch_size)], dtype=torch.int32
+    )
+    metas = []
+    for use_prefix in (False, True):
+        builder = _create_gdn_builder(num_speculative_tokens=3)
+        builder.vllm_config.cache_config.mamba_cache_mode = "none"
+        builder.use_spec_rows_prefix_metadata = use_prefix
+        metas.append(
+            builder.build(
+                0,
+                common,
+                num_accepted_tokens=num_accepted,
+                num_decode_draft_tokens_cpu=torch.tensor(
+                    draft_tokens, dtype=torch.int32
+                ),
+            )
+        )
+    gather, sliced = metas
+    assert not gather.spec_rows_prefix
+    assert sliced.spec_rows_prefix == prefix
+    for field in _SPEC_PREFIX_FIELDS:
+        torch.testing.assert_close(
+            getattr(sliced, field), getattr(gather, field), msg=field
+        )
+
+    dst = _create_gdn_builder(num_speculative_tokens=3)
+    dst.vllm_config.cache_config.mamba_cache_mode = "none"
+    updated = dst.update_block_table(
+        sliced, common.block_table_tensor, common.slot_mapping
+    )
+    for field in (
+        "spec_state_indices_tensor",
+        "non_spec_state_indices_tensor",
+        "prefill_state_indices",
+    ):
+        torch.testing.assert_close(getattr(updated, field), getattr(gather, field))
+
+
 def test_has_initial_state_after_reclassification():
     """After reclassification, num_prefills > 0 so the prefill kernel path
     should compute has_initial_state. For the reclassified request with

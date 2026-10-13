@@ -40,6 +40,12 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from vllm.model_executor.layers.mamba.ops.gdn_spec_decode_rocm import (
+    aiter_gdr_supports_spec_decode,
+    gdn_spec_decode_conv_gdr_aiter,
+    gdn_spec_decode_packed_aiter,
+    gdn_unpack_z_ba,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
 from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
@@ -618,6 +624,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         if self.speculative_config is not None:
             logger.info_once("GDN spec decode kernel: %s", self.gdn_decode_kernel)
+
+        self.enable_rocm_spec_fast_path = (
+            current_platform.is_rocm()
+            and GDN_AITER_TRITON_AVAILABLE
+            and self.speculative_config is not None
+            and not self.gqa_interleaved_layout
+            and aiter_gdr_supports_spec_decode()
+        )
 
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -1324,6 +1338,26 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 attn_metadata=attn_metadata,
             )
 
+        if self.enable_rocm_spec_fast_path and self._is_pure_spec_decode(attn_metadata):
+            return self._forward_core_spec_decode_aiter(
+                qkvz=qkvz,
+                ba=ba,
+                z_out=z_out,
+                core_attn_out=core_attn_out,
+                attn_metadata=attn_metadata,
+            )
+
+        if self.enable_rocm_spec_fast_path and self._is_spec_prefix_mixed(
+            attn_metadata
+        ):
+            return self._forward_core_spec_mixed_aiter(
+                qkvz=qkvz,
+                ba=ba,
+                z_out=z_out,
+                core_attn_out=core_attn_out,
+                attn_metadata=attn_metadata,
+            )
+
         core_attn_out.zero_()
         num_tokens_all = qkvz.shape[0]
         mixed_qkv, z, b, a = self.prepare_gdn_attention_core_inputs(
@@ -1724,6 +1758,187 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             use_qk_l2norm_in_kernel=True,
             core_attn_out=core_attn_out.reshape(-1),
         )
+
+    @staticmethod
+    def _is_pure_spec_decode(attn_metadata: GDNAttentionMetadata) -> bool:
+        return (
+            attn_metadata.spec_sequence_masks is not None
+            and attn_metadata.num_prefills == 0
+            and attn_metadata.num_decodes == 0
+            and attn_metadata.num_spec_decodes > 0
+        )
+
+    def _forward_core_spec_decode_aiter(
+        self,
+        qkvz: torch.Tensor,
+        ba: torch.Tensor,
+        z_out: torch.Tensor,
+        core_attn_out: torch.Tensor,
+        attn_metadata: GDNAttentionMetadata,
+    ):
+        logger.info_once("Using the ROCm GDN spec-decode fast path.")
+        spec_state_indices = attn_metadata.spec_state_indices_tensor
+        spec_query_start_loc = attn_metadata.spec_query_start_loc
+        num_accepted_tokens = attn_metadata.num_accepted_tokens
+        assert spec_state_indices is not None
+        assert spec_query_start_loc is not None
+        assert num_accepted_tokens is not None
+        conv_state = (
+            self.kv_cache[0]
+            if is_conv_state_dim_first()
+            else self.kv_cache[0].transpose(-1, -2)
+        )
+        draft_window: int | None = self.num_spec + 1
+        if attn_metadata.uniform_spec_sequence_length != draft_window:
+            draft_window = None
+        gdn_spec_decode_packed_aiter(
+            qkvz=qkvz,
+            ba=ba,
+            z_out=z_out,
+            core_attn_out=core_attn_out,
+            conv_state=conv_state,
+            conv_weights=self.conv1d.weight.view(
+                self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+            ),
+            conv_bias=self.conv1d.bias,
+            activation=self.activation,
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+            ssm_state=self.kv_cache[1],
+            spec_query_start_loc=spec_query_start_loc,
+            spec_state_indices=spec_state_indices,
+            num_accepted_tokens=num_accepted_tokens,
+            num_spec_decodes=attn_metadata.num_spec_decodes,
+            num_actual_tokens=attn_metadata.num_actual_tokens,
+            key_dim=self.key_dim // self.tp_size,
+            value_dim=self.value_dim // self.tp_size,
+            head_k_dim=self.head_k_dim,
+            head_v_dim=self.head_v_dim,
+            draft_window=draft_window,
+        )
+
+    @staticmethod
+    def _is_spec_prefix_mixed(attn_metadata: GDNAttentionMetadata) -> bool:
+        return (
+            attn_metadata.spec_rows_prefix
+            and attn_metadata.spec_sequence_masks is not None
+            and attn_metadata.num_prefills > 0
+            and attn_metadata.num_decodes == 0
+            and attn_metadata.num_spec_decodes > 0
+        )
+
+    def _forward_core_spec_mixed_aiter(
+        self,
+        qkvz: torch.Tensor,
+        ba: torch.Tensor,
+        z_out: torch.Tensor,
+        core_attn_out: torch.Tensor,
+        attn_metadata: GDNAttentionMetadata,
+    ):
+        """Mixed spec batch whose spec tokens are rows [0, num_spec_tokens).
+
+        Same kernels and state semantics as the generic mixed path, without
+        its token gathers and scatters.
+        """
+        logger.info_once("Using the ROCm GDN mixed spec-decode fast path.")
+        md = attn_metadata
+        num_spec_tokens = md.num_spec_decode_tokens
+        num_tokens = num_spec_tokens + md.num_prefill_tokens
+        key_dim = self.key_dim // self.tp_size
+        value_dim = self.value_dim // self.tp_size
+        qkv_size = 2 * key_dim + value_dim
+        assert num_tokens <= qkvz.shape[0]
+        assert md.spec_state_indices_tensor is not None
+        assert md.spec_query_start_loc is not None
+        assert md.num_accepted_tokens is not None
+        assert md.prefill_state_indices is not None
+        assert md.prefill_has_initial_state is not None
+
+        b, a = gdn_unpack_z_ba(
+            qkvz, ba, z_out, qkv_size, self.num_v_heads // self.tp_size
+        )
+        if num_tokens < core_attn_out.shape[0]:
+            core_attn_out[num_tokens:].zero_()
+
+        conv_state = (
+            self.kv_cache[0]
+            if is_conv_state_dim_first()
+            else self.kv_cache[0].transpose(-1, -2)
+        )
+        ssm_state = self.kv_cache[1]
+        conv_weights = self.conv1d.weight.view(
+            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+        )
+
+        draft_window: int | None = self.num_spec + 1
+        if md.uniform_spec_sequence_length != draft_window:
+            draft_window = None
+        gdn_spec_decode_conv_gdr_aiter(
+            qkv=qkvz[:num_spec_tokens, :qkv_size],
+            b=b[:num_spec_tokens],
+            a=a[:num_spec_tokens],
+            core_attn_out=core_attn_out[:num_spec_tokens],
+            conv_state=conv_state,
+            conv_weights=conv_weights,
+            conv_bias=self.conv1d.bias,
+            activation=self.activation,
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+            ssm_state=ssm_state,
+            spec_query_start_loc=md.spec_query_start_loc,
+            spec_state_indices=md.spec_state_indices_tensor,
+            num_accepted_tokens=md.num_accepted_tokens,
+            num_spec_decodes=md.num_spec_decodes,
+            key_dim=key_dim,
+            value_dim=value_dim,
+            head_k_dim=self.head_k_dim,
+            head_v_dim=self.head_v_dim,
+            draft_window=draft_window,
+        )
+
+        prefill_rows = slice(num_spec_tokens, num_tokens)
+        mixed_qkv = causal_conv1d_fn(
+            qkvz[prefill_rows, :qkv_size].transpose(0, 1),
+            conv_weights,
+            self.conv1d.bias,
+            activation=self.activation,
+            conv_states=conv_state,
+            has_initial_state=md.has_initial_state,
+            cache_indices=md.non_spec_state_indices_tensor,
+            query_start_loc=md.non_spec_query_start_loc,
+            metadata=md,
+        ).transpose(0, 1)
+        query, key, value, g, beta = fused_post_conv_prep(
+            conv_output=mixed_qkv,
+            a=a[prefill_rows],
+            b=b[prefill_rows],
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+            num_k_heads=self.num_k_heads // self.tp_size,
+            head_k_dim=self.head_k_dim,
+            head_v_dim=self.head_v_dim,
+            apply_l2norm=True,
+            output_g_exp=False,
+        )
+        initial_state = ssm_state[md.prefill_state_indices]
+        # masked_fill_ instead of a bool-mask index_put_ (nonzero host sync).
+        initial_state.masked_fill_(~md.prefill_has_initial_state.view(-1, 1, 1, 1), 0)
+        _, last_recurrent_state = self.chunk_gated_delta_rule(
+            q=query.unsqueeze(0),
+            k=key.unsqueeze(0),
+            v=value.unsqueeze(0),
+            g=g.unsqueeze(0),
+            beta=beta.unsqueeze(0),
+            initial_state=initial_state,
+            output_final_state=True,
+            cu_seqlens=md.prefill_query_start_loc,
+            chunk_indices=md.chunk_indices,
+            chunk_offsets=md.chunk_offsets,
+            use_qk_l2norm_in_kernel=False,
+            core_attn_out=core_attn_out[prefill_rows],
+            aiter_prefill_metadata=md.aiter_prefill_metadata,
+        )
+        ssm_state[md.prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
 
     def _forward_core_decode_non_spec(
         self,
