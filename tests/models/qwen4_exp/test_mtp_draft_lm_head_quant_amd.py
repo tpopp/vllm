@@ -64,6 +64,7 @@ def _bare_draft(default_vllm_config, vocab: int, lm_head: _StubLMHead) -> Qwen4E
     torch.nn.Module.__init__(draft)
     draft.logits_processor = LogitsProcessor(vocab)
     draft.lm_head = lm_head
+    draft._mono = None
     return draft
 
 
