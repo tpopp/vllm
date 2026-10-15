@@ -46,6 +46,15 @@ def enabled() -> bool:
     return envs.VLLM_ROCM_MONO_DRAFT and current_platform.is_rocm()
 
 
+def fused_head() -> bool:
+    """Greedy draft tokens from one ``mono.head`` launch when the draft
+    lm_head is an online-MXFP4 copy on the ASM layout
+    (``draft_lm_head_quantization="mxfp4"``)."""
+    from vllm import envs
+
+    return envs.VLLM_ROCM_MONO_DRAFT_HEAD
+
+
 def fused_front() -> bool:
     """The front as one ``mono.front`` launch (else stock ops + ``hc_front``)."""
     from vllm import envs
@@ -63,9 +72,77 @@ class DraftMonoDecode(B.QwenMonoDecode):
     BLOCKS = L.BLOCKS
     MTP = True
 
+    def __init__(self, model, vllm_config):
+        super().__init__(model, vllm_config)
+        self._head = None
+        if not self.ok or not fused_head():
+            return
+        from vllm.distributed import get_tp_group
+        from vllm.models.kimi_k3.amd.mono.common.peer_memory import PeerBuffer
+        from vllm.models.qwen4_exp.amd.mono import head
+
+        dev = self.epoch.device
+        tp = get_tp_group()
+        # its own epoch, scratch and peers: a head also follows draft steps
+        # that ran stock (draft position 0), so it bumps its own epoch
+        self._head = {
+            "epoch": torch.zeros(1, dtype=torch.int32, device=dev),
+            "scratch": {
+                n: torch.zeros(
+                    (head.scratch_bytes(head.HeadBuild(tokens=n, tp=self.tp)) + 255)
+                    // 256
+                    * 256,
+                    dtype=torch.uint8,
+                    device=dev,
+                )
+                for n in self.k1_scratch
+            },
+            "peers": PeerBuffer(
+                head.peer_bytes(self.tp), tp.cpu_group, self.rank, self.tp, dev
+            ),
+        }
+        self._head["peers"].bytes.zero_()
+
     @cached_property
     def lay(self) -> L.Layout:
         return L.Layout(self.tp)
+
+    def head_eligible(self, lm_head, logits_processor, hidden_states) -> bool:
+        """``get_top_tokens`` of at most ``MAX_TOKENS`` rows on the MXFP4
+        draft head (every rank decides alike: shapes and module state)."""
+        if self._head is None or in_piecewise_cudagraph():
+            return False
+        if not 1 <= hidden_states.size(0) <= self.MAX_TOKENS:
+            return False
+        if logits_processor.soft_cap is not None or logits_processor.scale != 1.0:
+            return False
+        return B.asm_mxfp4(lm_head) and lm_head.tp_size == self.tp
+
+    def top_tokens(self, lm_head, hidden_states) -> torch.Tensor:
+        """Greedy draft tokens: ``LogitsProcessor.get_top_tokens``'s result
+        from one ``mono.head`` launch."""
+        from vllm.models.qwen4_exp.amd.mono import head
+
+        s = hidden_states.size(0)
+        hd = self._head
+        hd["epoch"].add_(1)
+        si = lm_head.shard_indices
+        out = torch.empty(s, dtype=torch.int64, device=hidden_states.device)
+        head.draft_head(
+            head.HeadBuild(tokens=s, tp=self.tp, rows=lm_head.weight.size(0)),
+            x=hidden_states.contiguous(),
+            w=lm_head.weight,
+            ws=lm_head.weight_scale,
+            valid=si.org_vocab_end_index - si.org_vocab_start_index,
+            vocab_start=si.org_vocab_start_index,
+            out=out,
+            scratch=hd["scratch"][s],
+            peers=hd["peers"].addresses,
+            rank=self.rank,
+            epoch=hd["epoch"],
+            slot=0,
+        )
+        return out
 
     def probe_prefix(self, model) -> str:
         return model.layers[0].self_attn.layer_name

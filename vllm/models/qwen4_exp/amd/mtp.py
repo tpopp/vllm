@@ -573,6 +573,10 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
     ) -> torch.Tensor:
         """Greedy draft tokens via vocab-parallel local argmax, skipping the
         full-vocab logits all-gather (``use_local_argmax_reduction``)."""
+        if self._mono is not None and self._mono.head_eligible(
+            self.lm_head, self.logits_processor, hidden_states
+        ):
+            return self._mono.top_tokens(self.lm_head, hidden_states)
         return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
