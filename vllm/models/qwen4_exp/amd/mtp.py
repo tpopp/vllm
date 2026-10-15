@@ -589,7 +589,10 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
             self,
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
-        return loader.load_weights(remap_weight_names(), mapper=mapper)
+        loaded = loader.load_weights(remap_weight_names(), mapper=mapper)
+        if self._mono is not None and self._mono.ok:
+            self._mono.prepare_weights()
+        return loaded
 
 
 __all__ = ["Qwen4ExpMTP", "Qwen4ExpMultiTokenPredictor"]

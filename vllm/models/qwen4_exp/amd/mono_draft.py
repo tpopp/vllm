@@ -162,16 +162,21 @@ class DraftMonoDecode(B.QwenMonoDecode):
         why = B.dense_error(layer.layer_idx, dense)
         if why is not None:
             return why
-        # the kernel's down GEMM always reads DOWN_ROWS rows (an injection
-        # group past the low-rank one); the mixer has none, so the pad rows
-        # are zero. _down_out only routes group < INJ_GROUP (rows < LORA) to
-        # the gate-mix that produces bin_out; the injection group's output
-        # (here all zero) only ever reaches inj_out, which this launch
-        # ignores, so the pad cannot perturb bin_out.
-        padded = down.new_zeros(L.DOWN_ROWS, L.HH)
-        padded[: L.LORA].copy_(down)
-        self._mixer_w_down = padded.contiguous()
+        if getattr(self, "_mixer_w_down", None) is None:
+            return "the padded mixer down not built (prepare_weights)"
         return None
+
+    def prepare_weights(self) -> None:
+        """After loading, outside any graph capture: the mixer's down as the
+        kernel reads it. The down GEMM always reads ``DOWN_ROWS`` rows (an
+        injection group past the low-rank one); the mixer has none, so the pad
+        rows are zero. Only groups below ``INJ_GROUP`` reach the gate-mix that
+        produces ``bin_out`` (``hc._down_out``), so the pad cannot perturb it,
+        and this launch's injection output is unused."""
+        down = self.model.hyper_connection_mixer.input_mix_weight_down.weight
+        padded = down.new_zeros(L.DOWN_ROWS, L.HH)
+        padded[: down.size(0)].copy_(down)
+        self._mixer_w_down = padded
 
     def eligible(self, input_ids, intermediate_tensors) -> bool:
         """A pure decode draft step of at most ``MAX_TOKENS`` rows: unlike the
