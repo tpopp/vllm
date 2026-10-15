@@ -468,7 +468,9 @@ class SpeculativeConfig:
     """Use vocab-parallel local argmax instead of all-gathering full logits
     for draft token generation. Reduces communication from O(vocab_size) to
     O(2 * tp_size) per token. Only applies to greedy draft selection in
-    non-tree speculation."""
+    non-tree speculation. Also verifies all-greedy target batches from
+    vocab-parallel argmaxes when the target logits are TP-sharded, skipping
+    the target logits all-gather."""
 
     use_heterogeneous_vocab: bool = False
     """Allow draft and target models to use different vocabularies.
