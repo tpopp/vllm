@@ -159,6 +159,9 @@ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     set_eagle3_aux_hidden_state_layers,
     verify_supports_aux_hidden_states_over_pp,
 )
+from vllm.v1.worker.gpu.spec_decode.greedy_local_argmax import (
+    GreedyLocalArgmaxVerifier,
+)
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
     RejectionSampler,
     get_max_chunk_logits,
@@ -334,6 +337,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # model_state exists (num_new_sampled_tokens_per_step from ModelState).
         self.sampler: Sampler | None = None
         self.rejection_sampler: RejectionSampler | None = None
+        self.greedy_local_verifier: GreedyLocalArgmaxVerifier | None = None
         self.batch_sharder: BatchSharder | None = None
         self.prompt_logprobs_worker: PromptLogprobsWorker | None = None
         self.structured_outputs_worker: StructuredOutputsWorker | None = None
@@ -510,6 +514,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         self.vllm_config.watermark_config
                     ),
                 )
+            self.greedy_local_verifier = GreedyLocalArgmaxVerifier.maybe_create(
+                self.model, self.rejection_sampler, self.speculative_config
+            )
             self.prompt_logprobs_worker = PromptLogprobsWorker(
                 self.max_num_reqs,
                 self.device,
@@ -1590,6 +1597,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         input_batch: InputBatch,
         grammar_output: GrammarOutput | None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
+        if (
+            self.greedy_local_verifier is not None
+            and self.batch_sharder is None
+            and grammar_output is None
+            and self.speculator is not None
+            and self.greedy_local_verifier.can_verify(
+                input_batch, self.speculator.draft_logits
+            )
+        ):
+            # All-greedy verify: all-gather only per-shard argmaxes.
+            greedy_output = self.greedy_local_verifier(
+                hidden_states[input_batch.logits_indices], input_batch
+            )
+            return (
+                greedy_output,
+                greedy_output.num_sampled,
+                greedy_output.num_rejected,
+            )
+
         shard_metadata = None
         global_input_batch = input_batch
         if self.batch_sharder is not None:
