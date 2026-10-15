@@ -157,6 +157,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_MONO_DECODE: bool = False
     VLLM_ROCM_MONO_DRAFT: bool = False
+    VLLM_ROCM_MONO_DRAFT_FRONT: bool = True
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
@@ -1400,6 +1401,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # HC and sparse MoE) on the mono kernels. By default is disabled.
     "VLLM_ROCM_MONO_DRAFT": lambda: (
         os.getenv("VLLM_ROCM_MONO_DRAFT", "False").lower() in ("true", "1")
+    ),
+    # The MTP mono draft step's front as one launch (mono/front.py)
+    "VLLM_ROCM_MONO_DRAFT_FRONT": lambda: (
+        os.getenv("VLLM_ROCM_MONO_DRAFT_FRONT", "1").lower() in ("true", "1")
     ),
     # Whether to use aiter triton kernels for gemm ops.
     # By default is enabled.

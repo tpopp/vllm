@@ -46,6 +46,13 @@ def enabled() -> bool:
     return envs.VLLM_ROCM_MONO_DRAFT and current_platform.is_rocm()
 
 
+def fused_front() -> bool:
+    """The front as one ``mono.front`` launch (else stock ops + ``hc_front``)."""
+    from vllm import envs
+
+    return envs.VLLM_ROCM_MONO_DRAFT_FRONT
+
+
 class DraftMonoDecode(B.QwenMonoDecode):
     """Bound to one ``Qwen4ExpMultiTokenPredictor``; built at model init on
     every rank."""
@@ -177,6 +184,25 @@ class DraftMonoDecode(B.QwenMonoDecode):
         padded = down.new_zeros(L.DOWN_ROWS, L.HH)
         padded[: down.size(0)].copy_(down)
         self._mixer_w_down = padded
+        self._fc = None
+        if fused_front():
+            from vllm.distributed import tensor_model_parallel_all_gather
+
+            model = self.model
+            # every rank's full fc weights: the kernel computes every output
+            # column, so no all-gather runs in the step
+            self._fc = tuple(
+                tensor_model_parallel_all_gather(lin.weight.data, dim=0).contiguous()
+                for lin in (model.fc_embedding, model.fc_hidden)
+            )
+            self.front_scratch = {
+                n: torch.zeros(
+                    (_front_bytes(n, self.tp) + 255) // 256 * 256,
+                    dtype=torch.uint8,
+                    device=self.epoch.device,
+                )
+                for n in self.k1_scratch
+            }
 
     def eligible(self, input_ids, intermediate_tensors) -> bool:
         """A pure decode draft step of at most ``MAX_TOKENS`` rows: unlike the
@@ -209,30 +235,32 @@ class DraftMonoDecode(B.QwenMonoDecode):
         self.first_step(s)
         self.epoch.add_(1)
         layer = self.model.layers[0]
-        state = self._front(input_ids, hidden_states, inputs_embeds)
-
         attn_hc = layer.attn_hyper_connection
-        x = torch.empty(s, L.HIDDEN, dtype=state.dtype, device=state.device)
-        inj = torch.empty(s, L.HC, dtype=state.dtype, device=state.device)
-        k1.hc_front(
-            k1.K1Build(
-                tokens=s,
-                tp=self.tp,
-                self_msq=True,
-                front_only=True,
-                eps=attn_hc.config.rms_norm_eps,
-            ),
-            state=state,
-            msq_in=None,
-            hc_w=attn_hc.hc_norm.weight,
-            w_down=attn_hc.input_mix_weight_down_block_inject.weight,
-            w_up=attn_hc.input_mix_weight_up.weight,
-            inj_out=inj,
-            bin_out=x,
-            scratch=self.k1_scratch[s],
-            epoch=self.epoch,
-            layer=layer.layer_idx,
-        )
+        x = torch.empty(s, L.HIDDEN, dtype=hidden_states.dtype, device=self.epoch.device)
+        inj = torch.empty(s, L.HC, dtype=x.dtype, device=x.device)
+        if self._fc is not None:
+            state = self._fused_front(input_ids, hidden_states, inputs_embeds, x, inj)
+        else:
+            state = self._front(input_ids, hidden_states, inputs_embeds)
+            k1.hc_front(
+                k1.K1Build(
+                    tokens=s,
+                    tp=self.tp,
+                    self_msq=True,
+                    front_only=True,
+                    eps=attn_hc.config.rms_norm_eps,
+                ),
+                state=state,
+                msq_in=None,
+                hc_w=attn_hc.hc_norm.weight,
+                w_down=attn_hc.input_mix_weight_down_block_inject.weight,
+                w_up=attn_hc.input_mix_weight_up.weight,
+                inj_out=inj,
+                bin_out=x,
+                scratch=self.k1_scratch[s],
+                epoch=self.epoch,
+                layer=layer.layer_idx,
+            )
         core, gate = _qsa_core(layer.self_attn, x, positions)
 
         mlp_hc = layer.mlp_hyper_connection
@@ -298,6 +326,44 @@ class DraftMonoDecode(B.QwenMonoDecode):
         )
         return h, state2
 
+    def _fused_front(self, input_ids, hidden_states, inputs_embeds, x, inj):
+        """``mono.front``: the fc projections and the attention HC front in one
+        launch -> ``state`` [S, 4H]; ``x`` / ``inj`` written."""
+        from vllm.models.qwen4_exp.amd.mono import front
+
+        model = self.model
+        layer = model.layers[0]
+        attn_hc = layer.attn_hyper_connection
+        s = x.size(0)
+        if inputs_embeds is None:
+            inputs_embeds = model.embed_input_ids(input_ids)
+        state = torch.empty(s, L.HH, dtype=x.dtype, device=x.device)
+        front.draft_front(
+            front.FrontBuild(
+                tokens=s,
+                tp=self.tp,
+                eps=attn_hc.config.rms_norm_eps,
+                ne_eps=model.pre_fc_norm_embedding.variance_epsilon,
+                nh_eps=model.pre_fc_norm_hidden.variance_epsilon,
+            ),
+            emb=inputs_embeds.contiguous(),
+            prev=hidden_states.contiguous(),
+            w_ne=model.pre_fc_norm_embedding.weight,
+            w_nh=model.pre_fc_norm_hidden.weight,
+            w_fe=self._fc[0],
+            w_fh=self._fc[1],
+            hc_w=attn_hc.hc_norm.weight,
+            w_down=attn_hc.input_mix_weight_down_block_inject.weight,
+            w_up=attn_hc.input_mix_weight_up.weight,
+            state_out=state,
+            bin_out=x,
+            inj_out=inj,
+            scratch=self.front_scratch[s],
+            epoch=self.epoch,
+            slot=layer.layer_idx,
+        )
+        return state
+
     def _front(self, input_ids, hidden_states, inputs_embeds) -> torch.Tensor:
         """``Qwen4ExpMultiTokenPredictor.forward``'s embedding branch, eager:
         embed, the two pre-norms, fc_embedding / fc_hidden, the embedding
@@ -315,3 +381,9 @@ class DraftMonoDecode(B.QwenMonoDecode):
         hidden_states = model.fc_hidden(hidden_states)
         hidden_states = inputs_embeds.unsqueeze(-2) + hidden_states
         return hidden_states.flatten(-2).contiguous()
+
+
+def _front_bytes(s: int, tp: int) -> int:
+    from vllm.models.qwen4_exp.amd.mono import front
+
+    return front.scratch_bytes(front.FrontBuild(tokens=s, tp=tp))
