@@ -464,12 +464,14 @@ class SpeculativeConfig:
     speculative methods. This is an experimental option for measuring the
     acceptance-rate impact of reusing that block. It does not disable the
     speculative drafter itself."""
-    draft_lm_head_quantization: Literal["fp8", "nvfp4"] | None = None
+    draft_lm_head_quantization: Literal["fp8", "nvfp4", "mxfp4"] | None = None
     """Quantize the drafter's copy of a target lm_head it shares (EAGLE and
     MTP). "fp8" uses per-row weight and per-token activation scales on the
     platform's FP8 linear kernel; "nvfp4" is weight-only on the platform's
-    W4A16 kernel. The target verifies with its own head, so only the
-    acceptance length can change. Model Runner V2 only."""
+    W4A16 kernel; "mxfp4" is W4A4 MXFP4 (OCP microscaling, block-32) on
+    AITER's ROCm GEMM and is only supported on ROCm. The target verifies with
+    its own head, so only the acceptance length can change. Model Runner V2
+    only."""
     use_local_argmax_reduction: bool = False
     """Use vocab-parallel local argmax instead of all-gathering full logits
     for draft token generation. Reduces communication from O(vocab_size) to
@@ -1866,6 +1868,15 @@ class SpeculativeConfig:
                     "draft_lm_head_quantization is not supported for method "
                     f"{self.method!r}."
                 )
+            if self.draft_lm_head_quantization == "mxfp4":
+                from vllm.platforms import current_platform
+
+                if not current_platform.is_rocm():
+                    raise ValueError(
+                        "draft_lm_head_quantization='mxfp4' is only supported "
+                        "on ROCm (AITER's MXFP4 GEMM kernel); use 'fp8' or "
+                        "'nvfp4' on other platforms."
+                    )
             draft = self.draft_model_config
             if draft is not None and draft.head_dtype != draft.dtype:
                 raise ValueError(
