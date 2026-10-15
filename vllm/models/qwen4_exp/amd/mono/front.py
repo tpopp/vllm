@@ -279,7 +279,9 @@ def stage_fc(c, g, fe_ops, fh_ops):
 # ---------------------------------------------------------------- F3
 def wait_state(c):
     """Every F2 group's ``sflag``: ``state``'s stores are visible after."""
-    c["poll"]([(c["sflag"], i, 1) for i in range(hc.UP_TASKS)])
+    if c["tid"] < hc.UP_TASKS:
+        c["poll"]([(c["sflag"], c["tid"], 1)])
+    gpu.barrier()
 
 
 def _put_inj(c, t, r, vs):
