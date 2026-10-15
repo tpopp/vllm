@@ -113,6 +113,46 @@ def test_fused_shared_expert_decision_unchanged():
     assert before[0] is False
 
 
+def test_fused_shared_expert_enabled_with_online_quant(monkeypatch):
+    """With FSE requested, the shared expert is targeted alongside the
+    routed experts and the compatibility check passes (``draft_moe_online_quant``
+    set). Without it, nothing about the shared expert changes."""
+    monkeypatch.setattr(
+        mtp.rocm_aiter_ops, "is_fusion_moe_shared_experts_enabled", lambda: True
+    )
+    config = _enable(_quark_config())
+    online = config.online_quantization_config
+
+    for projection in ("gate_up_proj", "down_proj"):
+        prefix = f"{DRAFT_LAYER}.mlp.shared_expert.{projection}"
+        resolved = online.resolve_quant_method_cls(LinearBase, prefix)
+        assert resolved is not None, prefix
+        assert resolved[1] == "mxfp4"
+
+    is_fse_compatible, reason = is_shared_expert_quant_fse_compatible(
+        config, DRAFT_EXPERTS, f"{DRAFT_LAYER}.mlp.shared_expert"
+    )
+    assert is_fse_compatible, reason
+
+    # The target model's shared experts are untouched by the draft's targets.
+    assert (
+        online.resolve_quant_method_cls(
+            LinearBase, "model.layers.3.mlp.shared_expert.down_proj"
+        )
+        is None
+    )
+
+
+def test_fused_shared_expert_disabled_without_fse_env():
+    """Without FSE requested (the default), the shared expert stays untargeted
+    even though ``draft_moe_online_quant`` is set."""
+    config = _enable(_quark_config())
+    online = config.online_quantization_config
+    for projection in ("gate_up_proj", "down_proj"):
+        prefix = f"{DRAFT_LAYER}.mlp.shared_expert.{projection}"
+        assert online.resolve_quant_method_cls(LinearBase, prefix) is None, prefix
+
+
 def test_rejects_unquantized_or_already_online_draft():
     with pytest.raises(ValueError, match="no quantization config"):
         mtp._quantize_draft_experts_online(None, [DRAFT_EXPERTS], "mxfp4")

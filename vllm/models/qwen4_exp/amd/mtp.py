@@ -20,6 +20,7 @@ import torch
 from torch import nn
 from transformers import Qwen4ExpTextConfig
 
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig, replace, set_current_vllm_config
 from vllm.config.speculative import DraftMoEOnlineQuant
@@ -213,6 +214,13 @@ def _quantize_draft_experts_online(
     ``--quantization-config`` does not reach the draft model config, so this
     composes an online ``targets`` config naming only these expert layers onto
     the draft's own quant config. The target model is untouched.
+
+    When AITER fused-shared-expert execution is requested
+    (``VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS``), the shared expert's
+    projections are targeted with the same scheme so it can be fused as
+    expert 512 of the routed experts (see
+    ``is_shared_expert_quant_fse_compatible``); otherwise it is excluded (BF16)
+    like the rest of ``mtp.*`` and FSE stays disabled for the draft.
     """
     if draft_quant_config is None:
         raise ValueError(
@@ -230,8 +238,18 @@ def _quantize_draft_experts_online(
         OnlineQuantizationConfig,
     )
 
+    targets = dict.fromkeys(expert_prefixes, scheme)
+    if rocm_aiter_ops.is_fusion_moe_shared_experts_enabled():
+        targets.update(
+            {
+                f"{prefix.removesuffix('.experts')}.shared_expert.{projection}": scheme
+                for prefix in expert_prefixes
+                for projection in ("gate_up_proj", "down_proj")
+            }
+        )
+
     draft_quant_config.online_quantization_config = OnlineQuantizationConfig(
-        QuantizationConfigArgs(targets=dict.fromkeys(expert_prefixes, scheme))
+        QuantizationConfigArgs(targets=targets)
     )
     logger.info_once(
         "Quantizing the Qwen4Exp MTP draft routed experts (%s) to %s at load time.",

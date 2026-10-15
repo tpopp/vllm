@@ -117,9 +117,24 @@ def is_shared_expert_quant_fse_compatible(
         # - Retrieve routed activation quant key
         # and ensure the online quantization set on shared expert match them.
         if isinstance(quant_config, QuarkConfig):
-            routed_weight_key, routed_activation_key, _ = (
-                quant_config.get_quant_method_target(expert_prefix, RoutedExperts)
+            # The routed experts may themselves be online-quantized (e.g. the
+            # Qwen4Exp MTP draft's online MXFP4 experts, which Quark's static
+            # `get_quant_method_target` would otherwise still report as the
+            # checkpoint's excluded/unquantized scheme). Prefer the online
+            # resolution when the online config targets them too.
+            routed_online = online_quant_config.resolve_quant_method_cls(
+                RoutedExperts, expert_prefix
             )
+            if routed_online is not None:
+                _, _, _, routed_quant_spec, routed_method_cls = routed_online
+                routed_weight_key = routed_quant_spec.weight
+                routed_activation_key = getattr(
+                    routed_method_cls, "activation_quant_key", None
+                )
+            else:
+                routed_weight_key, routed_activation_key, _ = (
+                    quant_config.get_quant_method_target(expert_prefix, RoutedExperts)
+                )
         else:
             reason = (
                 "online quantization FSE compatibility check is not implemented for "
