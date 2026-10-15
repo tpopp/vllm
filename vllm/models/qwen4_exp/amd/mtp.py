@@ -52,6 +52,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.sequence import IntermediateTensors
 
+from . import mono_draft
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
 from .model import (
@@ -488,15 +489,6 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         return loader.load_weights(weights, mapper=mapper)
 
 
-@support_torch_compile(
-    dynamic_arg_dims={
-        "input_ids": 0,
-        "positions": -1,
-        "intermediate_tensors": 0,
-        "inputs_embeds": 0,
-        "hidden_states": 0,
-    }
-)
 class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
@@ -540,6 +532,9 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
         )
         self.set_moe_parameters(self.model.layers)
         enable_qwen4_exp_low_latency_gemm(self, vllm_config.model_config.dtype)
+        self._mono = None
+        if mono_draft.enabled():
+            self._mono = mono_draft.DraftMonoDecode(self.model, vllm_config)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -553,6 +548,12 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | IntermediateTensors:
+        if self._mono is not None and self._mono.eligible(
+            input_ids, intermediate_tensors
+        ):
+            return self._mono.forward(
+                input_ids, positions, hidden_states, inputs_embeds
+            )
         return self.model(
             input_ids,
             positions,
