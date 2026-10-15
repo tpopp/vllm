@@ -163,11 +163,7 @@ class QwenMonoDecode:
             return
         tp = get_tp_group()
         self.tp, self.rank = tp.world_size, tp.rank_in_group
-        self._probe = next(
-            ly.linear_attn.prefix
-            for ly in model.layers
-            if ly.layer_type == "linear_attention"
-        )
+        self._probe = self.probe_prefix(model)
         dev = model.embed_tokens.weight.device
 
         def buf(n: int) -> torch.Tensor:
@@ -240,6 +236,16 @@ class QwenMonoDecode:
     def unsupported(self, model) -> str | None:
         """Why the kernels cannot serve this model variant, else None."""
         raise NotImplementedError
+
+    def probe_prefix(self, model) -> str:
+        """The attention metadata dict key a step's eligibility reads, by
+        default a GDN layer's. A model with no GDN layer (an all-QSA draft)
+        overrides this to a layer whose metadata every step still carries."""
+        return next(
+            ly.linear_attn.prefix
+            for ly in model.layers
+            if ly.layer_type == "linear_attention"
+        )
 
     def buffer_bytes(self):
         """(K1's scratch bytes at a width, K2's, the peer buffer's)."""
