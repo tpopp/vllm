@@ -670,3 +670,279 @@ def test_mixed_width_graph_replay(monkeypatch: pytest.MonkeyPatch) -> None:
     time, on both ranks. Steps of different widths share the peer buffer and
     the epoch; a scratch race between widths shows up as a mismatch."""
     multi_process_parallel(monkeypatch, 2, 1, _replay_worker)
+
+
+# ---------------------------------------------------------------- draft head
+def _lmhead_weights(rank: int, device, v_r: int):
+    """One rank's lm_head shard as vLLM holds it after loading
+    (``Mxfp4OnlineLinearMethod`` on the ASM FP4 GEMM, ``AiterMxfp4LinearKernel
+    (use_asm_gemm=True)``): random fp4x2 / e8m0, through ``_mxfp4_linear``'s
+    shuffle. Returns (raw q, raw scales, w, ws)."""
+    from vllm.models.qwen4_exp.amd.mono.layout import HIDDEN
+
+    gr = torch.Generator(device=device).manual_seed(500 + rank)
+    return _mxfp4_linear(gr, v_r, HIDDEN)
+
+
+def _lmhead_logits(x, q, sc):
+    """fp32-of-bf16-rounded logits of the MXFP4-exact ``x`` (as ``quant_x``
+    quantizes it) against the dequantized shard: what the kernel compares.
+    The matmul itself stays fp32 (``_mxfp4_dequant`` / ``_mxfp4_qdq`` are
+    already fp32); only the final logit is rounded to bf16."""
+    w_ref = _mxfp4_dequant(q, sc)
+    xq = _mxfp4_qdq(x)
+    return F.linear(xq, w_ref).to(bf).float()
+
+
+def _lmhead_reference(x, tp: int, v_r: int, valid: int, device):
+    """The global argmax over every rank's shard (``_lmhead_weights``, the
+    same seeds the worker uses), padding rows (>= ``valid``) excluded:
+    ``torch.argmax``'s tie-break (the lowest index)."""
+    logits = []
+    for r in range(tp):
+        q, sc, _, _ = _lmhead_weights(r, device, v_r)
+        lg = _lmhead_logits(x, q, sc)
+        lg[:, valid:] = float("-inf")
+        logits.append(lg)
+    return torch.argmax(torch.cat(logits, dim=-1), dim=-1)
+
+
+def _reshuffle_lmhead(q, sc):
+    """``_mxfp4_linear``'s shuffle, standalone: raw (q, sc) -> (w, ws). Lets a
+    test plant specific rows in the raw codes, then re-derive the kernel's
+    (shuffled) input from them."""
+    from aiter.ops.shuffle import shuffle_weight
+
+    w = shuffle_weight(q.clone().view(torch.float4_e2m1fn_x2), layout=(16, 16))
+    sm, sn = sc.shape
+    ws = sc.view(sm // 32, 2, 16, sn // 8, 2, 4, 1).permute(0, 3, 5, 2, 4, 1, 6)
+    return w, ws.contiguous().view(sm, sn)
+
+
+@ray.remote(num_gpus=1, max_calls=1)
+def _head_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    tp_size: int,
+    pp_size: int,
+    rank: int,
+    distributed_init_port: str,
+) -> None:
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    device = torch.device(f"cuda:{rank}")
+    torch.accelerator.set_device_index(device)
+    init_test_distributed_environment(tp_size, pp_size, rank, distributed_init_port)
+
+    from vllm.distributed import get_tp_group
+    from vllm.models.kimi_k3.amd.mono.common.peer_memory import PeerBuffer
+    from vllm.models.qwen4_exp.amd.mono import head
+    from vllm.models.qwen4_exp.amd.mono.layout import HIDDEN
+
+    tp = get_tp_group()
+    peers = PeerBuffer(head.peer_bytes(TP), tp.cpu_group, rank, tp_size, device)
+    peers.bytes.zero_()
+    epoch = torch.zeros(1, dtype=torch.int32, device=device)
+    step = 0
+
+    # a padded shard smaller than the real one, a non-16-aligned valid cutoff
+    v_r, valid = 16 * 300 + 32, 16 * 300 + 5
+    vocab_start = rank * v_r
+    q, sc, w, ws = _lmhead_weights(rank, device, v_r)
+
+    for s in (1, 3, 8):
+        step += 1
+        epoch.add_(1)
+        key = head.HeadBuild(tokens=s, tp=TP, rows=v_r)
+        g = torch.Generator(device=device).manual_seed(900 + s)
+        x = _randn(g, s, HIDDEN, scale=0.3)
+        out = torch.full((s,), -1, dtype=torch.int64, device=device)
+        scratch = torch.zeros(head.scratch_bytes(key), dtype=torch.uint8, device=device)
+        head.draft_head(
+            key,
+            x=x,
+            w=w,
+            ws=ws,
+            valid=valid,
+            vocab_start=vocab_start,
+            out=out,
+            scratch=scratch,
+            peers=peers.addresses,
+            rank=rank,
+            epoch=epoch,
+            slot=step,
+        )
+        torch.accelerator.synchronize()
+        want = _lmhead_reference(x, TP, v_r, valid, device)
+        torch.testing.assert_close(out, want, atol=0, rtol=0)
+        outs = [torch.empty_like(out) for _ in range(tp_size)]
+        dist.all_gather(outs, out)
+        assert all(torch.equal(outs[0], o) for o in outs), (s, "ranks disagree")
+
+    # planted ties (the lower of two equal rows must win) and a planted max
+    # in a padding row (must be ignored): token 0 the plant, token 1 ordinary
+    step += 1
+    epoch.add_(1)
+    pv_r, pvalid = 64, 48
+    tie_lo, tie_hi, pad_row = 5, 40, 60
+
+    def _plant(q, sc):
+        """Rows ``tie_lo`` / ``tie_hi`` (two valid rows, column 0): an
+        identical, huge dequantized value -- a guaranteed, decisive tie. Row
+        ``pad_row`` (a padding row, column 0): an even huger value, that must
+        never win. nibble 7 -> e2m1 magnitude 6.0 (``_mxfp4_dequant``'s
+        ``_FP4`` max); column 0 is byte 0's low nibble. The high nibble
+        (column 1) is left random: x is zero there, so it never contributes
+        to the dot product."""
+        for row, code in ((tie_lo, 180), (tie_hi, 180), (pad_row, 220)):
+            q[row, 0] = (q[row, 0] & 0xF0) | 0x7
+            sc[row, 0] = code
+
+    s = 2
+    g = torch.Generator(device=device).manual_seed(901)
+    x = _randn(g, s, HIDDEN, scale=0.3)
+    x[0, 0], x[0, 1:] = 1.0, 0.0
+    pq, psc, _, _ = _lmhead_weights(rank, device, pv_r)
+    if rank == 0:
+        _plant(pq, psc)
+    pw, pws = _reshuffle_lmhead(pq, psc)
+    key = head.HeadBuild(tokens=s, tp=TP, rows=pv_r)
+    out = torch.full((s,), -1, dtype=torch.int64, device=device)
+    scratch = torch.zeros(head.scratch_bytes(key), dtype=torch.uint8, device=device)
+    head.draft_head(
+        key,
+        x=x,
+        w=pw,
+        ws=pws,
+        valid=pvalid,
+        vocab_start=rank * pv_r,
+        out=out,
+        scratch=scratch,
+        peers=peers.addresses,
+        rank=rank,
+        epoch=epoch,
+        slot=step,
+    )
+    torch.accelerator.synchronize()
+    # the reference, reconstructed identically on every rank (the plant
+    # applies to rank 0's shard regardless of which rank computes it here)
+    logits = []
+    for r in range(TP):
+        rq, rsc, _, _ = _lmhead_weights(r, device, pv_r)
+        if r == 0:
+            _plant(rq, rsc)
+        lg = _lmhead_logits(x, rq, rsc)
+        lg[:, pvalid:] = float("-inf")
+        logits.append(lg)
+    want = torch.argmax(torch.cat(logits, dim=-1), dim=-1)
+    # sanity: the plant's own reasoning -- the lower tied row wins token 0,
+    # unperturbed by the (dwarfed) padding row or any ordinary random row
+    assert want[0].item() == tie_lo, want
+    torch.testing.assert_close(out, want, atol=0, rtol=0)
+    outs = [torch.empty_like(out) for _ in range(tp_size)]
+    dist.all_gather(outs, out)
+    assert all(torch.equal(outs[0], o) for o in outs), "ranks disagree (plant)"
+
+    peers.close()
+
+
+@multi_gpu_test(num_gpus=2)
+def test_draft_head_matches_vllm_ops(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``draft_head``'s MXFP4 lm_head GEMV + greedy argmax across the vocab
+    shard and the TP ranks, against a dequantized fp32 reference, at a small
+    padded vocab shard (a non-16-aligned valid cutoff); plus planted ties
+    (the lower index must win) and a planted max in a padding row (must be
+    ignored)."""
+    multi_process_parallel(monkeypatch, 2, 1, _head_worker)
+
+
+@ray.remote(num_gpus=1, max_calls=1)
+def _head_worker_full_vocab(
+    monkeypatch: pytest.MonkeyPatch,
+    tp_size: int,
+    pp_size: int,
+    rank: int,
+    distributed_init_port: str,
+) -> None:
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    device = torch.device(f"cuda:{rank}")
+    torch.accelerator.set_device_index(device)
+    init_test_distributed_environment(tp_size, pp_size, rank, distributed_init_port)
+
+    from vllm.distributed import get_tp_group
+    from vllm.models.kimi_k3.amd.mono.common.peer_memory import PeerBuffer
+    from vllm.models.qwen4_exp.amd.mono import head
+    from vllm.models.qwen4_exp.amd.mono.layout import HIDDEN
+
+    tp = get_tp_group()
+    peers = PeerBuffer(head.peer_bytes(TP), tp.cpu_group, rank, tp_size, device)
+    peers.bytes.zero_()
+    epoch = torch.zeros(1, dtype=torch.int32, device=device)
+
+    v_r = 124160  # Qwen3.8-Flash-Next draft head's real per-rank vocab shard
+    _, _, w, ws = _lmhead_weights(rank, device, v_r)
+    s = 8
+    key = head.HeadBuild(tokens=s, tp=TP, rows=v_r)
+    g = torch.Generator(device=device).manual_seed(902)
+    x = _randn(g, s, HIDDEN, scale=0.3)
+    out = torch.full((s,), -1, dtype=torch.int64, device=device)
+    scratch = torch.zeros(head.scratch_bytes(key), dtype=torch.uint8, device=device)
+    epoch.add_(1)
+    head.draft_head(
+        key,
+        x=x,
+        w=w,
+        ws=ws,
+        valid=v_r,
+        vocab_start=rank * v_r,
+        out=out,
+        scratch=scratch,
+        peers=peers.addresses,
+        rank=rank,
+        epoch=epoch,
+        slot=1,
+    )
+    torch.accelerator.synchronize()
+    want = _lmhead_reference(x, TP, v_r, v_r, device)
+    torch.testing.assert_close(out, want, atol=0, rtol=0)
+
+    # both ranks must keep launching in lockstep (the cross-rank reduce
+    # rendezvous-waits on every rank), so only the timing / print is rank 0's
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    n_iters = 100
+    torch.accelerator.synchronize()
+    if rank == 0:
+        start.record()
+    for _ in range(n_iters):
+        epoch.add_(1)
+        head.draft_head(
+            key,
+            x=x,
+            w=w,
+            ws=ws,
+            valid=v_r,
+            vocab_start=rank * v_r,
+            out=out,
+            scratch=scratch,
+            peers=peers.addresses,
+            rank=rank,
+            epoch=epoch,
+            slot=1,
+        )
+    if rank == 0:
+        end.record()
+    torch.accelerator.synchronize()
+    if rank == 0:
+        us = start.elapsed_time(end) * 1000 / n_iters
+        print(f"draft_head s={s} rows={v_r}: {us:.1f} us/iter")
+    peers.close()
+
+
+@pytest.mark.slow_test
+@multi_gpu_test(num_gpus=2)
+def test_draft_head_matches_vllm_ops_full_vocab(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``draft_head`` at the real Qwen3.8-Flash-Next draft head's per-rank
+    vocab shard (124160 rows, no padding), S = 8; also times 100 iterations
+    (CUDA events) and prints the per-iteration microseconds."""
+    multi_process_parallel(monkeypatch, 2, 1, _head_worker_full_vocab)
