@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import ctypes
+import dataclasses
 import functools
+import importlib
+import inspect
 import os
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
 
 import torch
 import torch.distributed as dist
@@ -43,6 +46,96 @@ MB = 1024 * KB
 
 def _is_fp8_e4m3_tensor(t: torch.Tensor | None) -> bool:
     return t is not None and t.dtype in _FP8_E4M3_DTYPES
+
+
+def _call_aiter(module_path: str, name: str, *args: Any, **kwargs: Any) -> Any:
+    """Call ``name`` from the aiter module at ``module_path``.
+
+    The lazy ``import aiter...`` keeps aiter an optional runtime dependency
+    (not importable on non-ROCm platforms or without aiter installed).
+    """
+    return getattr(importlib.import_module(module_path), name)(*args, **kwargs)
+
+
+_P = ParamSpec("_P")
+_T = TypeVar("_T")
+
+
+def _bind_stub_call(
+    sig: inspect.Signature, args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> inspect.BoundArguments:
+    """Bind a call against a stub's own signature, applying its defaults.
+
+    Shared by `_aiter_passthrough` and `_torch_op_passthrough`: whichever
+    arguments the caller omitted are filled in from the *stub's* declared
+    defaults, since the stub -- not the thing it forwards to -- is what
+    callers and mypy see.
+    """
+    bound = sig.bind(*args, **kwargs)
+    bound.apply_defaults()
+    return bound
+
+
+def _aiter_passthrough(
+    module_path: str, aiter_name: str | None = None
+) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
+    """Turn a stub into a literal 1:1 forward to an aiter function.
+
+    This lists the forwarded call's parameters once -- in the stub's own
+    signature -- instead of once there and again in a hand-written
+    forwarding call. The stub's body (its docstring aside) is never
+    executed; it exists purely for typing and documentation, so callers and
+    mypy still see the real, explicit signature.
+
+    At call time this binds the stub's own declared defaults (see
+    `_bind_stub_call`), then lazily imports ``aiter_name`` (default: the
+    stub's own name) from ``module_path`` via `_call_aiter` and forwards
+    the call unchanged. Only use this for a true 1:1 forward: same
+    parameter names, same order, same defaults as the aiter function being
+    wrapped. If even one parameter needs renaming, reordering, or
+    translating, or the aiter call needs extra fixed arguments, write the
+    method by hand instead. See `_torch_op_passthrough` for the analogous
+    decorator for ops registered via `direct_register_custom_op`.
+    """
+
+    def decorator(stub: Callable[_P, _T]) -> Callable[_P, _T]:
+        name = aiter_name or stub.__name__
+        sig = inspect.signature(stub)
+
+        @functools.wraps(stub)
+        def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _T:
+            bound = _bind_stub_call(sig, args, kwargs)
+            return _call_aiter(module_path, name, *bound.args, **bound.kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+def _torch_op_passthrough(
+    op_name: str | None = None,
+) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
+    """Turn a stub into a literal 1:1 forward to a registered torch.ops.vllm op.
+
+    Same contract and same caveats as `_aiter_passthrough`, but for ops
+    already registered via `direct_register_custom_op` (see
+    `_CUSTOM_OP_SPECS`) rather than a direct aiter call. ``op_name``
+    defaults to the stub's own name, matching how most of these ops are
+    registered.
+    """
+
+    def decorator(stub: Callable[_P, _T]) -> Callable[_P, _T]:
+        name = op_name or stub.__name__
+        sig = inspect.signature(stub)
+
+        @functools.wraps(stub)
+        def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _T:
+            bound = _bind_stub_call(sig, args, kwargs)
+            return getattr(torch.ops.vllm, name)(*bound.args, **bound.kwargs)
+
+        return wrapper
+
+    return decorator
 
 
 def _get_or_create_aiter_qr_rmsnorm_comm(
@@ -199,11 +292,13 @@ def _maybe_promote_torch_hip_runtime() -> None:
 _maybe_promote_torch_hip_runtime()
 
 
+@functools.cache
 def is_aiter_found_and_supported() -> bool:
     """Check if AITER library is available and platform supports it.
 
     Checks: platform (ROCm), device arch is CDNA 3 or better, and library existence.
-    Does NOT check environment variables - that's handled by rocm_aiter_ops.is_enabled().
+    Does NOT check environment variables - that's handled by
+    rocm_aiter_ops.is_enabled().
 
     This function determines if aiter CAN be used, not if it SHOULD be used.
 
@@ -214,6 +309,11 @@ def is_aiter_found_and_supported() -> bool:
 
     This allows explicit backend selection via attention_config to work even when
     VLLM_ROCM_USE_AITER=0, while preventing unwanted JIT warnings for auto-discovery.
+
+    Cached: platform, device arch, and library availability are all fixed for
+    the lifetime of the process, so this is computed once. Tests that need a
+    different answer monkeypatch/patch this name directly rather than relying
+    on re-evaluating the body.
     """
     if current_platform.is_rocm() and IS_AITER_FOUND:
         from vllm.platforms.rocm import get_cdna_version
@@ -222,6 +322,7 @@ def is_aiter_found_and_supported() -> bool:
     return False
 
 
+@functools.cache
 def is_aiter_found_and_supported_on_rdna4() -> bool:
     """RDNA4 (gfx12) analog of `is_aiter_found_and_supported()`.
 
@@ -229,6 +330,7 @@ def is_aiter_found_and_supported_on_rdna4() -> bool:
     `@if_aiter_supported` umbrella; it reports only that aiter's Triton
     kernels are usable here. Like its gfx9 counterpart it checks platform +
     arch + library availability and does not check environment variables.
+    Cached for the same reason as `is_aiter_found_and_supported()`.
     """
     if current_platform.is_rocm() and IS_AITER_FOUND:
         from vllm.platforms.rocm import on_rdna4
@@ -1608,7 +1710,8 @@ def _fused_mla_dual_rms_norm_per_token_quant_impl(
     Backs the ``fused_mla_dual_rms_norm_per_token_quant`` custom op used by the
     MLA FP8 attention fusion when the q latent is quantized *per token* (a single
     ``(M, 1)`` scale). Only the *q* latent is FP8 quantized (it feeds the
-    FP8 ``q_b_proj`` GEMM); the *kv* latent is RMS-normed and consumed by attention as bf16.
+    FP8 ``q_b_proj`` GEMM); the *kv* latent is RMS-normed and consumed by
+    attention as bf16.
     """
     from aiter.ops.fused_qk_rmsnorm_group_quant import (
         fused_qk_rmsnorm_per_token_quant,
@@ -1957,9 +2060,274 @@ def _sync_aiter_situv2_moe_env() -> None:
             os.environ.pop(name, None)
 
 
+# Simple (non-lazy) env-controlled AITER flags: one spot listing which
+# attribute reads which env var, shared by rocm_aiter_ops's class-body
+# initialization and refresh_env_variables() so the two can't drift out of
+# sync (`_MOE_DISPATCH_POLICY` and `_TOPK_SOFTMAX_FUSED_SIGMOID` are lazily
+# cached on first use instead, so they are handled separately).
+_AITER_ENV_FLAG_GETTERS: dict[str, Callable[[], Any]] = {
+    "_AITER_ENABLED": lambda: envs.VLLM_ROCM_USE_AITER,
+    "_CUSTOM_ALL_REDUCE_ENABLED": lambda: envs.VLLM_ROCM_USE_AITER_CUSTOM_AR,
+    "_LINEAR_ENABLED": lambda: envs.VLLM_ROCM_USE_AITER_LINEAR,
+    "_FMOE_ENABLED": lambda: envs.VLLM_ROCM_USE_AITER_MOE,
+    "_MLA_ENABLED": lambda: envs.VLLM_ROCM_USE_AITER_MLA,
+    "_MHA_ENABLED": lambda: envs.VLLM_ROCM_USE_AITER_MHA,
+    "_SHUFFLE_KV_CACHE_ENABLED": lambda: envs.VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT,
+    "_TRITON_UNIFIED_ATTN_ENABLED": lambda: envs.VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION,
+    # TODO: Consolidate under _LINEAR_ENABLED
+    "_FP8BMM_ENABLED": lambda: envs.VLLM_ROCM_USE_AITER_FP8BMM,
+    "_FP4BMM_ENABLED": lambda: envs.VLLM_ROCM_USE_AITER_FP4BMM,
+    "_LINEAR_HIPBMM_ENABLED": lambda: envs.VLLM_ROCM_USE_AITER_LINEAR_HIPBMM,
+    # TODO: Consolidate under _LINEAR_ENABLED
+    "_FP4_GEMM_DYNAMIC_QUANT_ASM": lambda: envs.VLLM_ROCM_USE_AITER_FP4_ASM_GEMM,
+    # TODO: Consolidate under VLLM_ROCM_USE_AITER_ROPE
+    "_TRITON_ROTARY_EMBED": lambda: envs.VLLM_ROCM_USE_AITER_TRITON_ROPE,
+    "_TRITON_SPARSE_MLA": lambda: envs.VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA,
+    "_MOE_SHARED_EXPERTS_ENABLED": (
+        lambda: envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS
+    ),
+    "_MOE_SITUV2": _resolve_situv2_activation,
+    # TODO: Consolidate under _LINEAR_ENABLED
+    "_TRITON_UNQUANT_GEMM": lambda: envs.VLLM_ROCM_USE_AITER_TRITON_GEMM,
+}
+
+
 _GFX950_C4A_AITER_MAX_COMPRESSED_SEQ_LEN = 64 * 1024
 _GFX950_C4A_NATIVE_MAX_ROWS = 256
 _GFX950_DSV4_NATIVE_MAX_COLUMNS = 1024 * 1024
+
+
+@dataclasses.dataclass(frozen=True)
+class _CustomOpSpec:
+    """One `direct_register_custom_op()` call, as data.
+
+    `use_dispatch_key` is a flag rather than the resolved
+    `current_platform.dispatch_key` itself so the dispatch key is only ever
+    read when `register_ops_once()` actually runs (same timing as before
+    this was a table), not when this module-level tuple is built.
+    """
+
+    op_name: str
+    op_func: Callable
+    mutates_args: list[str] | None = None
+    fake_impl: Callable | None = None
+    use_dispatch_key: bool = False
+
+
+# All ops `register_ops_once()` registers when aiter is found and supported
+# (CDNA3+ or RDNA4). The gfx11/gfx950-without-aiter-support early-exit branch
+# in `register_ops_once()` registers `rocm_aiter_sparse_attn_indexer` on its
+# own and is not part of this table.
+_CUSTOM_OP_SPECS: tuple[_CustomOpSpec, ...] = (
+    _CustomOpSpec(
+        "rocm_aiter_asm_moe_tkw1",
+        _rocm_aiter_asm_moe_tkw1_impl,
+        mutates_args=[],
+        fake_impl=_rocm_aiter_asm_moe_tkw1_fake,
+        use_dispatch_key=True,
+    ),
+    _CustomOpSpec(
+        "rocm_aiter_fused_moe",
+        _rocm_aiter_fused_moe_impl,
+        mutates_args=[],
+        fake_impl=_rocm_aiter_fused_moe_fake,
+        use_dispatch_key=True,
+    ),
+    _CustomOpSpec(
+        "rocm_aiter_topk_softmax",
+        _rocm_aiter_topk_softmax_impl,
+        mutates_args=["topk_weights", "topk_indices", "token_expert_indices"],
+        use_dispatch_key=True,
+    ),
+    _CustomOpSpec(
+        "rocm_aiter_topk_sigmoid",
+        _rocm_aiter_topk_sigmoid_impl,
+        mutates_args=["topk_weights", "topk_indices"],
+        use_dispatch_key=True,
+    ),
+    _CustomOpSpec(
+        "rocm_aiter_biased_grouped_topk",
+        _rocm_aiter_biased_grouped_topk_impl,
+        mutates_args=["topk_weights", "topk_ids"],
+        use_dispatch_key=True,
+    ),
+    _CustomOpSpec(
+        "rocm_aiter_grouped_topk",
+        _rocm_aiter_grouped_topk_impl,
+        mutates_args=["topk_weights", "topk_ids"],
+        use_dispatch_key=True,
+    ),
+    _CustomOpSpec(
+        "rocm_aiter_fused_topk",
+        _rocm_aiter_fused_topk_impl,
+        mutates_args=[],
+        fake_impl=_rocm_aiter_fused_topk_fake,
+        use_dispatch_key=True,
+    ),
+    _CustomOpSpec(
+        "rocm_aiter_gather_kv_b_proj",
+        _rocm_aiter_gather_kv_b_proj_impl,
+        mutates_args=["k", "v"],
+        fake_impl=_rocm_aiter_gather_kv_b_proj_fake,
+        use_dispatch_key=True,
+    ),
+    _CustomOpSpec(
+        "rocm_aiter_mla_decode_fwd",
+        _rocm_aiter_mla_decode_fwd_impl,
+        mutates_args=["o"],
+    ),
+    _CustomOpSpec(
+        "rocm_aiter_mla_decode_fwd_lse",
+        _rocm_aiter_mla_decode_fwd_lse_impl,
+        mutates_args=["o"],
+        fake_impl=_rocm_aiter_mla_decode_fwd_lse_fake,
+    ),
+    _CustomOpSpec(
+        "rocm_aiter_w8a8_gemm",
+        _rocm_aiter_w8a8_gemm_impl,
+        fake_impl=_rocm_aiter_w8a8_gemm_fake,
+    ),
+    _CustomOpSpec(
+        "_rocm_aiter_preshuffled_per_token_w8a8_gemm",
+        _rocm_aiter_preshuffled_per_token_w8a8_gemm_impl,
+        fake_impl=_rocm_aiter_preshuffled_per_token_w8a8_gemm_fake,
+    ),
+    _CustomOpSpec(
+        "rocm_aiter_hipb_mm_fp8",
+        _rocm_aiter_hipb_mm_fp8_impl,
+        fake_impl=_rocm_aiter_hipb_mm_fp8_fake,
+    ),
+    _CustomOpSpec(
+        "rocm_aiter_triton_gemm_a8w8_blockscale",
+        _rocm_aiter_triton_gemm_a8w8_blockscale_impl,
+        fake_impl=_rocm_aiter_triton_gemm_a8w8_blockscale_fake,
+    ),
+    _CustomOpSpec(
+        "rocm_aiter_gemm_a8w8_blockscale",
+        _rocm_aiter_gemm_a8w8_blockscale_impl,
+        fake_impl=_rocm_aiter_gemm_a8w8_blockscale_fake,
+    ),
+    _CustomOpSpec(
+        "rocm_aiter_gemm_a8w8_blockscale_bpreshuffle",
+        _rocm_aiter_gemm_a8w8_blockscale_bpreshuffle_impl,
+        fake_impl=_rocm_aiter_gemm_a8w8_blockscale_bpreshuffle_fake,
+    ),
+    _CustomOpSpec(
+        "rocm_aiter_rmsnorm_fused_dynamic_quant",
+        _rocm_aiter_rmsnorm_fused_dynamic_quant_impl,
+        fake_impl=_rocm_aiter_rmsnorm_fused_dynamic_quant_fake,
+        use_dispatch_key=True,
+    ),
+    _CustomOpSpec(
+        "rocm_aiter_rmsnorm_fused_add_dynamic_quant",
+        _rocm_aiter_rmsnorm_fused_add_dynamic_quant_impl,
+        fake_impl=_rocm_aiter_rmsnorm_fused_add_dynamic_quant_fake,
+        use_dispatch_key=True,
+    ),
+    _CustomOpSpec(
+        "rocm_aiter_rmsnorm_fp8_group_quant",
+        _rocm_aiter_rmsnorm_fp8_group_quant_impl,
+        fake_impl=_rocm_aiter_rmsnorm_fp8_group_quant_fake,
+    ),
+    _CustomOpSpec(
+        "rocm_aiter_fused_rms_gated_fp8_group_quant",
+        _rocm_aiter_fused_rms_gated_fp8_group_quant_impl,
+        fake_impl=_rocm_aiter_fused_rms_gated_fp8_group_quant_fake,
+    ),
+    _CustomOpSpec(
+        "rocm_aiter_rmsnorm_with_add_fp8_group_quant",
+        _rocm_aiter_rmsnorm_with_add_fp8_group_quant_impl,
+        fake_impl=_rocm_aiter_rmsnorm_with_add_fp8_group_quant_fake,
+    ),
+    _CustomOpSpec(
+        "rocm_aiter_act_mul_and_fp8_group_quant",
+        _rocm_aiter_act_mul_and_fp8_group_quant_impl,
+        fake_impl=_rocm_aiter_act_mul_and_fp8_group_quant_fake,
+    ),
+    _CustomOpSpec(
+        "rocm_aiter_triton_add_rmsnorm_pad",
+        _rocm_aiter_triton_add_rmsnorm_pad_impl,
+        fake_impl=_rocm_aiter_triton_add_rmsnorm_pad_fake,
+        use_dispatch_key=True,
+    ),
+    _CustomOpSpec(
+        "rocm_aiter_group_fp8_quant",
+        _rocm_aiter_group_fp8_quant_impl,
+        fake_impl=_rocm_aiter_group_fp8_quant_fake,
+    ),
+    _CustomOpSpec(
+        "rocm_aiter_per_tensor_quant",
+        _rocm_aiter_per_tensor_quant_impl,
+        mutates_args=["out", "scale"],
+        use_dispatch_key=True,
+    ),
+    _CustomOpSpec(
+        "rocm_aiter_per_token_quant",
+        _rocm_aiter_per_token_quant_impl,
+        fake_impl=_rocm_aiter_per_token_quant_fake,
+        use_dispatch_key=True,
+    ),
+    _CustomOpSpec(
+        "rocm_aiter_sparse_attn_indexer",
+        rocm_aiter_sparse_attn_indexer,
+        mutates_args=["topk_indices_buffer", "candidate_blocks"],
+        fake_impl=rocm_aiter_sparse_attn_indexer_fake,
+        use_dispatch_key=True,
+    ),
+    _CustomOpSpec(
+        "aiter_fp8_attn_wrapper",
+        _rocm_aiter_fp8_attn_impl,
+        mutates_args=[],
+        fake_impl=_rocm_aiter_fp8_attn_fake,
+        use_dispatch_key=True,
+    ),
+    _CustomOpSpec(
+        "rocm_aiter_gemm_a8wfp4",
+        _rocm_aiter_gemm_a8wfp4_impl,
+        mutates_args=[],
+        fake_impl=_rocm_aiter_gemm_a8wfp4_fake,
+        use_dispatch_key=True,
+    ),
+    _CustomOpSpec(
+        "rocm_aiter_triton_rotary_embedding",
+        _triton_rotary_embedding_impl,
+        # query and key are modified in-place.
+        mutates_args=["query", "key"],
+    ),
+    _CustomOpSpec(
+        "rocm_aiter_fused_allreduce_rmsnorm",
+        _rocm_aiter_fused_allreduce_rmsnorm_impl,
+        fake_impl=_rocm_aiter_fused_allreduce_rmsnorm_fake,
+    ),
+    _CustomOpSpec(
+        "rocm_aiter_fused_allreduce_rmsnorm_quant_per_group",
+        _rocm_aiter_fused_allreduce_rmsnorm_quant_per_group_impl,
+        fake_impl=_rocm_aiter_fused_allreduce_rmsnorm_quant_per_group_fake,
+    ),
+    _CustomOpSpec(
+        "rocm_aiter_fused_allreduce_rmsnorm_quant_per_group_with_bf16_norm",
+        _rocm_aiter_fused_allreduce_rmsnorm_quant_per_group_with_bf16_norm_impl,
+        fake_impl=_rocm_aiter_fused_allreduce_rmsnorm_quant_per_group_with_bf16_norm_fake,  # noqa: E501
+    ),
+    _CustomOpSpec(
+        "fused_mla_dual_rms_norm",
+        _fused_mla_dual_rms_norm_impl,
+        mutates_args=[],
+        fake_impl=_fused_mla_dual_rms_norm_fake,
+    ),
+    _CustomOpSpec(
+        "fused_mla_dual_rms_norm_per_token_quant",
+        _fused_mla_dual_rms_norm_per_token_quant_impl,
+        mutates_args=[],
+        fake_impl=_fused_mla_dual_rms_norm_per_token_quant_fake,
+    ),
+    _CustomOpSpec(
+        "fused_mla_dual_rms_norm_group_quant",
+        _fused_mla_dual_rms_norm_group_quant_impl,
+        mutates_args=[],
+        fake_impl=_fused_mla_dual_rms_norm_group_quant_fake,
+    ),
+)
 
 
 class rocm_aiter_ops:
@@ -1995,7 +2363,8 @@ class rocm_aiter_ops:
         so you can't change the environment variables after the module is imported.
         This is done out of performance consideration. Accessing environment variables
         is expensive as described in issue https://github.com/vllm-project/vllm/issues/17067
-        so we don't want to do it repeatedly, especially in the hot path (the forward pass).
+        so we don't want to do it repeatedly, especially in the hot path (the forward
+        pass).
         You can call the refresh_env_variables() function to reload the env variables
         after monkey patching the env variables in the unit test.
 
@@ -2039,33 +2408,47 @@ class rocm_aiter_ops:
             cls._MOE_DISPATCH_POLICY = envs.VLLM_ROCM_AITER_MOE_DISPATCH_POLICY
         return cls._MOE_DISPATCH_POLICY
 
-    # Check if the env variable is set
-    _AITER_ENABLED = envs.VLLM_ROCM_USE_AITER
     # Chunk length the AITER FlyDSL K5 prefill kernels are compiled for.
     GDN_FLYDSL_CHUNK_SIZE = 64
-    _CUSTOM_ALL_REDUCE_ENABLED = envs.VLLM_ROCM_USE_AITER_CUSTOM_AR
-    _LINEAR_ENABLED = envs.VLLM_ROCM_USE_AITER_LINEAR
-    _FMOE_ENABLED = envs.VLLM_ROCM_USE_AITER_MOE
-    _MLA_ENABLED = envs.VLLM_ROCM_USE_AITER_MLA
-    _MHA_ENABLED = envs.VLLM_ROCM_USE_AITER_MHA
-    _SHUFFLE_KV_CACHE_ENABLED = envs.VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT
-    _TRITON_UNIFIED_ATTN_ENABLED = envs.VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION
-    # TODO: Consolidate under _LINEAR_ENABLED
-    _FP8BMM_ENABLED = envs.VLLM_ROCM_USE_AITER_FP8BMM
-    _FP4BMM_ENABLED = envs.VLLM_ROCM_USE_AITER_FP4BMM
-    _LINEAR_HIPBMM_ENABLED = envs.VLLM_ROCM_USE_AITER_LINEAR_HIPBMM
-    # TODO: Consolidate under _LINEAR_ENABLED
-    _FP4_GEMM_DYNAMIC_QUANT_ASM = envs.VLLM_ROCM_USE_AITER_FP4_ASM_GEMM
-    # TODO: Consolidate under VLLM_ROCM_USE_AITER_ROPE
-    _TRITON_ROTARY_EMBED = envs.VLLM_ROCM_USE_AITER_TRITON_ROPE
-    _TRITON_SPARSE_MLA = envs.VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA
-    _MOE_SHARED_EXPERTS_ENABLED = envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS
-    _MOE_SITUV2 = _resolve_situv2_activation()
-    # TODO: Consolidate under _LINEAR_ENABLED
-    _TRITON_UNQUANT_GEMM = envs.VLLM_ROCM_USE_AITER_TRITON_GEMM
+
+    # Simple env-controlled flags, populated by `_init_env_flags()` right
+    # after this class is defined and again by `refresh_env_variables()`.
+    # See `_AITER_ENV_FLAG_GETTERS` for which attribute reads which env var.
+    _AITER_ENABLED: bool
+    _CUSTOM_ALL_REDUCE_ENABLED: bool
+    _LINEAR_ENABLED: bool
+    _FMOE_ENABLED: bool
+    _MLA_ENABLED: bool
+    _MHA_ENABLED: bool
+    _SHUFFLE_KV_CACHE_ENABLED: bool
+    _TRITON_UNIFIED_ATTN_ENABLED: bool
+    _FP8BMM_ENABLED: bool
+    _FP4BMM_ENABLED: bool
+    _LINEAR_HIPBMM_ENABLED: bool
+    _FP4_GEMM_DYNAMIC_QUANT_ASM: bool
+    _TRITON_ROTARY_EMBED: bool
+    _TRITON_SPARSE_MLA: bool
+    _MOE_SHARED_EXPERTS_ENABLED: bool
+    _MOE_SITUV2: str
+    _TRITON_UNQUANT_GEMM: bool
+
     # Lazily probed: whether aiter.topk_softmax supports the
     # num_shared_experts / shared_expert_scoring_func args (7-arg form).
     _TOPK_SOFTMAX_FUSED_SIGMOID: bool | None = None
+
+    @classmethod
+    def _init_env_flags(cls) -> None:
+        """(Re)populate the simple env-controlled flags.
+
+        Shared by class creation (called once right after this class's
+        body, below) and `refresh_env_variables()`, so the two can't drift
+        out of sync. `_MOE_DISPATCH_POLICY` and `_TOPK_SOFTMAX_FUSED_SIGMOID`
+        are handled separately since they are lazily cached on first use
+        rather than read eagerly here.
+        """
+        for attr, getter in _AITER_ENV_FLAG_GETTERS.items():
+            setattr(cls, attr, getter())
+        _sync_aiter_situv2_moe_env()
 
     @classmethod
     def refresh_env_variables(cls):
@@ -2075,29 +2458,13 @@ class rocm_aiter_ops:
         for example, after monkey patching the env variables in the unit test,
         you can call this function to reload the env variables.
         """
-        cls._AITER_ENABLED = envs.VLLM_ROCM_USE_AITER
-        cls._CUSTOM_ALL_REDUCE_ENABLED = envs.VLLM_ROCM_USE_AITER_CUSTOM_AR
-        cls._LINEAR_ENABLED = envs.VLLM_ROCM_USE_AITER_LINEAR
-        cls._FMOE_ENABLED = envs.VLLM_ROCM_USE_AITER_MOE
-        cls._MLA_ENABLED = envs.VLLM_ROCM_USE_AITER_MLA
-        cls._MHA_ENABLED = envs.VLLM_ROCM_USE_AITER_MHA
-        cls._SHUFFLE_KV_CACHE_ENABLED = envs.VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT
-        cls._TRITON_UNIFIED_ATTN_ENABLED = envs.VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION
-        cls._FP8BMM_ENABLED = envs.VLLM_ROCM_USE_AITER_FP8BMM
-        cls._FP4BMM_ENABLED = envs.VLLM_ROCM_USE_AITER_FP4BMM
-        cls._LINEAR_HIPBMM_ENABLED = envs.VLLM_ROCM_USE_AITER_LINEAR_HIPBMM
-        cls._FP4_GEMM_DYNAMIC_QUANT_ASM = envs.VLLM_ROCM_USE_AITER_FP4_ASM_GEMM
-        cls._TRITON_ROTARY_EMBED = envs.VLLM_ROCM_USE_AITER_TRITON_ROPE
-        cls._TRITON_SPARSE_MLA = envs.VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA
-        cls._MOE_SHARED_EXPERTS_ENABLED = envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS
-        cls._MOE_SITUV2 = _resolve_situv2_activation()
-        _sync_aiter_situv2_moe_env()
-        cls._TRITON_UNQUANT_GEMM = envs.VLLM_ROCM_USE_AITER_TRITON_GEMM
+        cls._init_env_flags()
         cls._MOE_DISPATCH_POLICY = envs.VLLM_ROCM_AITER_MOE_DISPATCH_POLICY
 
     @staticmethod
     def get_aiter_activation_type(activation_str: str) -> "ActivationType | None":
-        """Given an activation type as a string, returns the corresponding aiter ActivationType enum.
+        """Given an activation type as a string, returns the corresponding
+        aiter ActivationType enum.
         Supported activation types: "no", "none", "silu", "gelu", "swiglu".
         Returns None if the mapping fails.
 
@@ -2130,8 +2497,10 @@ class rocm_aiter_ops:
 
     @staticmethod
     def get_aiter_quant_type(quant_type_str: str) -> "QuantType | None":
-        """Given a quantization type as a string, returns the corresponding aiter QuantType enum.
-        Supported quantization types: "no", "per_tensor", "per_token", "per_1x32", "per_1x128", "per_128x128".
+        """Given a quantization type as a string, returns the corresponding
+        aiter QuantType enum.
+        Supported quantization types: "no", "per_tensor", "per_token",
+        "per_1x32", "per_1x128", "per_128x128".
         Returns None if the mapping fails.
 
         Args:
@@ -2427,7 +2796,8 @@ class rocm_aiter_ops:
     def is_fp4bmm_enabled(cls) -> bool:
         from vllm.platforms.rocm import get_cdna_version
 
-        # TODO GFX1250: Enable for cdna 4+ when aiter supports batched_gemm_a16wfp4 on gfx1250
+        # TODO GFX1250: Enable for cdna 4+ when aiter supports
+        # batched_gemm_a16wfp4 on gfx1250
         return cls._AITER_ENABLED and cls._FP4BMM_ENABLED and get_cdna_version() == 4
 
     @classmethod
@@ -2827,249 +3197,16 @@ class rocm_aiter_ops:
             return
 
         if not _OPS_REGISTERED:
-            # register all the custom ops here
-            direct_register_custom_op(
-                op_name="rocm_aiter_asm_moe_tkw1",
-                op_func=_rocm_aiter_asm_moe_tkw1_impl,
-                mutates_args=[],
-                fake_impl=_rocm_aiter_asm_moe_tkw1_fake,
-                dispatch_key=current_platform.dispatch_key,
-            )
-
-            direct_register_custom_op(
-                op_name="rocm_aiter_fused_moe",
-                op_func=_rocm_aiter_fused_moe_impl,
-                mutates_args=[],
-                fake_impl=_rocm_aiter_fused_moe_fake,
-                dispatch_key=current_platform.dispatch_key,
-            )
-
-            direct_register_custom_op(
-                op_name="rocm_aiter_topk_softmax",
-                op_func=_rocm_aiter_topk_softmax_impl,
-                mutates_args=["topk_weights", "topk_indices", "token_expert_indices"],
-                dispatch_key=current_platform.dispatch_key,
-            )
-
-            direct_register_custom_op(
-                op_name="rocm_aiter_topk_sigmoid",
-                op_func=_rocm_aiter_topk_sigmoid_impl,
-                mutates_args=["topk_weights", "topk_indices"],
-                dispatch_key=current_platform.dispatch_key,
-            )
-
-            direct_register_custom_op(
-                op_name="rocm_aiter_biased_grouped_topk",
-                op_func=_rocm_aiter_biased_grouped_topk_impl,
-                mutates_args=["topk_weights", "topk_ids"],
-                dispatch_key=current_platform.dispatch_key,
-            )
-
-            direct_register_custom_op(
-                op_name="rocm_aiter_grouped_topk",
-                op_func=_rocm_aiter_grouped_topk_impl,
-                mutates_args=["topk_weights", "topk_ids"],
-                dispatch_key=current_platform.dispatch_key,
-            )
-
-            direct_register_custom_op(
-                op_name="rocm_aiter_fused_topk",
-                op_func=_rocm_aiter_fused_topk_impl,
-                mutates_args=[],
-                fake_impl=_rocm_aiter_fused_topk_fake,
-                dispatch_key=current_platform.dispatch_key,
-            )
-
-            direct_register_custom_op(
-                op_name="rocm_aiter_gather_kv_b_proj",
-                op_func=_rocm_aiter_gather_kv_b_proj_impl,
-                mutates_args=["k", "v"],
-                fake_impl=_rocm_aiter_gather_kv_b_proj_fake,
-                dispatch_key=current_platform.dispatch_key,
-            )
-            direct_register_custom_op(
-                op_name="rocm_aiter_mla_decode_fwd",
-                op_func=_rocm_aiter_mla_decode_fwd_impl,
-                mutates_args=["o"],
-            )
-
-            direct_register_custom_op(
-                op_name="rocm_aiter_mla_decode_fwd_lse",
-                op_func=_rocm_aiter_mla_decode_fwd_lse_impl,
-                mutates_args=["o"],
-                fake_impl=_rocm_aiter_mla_decode_fwd_lse_fake,
-            )
-
-            direct_register_custom_op(
-                op_name="rocm_aiter_w8a8_gemm",
-                op_func=_rocm_aiter_w8a8_gemm_impl,
-                fake_impl=_rocm_aiter_w8a8_gemm_fake,
-            )
-
-            direct_register_custom_op(
-                op_name="_rocm_aiter_preshuffled_per_token_w8a8_gemm",
-                op_func=_rocm_aiter_preshuffled_per_token_w8a8_gemm_impl,
-                fake_impl=_rocm_aiter_preshuffled_per_token_w8a8_gemm_fake,
-            )
-
-            direct_register_custom_op(
-                op_name="rocm_aiter_hipb_mm_fp8",
-                op_func=_rocm_aiter_hipb_mm_fp8_impl,
-                fake_impl=_rocm_aiter_hipb_mm_fp8_fake,
-            )
-
-            direct_register_custom_op(
-                op_name="rocm_aiter_triton_gemm_a8w8_blockscale",
-                op_func=_rocm_aiter_triton_gemm_a8w8_blockscale_impl,
-                fake_impl=_rocm_aiter_triton_gemm_a8w8_blockscale_fake,
-            )
-
-            direct_register_custom_op(
-                op_name="rocm_aiter_gemm_a8w8_blockscale",
-                op_func=_rocm_aiter_gemm_a8w8_blockscale_impl,
-                fake_impl=_rocm_aiter_gemm_a8w8_blockscale_fake,
-            )
-
-            direct_register_custom_op(
-                op_name="rocm_aiter_gemm_a8w8_blockscale_bpreshuffle",
-                op_func=_rocm_aiter_gemm_a8w8_blockscale_bpreshuffle_impl,
-                fake_impl=_rocm_aiter_gemm_a8w8_blockscale_bpreshuffle_fake,
-            )
-
-            direct_register_custom_op(
-                op_name="rocm_aiter_rmsnorm_fused_dynamic_quant",
-                op_func=_rocm_aiter_rmsnorm_fused_dynamic_quant_impl,
-                fake_impl=_rocm_aiter_rmsnorm_fused_dynamic_quant_fake,
-                dispatch_key=current_platform.dispatch_key,
-            )
-
-            direct_register_custom_op(
-                op_name="rocm_aiter_rmsnorm_fused_add_dynamic_quant",
-                op_func=_rocm_aiter_rmsnorm_fused_add_dynamic_quant_impl,
-                fake_impl=_rocm_aiter_rmsnorm_fused_add_dynamic_quant_fake,
-                dispatch_key=current_platform.dispatch_key,
-            )
-
-            direct_register_custom_op(
-                op_name="rocm_aiter_rmsnorm_fp8_group_quant",
-                op_func=_rocm_aiter_rmsnorm_fp8_group_quant_impl,
-                fake_impl=_rocm_aiter_rmsnorm_fp8_group_quant_fake,
-            )
-
-            direct_register_custom_op(
-                op_name="rocm_aiter_fused_rms_gated_fp8_group_quant",
-                op_func=_rocm_aiter_fused_rms_gated_fp8_group_quant_impl,
-                fake_impl=_rocm_aiter_fused_rms_gated_fp8_group_quant_fake,
-            )
-
-            direct_register_custom_op(
-                op_name="rocm_aiter_rmsnorm_with_add_fp8_group_quant",
-                op_func=_rocm_aiter_rmsnorm_with_add_fp8_group_quant_impl,
-                fake_impl=_rocm_aiter_rmsnorm_with_add_fp8_group_quant_fake,
-            )
-
-            direct_register_custom_op(
-                op_name="rocm_aiter_act_mul_and_fp8_group_quant",
-                op_func=_rocm_aiter_act_mul_and_fp8_group_quant_impl,
-                fake_impl=_rocm_aiter_act_mul_and_fp8_group_quant_fake,
-            )
-
-            direct_register_custom_op(
-                op_name="rocm_aiter_triton_add_rmsnorm_pad",
-                op_func=_rocm_aiter_triton_add_rmsnorm_pad_impl,
-                fake_impl=_rocm_aiter_triton_add_rmsnorm_pad_fake,
-                dispatch_key=current_platform.dispatch_key,
-            )
-
-            direct_register_custom_op(
-                op_name="rocm_aiter_group_fp8_quant",
-                op_func=_rocm_aiter_group_fp8_quant_impl,
-                fake_impl=_rocm_aiter_group_fp8_quant_fake,
-            )
-
-            direct_register_custom_op(
-                op_name="rocm_aiter_per_tensor_quant",
-                op_func=_rocm_aiter_per_tensor_quant_impl,
-                mutates_args=["out", "scale"],
-                dispatch_key=current_platform.dispatch_key,
-            )
-
-            direct_register_custom_op(
-                op_name="rocm_aiter_per_token_quant",
-                op_func=_rocm_aiter_per_token_quant_impl,
-                fake_impl=_rocm_aiter_per_token_quant_fake,
-                dispatch_key=current_platform.dispatch_key,
-            )
-
-            direct_register_custom_op(
-                op_name="rocm_aiter_sparse_attn_indexer",
-                op_func=rocm_aiter_sparse_attn_indexer,
-                mutates_args=["topk_indices_buffer", "candidate_blocks"],
-                fake_impl=rocm_aiter_sparse_attn_indexer_fake,
-                dispatch_key=current_platform.dispatch_key,
-            )
-
-            direct_register_custom_op(
-                op_name="aiter_fp8_attn_wrapper",
-                op_func=_rocm_aiter_fp8_attn_impl,
-                mutates_args=[],
-                fake_impl=_rocm_aiter_fp8_attn_fake,
-                dispatch_key=current_platform.dispatch_key,
-            )
-
-            direct_register_custom_op(
-                op_name="rocm_aiter_gemm_a8wfp4",
-                op_func=_rocm_aiter_gemm_a8wfp4_impl,
-                mutates_args=[],
-                fake_impl=_rocm_aiter_gemm_a8wfp4_fake,
-                dispatch_key=current_platform.dispatch_key,
-            )
-
-            # Register rocm aiter rotary embedding custom op
-            direct_register_custom_op(
-                op_name="rocm_aiter_triton_rotary_embedding",
-                op_func=_triton_rotary_embedding_impl,
-                mutates_args=["query", "key"],  # These tensors are modified in-place
-            )
-
-            direct_register_custom_op(
-                op_name="rocm_aiter_fused_allreduce_rmsnorm",
-                op_func=_rocm_aiter_fused_allreduce_rmsnorm_impl,
-                fake_impl=_rocm_aiter_fused_allreduce_rmsnorm_fake,
-            )
-
-            direct_register_custom_op(
-                op_name="rocm_aiter_fused_allreduce_rmsnorm_quant_per_group",
-                op_func=(_rocm_aiter_fused_allreduce_rmsnorm_quant_per_group_impl),
-                fake_impl=(_rocm_aiter_fused_allreduce_rmsnorm_quant_per_group_fake),
-            )
-
-            direct_register_custom_op(
-                op_name="rocm_aiter_fused_allreduce_rmsnorm_quant_per_group_with_bf16_norm",  # noqa: E501
-                op_func=_rocm_aiter_fused_allreduce_rmsnorm_quant_per_group_with_bf16_norm_impl,  # noqa: E501
-                fake_impl=_rocm_aiter_fused_allreduce_rmsnorm_quant_per_group_with_bf16_norm_fake,  # noqa: E501
-            )
-
-            direct_register_custom_op(
-                op_name="fused_mla_dual_rms_norm",
-                op_func=_fused_mla_dual_rms_norm_impl,
-                mutates_args=[],
-                fake_impl=_fused_mla_dual_rms_norm_fake,
-            )
-
-            direct_register_custom_op(
-                op_name="fused_mla_dual_rms_norm_per_token_quant",
-                op_func=_fused_mla_dual_rms_norm_per_token_quant_impl,
-                mutates_args=[],
-                fake_impl=_fused_mla_dual_rms_norm_per_token_quant_fake,
-            )
-
-            direct_register_custom_op(
-                op_name="fused_mla_dual_rms_norm_group_quant",
-                op_func=_fused_mla_dual_rms_norm_group_quant_impl,
-                mutates_args=[],
-                fake_impl=_fused_mla_dual_rms_norm_group_quant_fake,
-            )
+            for spec in _CUSTOM_OP_SPECS:
+                direct_register_custom_op(
+                    op_name=spec.op_name,
+                    op_func=spec.op_func,
+                    mutates_args=spec.mutates_args,
+                    fake_impl=spec.fake_impl,
+                    dispatch_key=(
+                        current_platform.dispatch_key if spec.use_dispatch_key else None
+                    ),
+                )
 
             _OPS_REGISTERED = True
 
@@ -3162,15 +3299,13 @@ class rocm_aiter_ops:
         return torch.ops.vllm.fused_mla_dual_rms_norm_group_quant.default
 
     @staticmethod
+    @_aiter_passthrough("aiter")
     def rms_norm(
         x: torch.Tensor,
         weight: torch.Tensor,
         epsilon: float,
     ) -> torch.Tensor:
         """RMSNorm via AITER kernel."""
-        import aiter
-
-        return aiter.rms_norm(x, weight, epsilon)
 
     @staticmethod
     def rms_norm2d_with_add(
@@ -3191,6 +3326,7 @@ class rocm_aiter_ops:
         return out, residual_out
 
     @staticmethod
+    @_torch_op_passthrough("rocm_aiter_w8a8_gemm")
     def w8a8_gemm(
         A: torch.Tensor,
         B: torch.Tensor,
@@ -3198,10 +3334,10 @@ class rocm_aiter_ops:
         Bs: torch.Tensor,
         bias: torch.Tensor | None = None,
         output_dtype: torch.dtype = torch.float16,
-    ) -> torch.Tensor:
-        return torch.ops.vllm.rocm_aiter_w8a8_gemm(A, B, As, Bs, bias, output_dtype)
+    ) -> torch.Tensor: ...
 
     @staticmethod
+    @_torch_op_passthrough("_rocm_aiter_preshuffled_per_token_w8a8_gemm")
     def preshuffled_per_token_w8a8_gemm(
         A: torch.Tensor,
         B: torch.Tensor,
@@ -3209,12 +3345,10 @@ class rocm_aiter_ops:
         Bs: torch.Tensor,
         bias: torch.Tensor | None = None,
         output_dtype: torch.dtype = torch.float16,
-    ) -> torch.Tensor:
-        return torch.ops.vllm._rocm_aiter_preshuffled_per_token_w8a8_gemm(
-            A, B, As, Bs, bias, output_dtype
-        )
+    ) -> torch.Tensor: ...
 
     @staticmethod
+    @_torch_op_passthrough("rocm_aiter_hipb_mm_fp8")
     def hipb_mm_fp8(
         A: torch.Tensor,
         B: torch.Tensor,
@@ -3222,8 +3356,7 @@ class rocm_aiter_ops:
         Bs: torch.Tensor,
         bias: torch.Tensor | None = None,
         output_dtype: torch.dtype = torch.bfloat16,
-    ) -> torch.Tensor:
-        return torch.ops.vllm.rocm_aiter_hipb_mm_fp8(A, B, As, Bs, bias, output_dtype)
+    ) -> torch.Tensor: ...
 
     @staticmethod
     def triton_gemm_a8w8_blockscale(
@@ -3252,18 +3385,17 @@ class rocm_aiter_ops:
         )
 
     @staticmethod
+    @_torch_op_passthrough("rocm_aiter_gemm_a8w8_blockscale_bpreshuffle")
     def gemm_a8w8_blockscale_bpreshuffle(
         A: torch.Tensor,
         B: torch.Tensor,
         As: torch.Tensor,
         Bs: torch.Tensor,
         output_dtype: torch.dtype = torch.float16,
-    ) -> torch.Tensor:
-        return torch.ops.vllm.rocm_aiter_gemm_a8w8_blockscale_bpreshuffle(
-            A, B, As, Bs, output_dtype
-        )
+    ) -> torch.Tensor: ...
 
     @staticmethod
+    @_torch_op_passthrough("rocm_aiter_fused_moe")
     def fused_moe(
         hidden_states: torch.Tensor,
         w1: torch.Tensor,
@@ -3295,41 +3427,10 @@ class rocm_aiter_ops:
         shared_w2_scale: torch.Tensor | None = None,
         shared_expert_id: int = -1,
         q_dtype_a: torch.dtype | None = None,
-    ) -> torch.Tensor:
-        return torch.ops.vllm.rocm_aiter_fused_moe(
-            hidden_states,
-            w1,
-            w2,
-            topk_weight,
-            topk_ids,
-            expert_mask,
-            activation_method,
-            quant_method,
-            doweight_stage1,
-            w1_scale,
-            w2_scale,
-            a1_scale,
-            a2_scale,
-            num_local_tokens,
-            output_dtype,
-            hidden_pad,
-            intermediate_pad,
-            gate_mode,
-            bias1,
-            bias2,
-            moe_sorting_dispatch_policy,
-            swiglu_limit,
-            beta,
-            linear_beta,
-            shared_w1,
-            shared_w2,
-            shared_w1_scale,
-            shared_w2_scale,
-            shared_expert_id,
-            q_dtype_a,
-        )
+    ) -> torch.Tensor: ...
 
     @staticmethod
+    @_torch_op_passthrough("rocm_aiter_asm_moe_tkw1")
     def asm_moe_tkw1(
         hidden_states: torch.Tensor,
         w1: torch.Tensor,
@@ -3344,22 +3445,7 @@ class rocm_aiter_ops:
         per_tensor_quant_scale: torch.Tensor | None = None,
         expert_mask: torch.Tensor | None = None,
         activation_method: int = 0,
-    ) -> torch.Tensor:
-        return torch.ops.vllm.rocm_aiter_asm_moe_tkw1(
-            hidden_states,
-            w1,
-            w2,
-            topk_weights,
-            topk_ids,
-            fc1_scale,
-            fc2_scale,
-            fc1_smooth_scale,
-            fc2_smooth_scale,
-            a16,
-            per_tensor_quant_scale,
-            expert_mask,
-            activation_method,
-        )
+    ) -> torch.Tensor: ...
 
     @staticmethod
     def topk_softmax(
@@ -3442,13 +3528,13 @@ class rocm_aiter_ops:
         )
 
     @staticmethod
+    @_torch_op_passthrough("rocm_aiter_fused_topk")
     def fused_topk(
         x: torch.Tensor,
         router_logits: torch.Tensor,
         top_k: int,
         gate_up: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return torch.ops.vllm.rocm_aiter_fused_topk(x, router_logits, top_k, gate_up)
+    ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
     @staticmethod
     def triton_sparse_mla_fwd(
@@ -3605,24 +3691,22 @@ class rocm_aiter_ops:
         return out, scale
 
     @staticmethod
+    @_torch_op_passthrough("rocm_aiter_per_token_quant")
     def per_token_quant(
         x: torch.Tensor,
         quant_dtype: torch.dtype,
         scale: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return torch.ops.vllm.rocm_aiter_per_token_quant(x, quant_dtype, scale)
+    ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
     @staticmethod
+    @_torch_op_passthrough("rocm_aiter_gemm_a8wfp4")
     def gemm_a8wfp4(
         x: torch.Tensor,
         w: torch.Tensor,
         x_scales: torch.Tensor,
         w_scales: torch.Tensor,
         out_dtype: torch.dtype,
-    ) -> torch.Tensor:
-        return torch.ops.vllm.rocm_aiter_gemm_a8wfp4(
-            x, w, x_scales, w_scales, out_dtype
-        )
+    ) -> torch.Tensor: ...
 
     @staticmethod
     def triton_fp4_gemm_dynamic_quant(
@@ -3928,10 +4012,12 @@ class rocm_aiter_ops:
         prequant: bool | None = False,
         y_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # ruff: noqa: E501 # isort: skip
-        from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
-
-        return batched_gemm_a16wfp4(
+        # Not a pure 1:1 forward (Y -> aiter's y), so this can't use
+        # @_aiter_passthrough; still routed through _call_aiter so the
+        # lazy import stays in one place.
+        return _call_aiter(
+            "aiter.ops.triton.batched_gemm_a16wfp4",
+            "batched_gemm_a16wfp4",
             X,
             W,
             w_scale,
@@ -3942,6 +4028,10 @@ class rocm_aiter_ops:
         )
 
     @staticmethod
+    @_aiter_passthrough(
+        "aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant",  # noqa: E501
+        "batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant",
+    )
     def triton_fp8_bmm(
         X: torch.Tensor,
         WQ: torch.Tensor,
@@ -3953,24 +4043,7 @@ class rocm_aiter_ops:
         YQ: torch.Tensor | None = None,
         transpose_bm: bool | None = False,
         config: dict | None = None,
-    ) -> torch.Tensor:
-        # ruff: noqa: E501 # isort: skip
-        from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
-            batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as aiter_triton_fp8_bmm,
-        )
-
-        return aiter_triton_fp8_bmm(
-            X,
-            WQ,
-            w_scale,
-            group_size=group_size,
-            bias=bias,
-            dtype=dtype,
-            splitK=splitK,
-            YQ=YQ,
-            transpose_bm=transpose_bm,
-            config=config,
-        )
+    ) -> torch.Tensor: ...
 
     @staticmethod
     def group_fp8_quant(
@@ -4021,14 +4094,13 @@ class rocm_aiter_ops:
         return _ck_gemm_shape_is_tuned(N, K, q_dtype_w, "AITER_CONFIG_GEMM_A8W8_FILE")
 
     @staticmethod
+    @_aiter_passthrough("aiter.ops.shuffle")
     def shuffle_weight(
         tensor: torch.Tensor, layout: tuple[int, int] = (16, 16)
-    ) -> torch.Tensor:
-        from aiter.ops.shuffle import shuffle_weight
-
-        return shuffle_weight(tensor, layout=layout)
+    ) -> torch.Tensor: ...
 
     @staticmethod
+    @_aiter_passthrough("aiter.ops.shuffle")
     def shuffle_weight_a16w4(
         tensor: "torch.Tensor",
         nLane: int,
@@ -4045,11 +4117,9 @@ class rocm_aiter_ops:
             torch.Tensor: The shuffled tensor.
 
         """
-        from aiter.ops.shuffle import shuffle_weight_a16w4
-
-        return shuffle_weight_a16w4(tensor, nLane, gate_up)
 
     @staticmethod
+    @_aiter_passthrough("aiter.ops.shuffle")
     def shuffle_scale_a16w4(
         tensor: "torch.Tensor",
         num_experts: int,
@@ -4066,16 +4136,11 @@ class rocm_aiter_ops:
             torch.Tensor: The shuffled scale tensor.
 
         """
-        from aiter.ops.shuffle import shuffle_scale_a16w4
-
-        return shuffle_scale_a16w4(tensor, num_experts, gate_up)
 
     @staticmethod
+    @_aiter_passthrough("aiter.ops.shuffle")
     def shuffle_scale(tensor: torch.Tensor) -> torch.Tensor:
         """Shuffle a non-gate/up E8M0 scale tensor for AITER."""
-        from aiter.ops.shuffle import shuffle_scale
-
-        return shuffle_scale(tensor)
 
     @staticmethod
     def shuffle_weights(
@@ -4126,6 +4191,7 @@ class rocm_aiter_ops:
         return w13, w2, w13_scale, w2_scale
 
     @staticmethod
+    @_aiter_passthrough("aiter")
     def flash_attn_varlen_func(
         q: torch.Tensor,
         k: torch.Tensor,
@@ -4149,31 +4215,10 @@ class rocm_aiter_ops:
         This function is NOT wrapped with @is_aiter_supported decorator
         to allow explicit backend selection via attention_config to work
         even when VLLM_ROCM_USE_AITER=0.
-
-        Note: This performs lazy import of aiter.flash_attn_varlen_func
         """
-        from aiter import flash_attn_varlen_func
-
-        return flash_attn_varlen_func(
-            q=q,
-            k=k,
-            v=v,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            min_seqlen_q=min_seqlen_q,
-            dropout_p=dropout_p,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            window_size=window_size,
-            alibi_slopes=alibi_slopes,
-            return_lse=return_lse,
-            out=out,
-            sink_ptr=sink_ptr,
-        )
 
     @staticmethod
+    @_torch_op_passthrough("aiter_fp8_attn_wrapper")
     def fp8_attn_wrapper(
         q: torch.Tensor,
         k: torch.Tensor,
@@ -4186,22 +4231,10 @@ class rocm_aiter_ops:
         scale: float | None = None,
         cu_seqlens: torch.Tensor | None = None,
         max_seqlen: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        return torch.ops.vllm.aiter_fp8_attn_wrapper(
-            q,
-            k,
-            v,
-            q_descale,
-            k_descale,
-            v_descale,
-            batch_size,
-            output_dtype,
-            scale,
-            cu_seqlens,
-            max_seqlen,
-        )
+    ) -> torch.Tensor: ...
 
     @staticmethod
+    @_aiter_passthrough("aiter")
     def pa_fwd_asm(
         Q: torch.Tensor,
         K: torch.Tensor,
@@ -4218,24 +4251,10 @@ class rocm_aiter_ops:
         This function is NOT wrapped with @is_aiter_supported decorator
         to allow explicit backend selection via attention_config to work
         even when VLLM_ROCM_USE_AITER=0.
-
-        Note: This performs lazy import of aiter.pa_fwd_asm
         """
-        from aiter import pa_fwd_asm
-
-        return pa_fwd_asm(
-            Q=Q,
-            K=K,
-            V=V,
-            block_tables=block_tables,
-            context_lens=context_lens,
-            block_tables_stride0=block_tables_stride0,
-            K_QScale=K_QScale,
-            V_QScale=V_QScale,
-            out_=out_,
-        )
 
     @staticmethod
+    @_aiter_passthrough("aiter")
     def paged_attention_common(
         Q: torch.Tensor,
         K: torch.Tensor,
@@ -4260,30 +4279,7 @@ class rocm_aiter_ops:
         This function is NOT wrapped with @is_aiter_supported decorator
         to allow explicit backend selection via attention_config to work
         even when VLLM_ROCM_USE_AITER=0.
-
-        Note: This performs lazy import of aiter.paged_attention_common
         """
-        from aiter import paged_attention_common
-
-        return paged_attention_common(
-            Q=Q,
-            K=K,
-            V=V,
-            tmp_out=tmp_out,
-            max_logits=max_logits,
-            exp_sums=exp_sums,
-            max_seq_len=max_seq_len,
-            block_tables=block_tables,
-            context_lens=context_lens,
-            block_tables_stride0=block_tables_stride0,
-            scale=scale,
-            K_QScale_hip=K_QScale_hip,
-            V_QScale_hip=V_QScale_hip,
-            K_QScale_asm=K_QScale_asm,
-            V_QScale_asm=V_QScale_asm,
-            out_=out_,
-            kv_cache_dtype=kv_cache_dtype,
-        )
 
     @staticmethod
     def mhc_pre(
@@ -4779,5 +4775,5 @@ class rocm_aiter_ops:
         )
 
 
+rocm_aiter_ops._init_env_flags()
 rocm_aiter_ops.register_ops_once()
-_sync_aiter_situv2_moe_env()
