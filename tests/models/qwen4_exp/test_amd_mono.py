@@ -133,6 +133,128 @@ def test_hc_front_matches_vllm_ops(s: int, self_msq: bool) -> None:
     torch.testing.assert_close(x, want_x, atol=2e-2, rtol=2e-2)
 
 
+def _front_ref(emb, prev, w_ne, w_nh, w_fe, w_fh, ne_eps, nh_eps):
+    """``pre_fc_norm_embedding`` -> ``fc_embedding``, ``pre_fc_norm_hidden``
+    (one norm over all 4 H, not one a stream) -> ``fc_hidden`` (one weight
+    shared across the 4 streams), the embedding added as a residual to every
+    stream: the MTP draft's front, stock ``GemmaRMSNorm`` + plain matmuls, as
+    ``Qwen4ExpMultiTokenPredictor.forward`` computes it."""
+    from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+    from vllm.models.qwen4_exp.amd.mono.layout import HC, HIDDEN
+
+    s = emb.size(0)
+    en_norm = GemmaRMSNorm(HIDDEN, eps=ne_eps).cuda()
+    en_norm.weight.data.copy_(w_ne)
+    fe = F.linear(en_norm(emb), w_fe)
+
+    hn_norm = GemmaRMSNorm(HIDDEN * HC, eps=nh_eps).cuda()
+    hn_norm.weight.data.copy_(w_nh)
+    hn = hn_norm(prev).view(s, HC, HIDDEN)
+    fh = F.linear(hn, w_fh)
+    return (fe.unsqueeze(1) + fh).flatten(1).contiguous()
+
+
+@pytest.mark.parametrize("s", [1, 3, 8])
+@torch.inference_mode()
+def test_draft_front_matches_vllm_ops(s: int) -> None:
+    """``draft_front``: the MTP draft step's ``fc_embedding`` / ``fc_hidden``
+    projections folded into the attention HC front, one launch, against the
+    stock torch ops (``_front_ref``) feeding ``_mix_ref`` -- the same
+    reference ``test_hc_front_matches_vllm_ops`` uses for the HC front
+    itself. Also times the fused launch against the stock sequence + K1's
+    separate ``hc_front`` launch (what ``draft_front`` replaces)."""
+    from vllm.models.qwen4_exp.amd.mono import front, k1
+    from vllm.models.qwen4_exp.amd.mono.layout import HC, HH, HIDDEN
+
+    g = torch.Generator(device="cuda").manual_seed(s)
+    emb = _randn(g, s, HIDDEN, scale=2.0)
+    prev = _randn(g, s, HH, scale=2.0)
+    w_ne = _randn(g, HIDDEN, scale=0.1)
+    w_nh = _randn(g, HH, scale=0.1)
+    w_fe = _randn(g, HIDDEN, HIDDEN, scale=0.05)
+    w_fh = _randn(g, HIDDEN, HIDDEN, scale=0.05)
+    hw = _hc_weights(g)
+
+    want_state = _front_ref(emb, prev, w_ne, w_nh, w_fe, w_fh, 1e-6, 1e-6)
+    want_x, want_inj, _ = _mix_ref(want_state, hw)
+
+    key = front.FrontBuild(tokens=s, tp=TP)
+    state = torch.full((s, HH), float("nan"), dtype=bf, device="cuda")
+    x = torch.full((s, HIDDEN), float("nan"), dtype=bf, device="cuda")
+    inj = torch.full((s, HC), float("nan"), dtype=bf, device="cuda")
+    scratch = torch.zeros(front.scratch_bytes(key), dtype=torch.uint8, device="cuda")
+    epoch = torch.ones(1, dtype=torch.int32, device="cuda")
+
+    def _fused():
+        front.draft_front(
+            key,
+            emb=emb,
+            prev=prev,
+            w_ne=w_ne,
+            w_nh=w_nh,
+            w_fe=w_fe,
+            w_fh=w_fh,
+            **hw,
+            state_out=state,
+            bin_out=x,
+            inj_out=inj,
+            scratch=scratch,
+            epoch=epoch,
+            slot=0,
+        )
+
+    _fused()
+    torch.accelerator.synchronize()
+    assert _cos(state, want_state) > COS_MIN
+    torch.testing.assert_close(state, want_state, atol=2e-2, rtol=2e-2)
+    assert _cos(inj, want_inj) > COS_MIN
+    torch.testing.assert_close(inj, want_inj, atol=2e-2, rtol=2e-2)
+    assert _cos(x, want_x) > COS_MIN
+    torch.testing.assert_close(x, want_x, atol=2e-2, rtol=2e-2)
+
+    # ---- timing: the fused launch vs the stock sequence + k1's separate
+    # HC front launch
+    k1key = k1.K1Build(tokens=s, tp=TP, self_msq=True, front_only=True)
+    k1scratch = torch.zeros(k1.scratch_bytes(k1key), dtype=torch.uint8, device="cuda")
+
+    def _stock():
+        state_ref = _front_ref(emb, prev, w_ne, w_nh, w_fe, w_fh, 1e-6, 1e-6)
+        k1.hc_front(
+            k1key,
+            state=state_ref,
+            msq_in=None,
+            **hw,
+            inj_out=inj,
+            bin_out=x,
+            scratch=k1scratch,
+            epoch=epoch,
+            layer=0,
+        )
+
+    for fn in (_stock, _fused):
+        for _ in range(3):
+            fn()
+    torch.accelerator.synchronize()
+
+    reps = 20
+    e0, e1, e2, e3 = (torch.cuda.Event(enable_timing=True) for _ in range(4))
+    e0.record()
+    for _ in range(reps):
+        _stock()
+    e1.record()
+    e2.record()
+    for _ in range(reps):
+        _fused()
+    e3.record()
+    torch.accelerator.synchronize()
+    stock_us = e0.elapsed_time(e1) * 1000 / reps
+    fused_us = e2.elapsed_time(e3) * 1000 / reps
+    print(
+        f"\ndraft_front timing (s={s}): stock {stock_us:.1f} us, "
+        f"fused {fused_us:.1f} us"
+    )
+
+
 # ---------------------------------------------------------------- K1
 def _gdn_inputs(s: int, n_real: int, slots: int = 16):
     from vllm.models.qwen4_exp.amd.mono.layout import HD, HH, HIDDEN, Layout
