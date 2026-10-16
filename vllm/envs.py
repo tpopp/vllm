@@ -162,6 +162,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_MONO_DRAFT_POS0: bool = False
     VLLM_ROCM_MONO_DRAFT_LAYER: bool = True
     VLLM_ROCM_MONO_DRAFT_BACK: bool = False
+    VLLM_ROCM_MONO_GDN_VERIFY_FUSED: bool = False
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
@@ -1436,6 +1437,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # head (VLLM_ROCM_MONO_DRAFT_HEAD). By default is disabled.
     "VLLM_ROCM_MONO_DRAFT_BACK": lambda: (
         os.getenv("VLLM_ROCM_MONO_DRAFT_BACK", "0").lower() in ("true", "1")
+    ),
+    # Fuse the mono GDN verify step's unpack + conv1d update + gated delta
+    # rule + gated RMSNorm into one Triton launch per (request, value head)
+    # for pure spec-decode steps (gdn_spec_decode_mono_fused.py), instead of
+    # the stock 4-launch chain B.gdn_core otherwise dispatches to. By default
+    # is disabled.
+    "VLLM_ROCM_MONO_GDN_VERIFY_FUSED": lambda: (
+        os.getenv("VLLM_ROCM_MONO_GDN_VERIFY_FUSED", "0").lower() in ("true", "1")
     ),
     # Whether to use aiter triton kernels for gemm ops.
     # By default is enabled.

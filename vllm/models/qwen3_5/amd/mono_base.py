@@ -105,7 +105,14 @@ def dense_error(i: int, dense: dict[str, torch.Tensor]) -> str | None:
 def gdn_core(attn, x) -> torch.Tensor:
     """``QwenGatedDeltaNetAttention.forward_hip`` up to out_proj's input: the
     input projections, AITER's conv + gated delta rule (vLLM's spec-decode
-    path on verify steps) and the gated norm -> [S, heads HD]."""
+    path on verify steps) and the gated norm -> [S, heads HD].
+
+    ``VLLM_ROCM_MONO_GDN_VERIFY_FUSED`` folds the post-in_proj part (conv1d
+    update + gated delta rule + gated norm) into one Triton launch per
+    (request, value head) for a pure spec-decode step
+    (``gdn_spec_decode_mono_fused.try_fused_gdn_verify_core``); any other
+    step (or a layer/shape it doesn't cover) falls back to the stock
+    4-launch chain below."""
     from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
         _encode_layer_name,
     )
@@ -115,10 +122,20 @@ def gdn_core(attn, x) -> torch.Tensor:
     ba, _ = attn.in_proj_ba(x)
     shape = (n, attn.num_v_heads // attn.tp_size, attn.head_v_dim)
     core = torch.empty(shape, dtype=x.dtype, device=x.device)
+    qkvz_flat, ba_flat = qkvz.view(n, -1), ba.view(n, -1)
+
+    if envs.VLLM_ROCM_MONO_GDN_VERIFY_FUSED:
+        from vllm.model_executor.layers.mamba.ops.gdn_spec_decode_mono_fused import (
+            try_fused_gdn_verify_core,
+        )
+
+        if try_fused_gdn_verify_core(attn, x, qkvz_flat, ba_flat, core):
+            return core.flatten(-2)
+
     z = torch.empty(shape, dtype=qkvz.dtype, device=x.device)
     torch.ops.vllm.qwen_gdn_attention_core(
-        qkvz.view(n, -1),
-        ba.view(n, -1),
+        qkvz_flat,
+        ba_flat,
         z,
         core,
         layer_name=_encode_layer_name(attn.prefix),
