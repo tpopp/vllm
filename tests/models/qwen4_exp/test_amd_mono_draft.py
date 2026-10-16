@@ -246,6 +246,7 @@ def _draft_step_worker(
     import torch.distributed as dist
 
     from tests.models.qwen3_5.test_amd_mono import (
+        _moe_emulation,
         _all_reduce_fp32,
         _check_route,
         _cos,
@@ -256,8 +257,8 @@ def _draft_step_worker(
     from tests.models.qwen4_exp.test_amd_mono import (
         _hc_weights,
         _mix_ref,
-        _moe_exact,
         _moe_weights,
+        _msq,
     )
     from tests.utils import init_test_distributed_environment
     from vllm.distributed import get_tp_group
@@ -383,14 +384,22 @@ def _draft_step_worker(
         attn_out = _all_reduce_fp32(F.linear(gated, w_o))
         state1_ref = hc_combine(state, attn_out, inj_ref, HC)
 
+        # K2 is test_amd_mono.py's (_k2_worker checks it in depth); here only
+        # that the draft wiring drives it: the MLP combine of the kernel's own
+        # state1 with the MoE emulated on its own picks, as _k2_worker does
         scr2 = k2.scratch_layout(k2_key)
+        off, n = scr2["state1"]
+        state1 = scratch2[off : off + n].view(bf).view(s, HH)
+        assert _rel_l2(state1, state1_ref) < 1e-2, s
         off, n = scr2["bin"]
         x_mlp = scratch2[off : off + n].view(bf).view(s, HIDDEN)
         ids = _check_route(scratch2, scr2["route"], x_mlp.clone(), mw)
-        emu = _moe_exact(x_mlp.clone(), mw, ids)
+        emu = _moe_emulation(x_mlp.clone(), mw, ids)
         inj_m = _pairs(scratch2, scr2["inj"], s * HC).view(s, HC).to(bf)
-        want_state2 = hc_combine(state1_ref, emu, inj_m, HC)
-        assert _rel_l2(state2, want_state2) < 2e-2, s
+        want_state2 = hc_combine(state1.clone(), emu, inj_m, HC)
+        assert _cos(state2 - state1, want_state2 - state1) > COS_MIN, s
+        torch.testing.assert_close(msq, _msq(state2), rtol=1e-5, atol=1e-3)
+        want_state2 = state2
 
         bin_ref = _mix_cpu(
             want_state2.float(),

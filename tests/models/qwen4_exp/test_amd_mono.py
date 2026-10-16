@@ -139,17 +139,17 @@ def _front_ref(emb, prev, w_ne, w_nh, w_fe, w_fh, ne_eps, nh_eps):
     shared across the 4 streams), the embedding added as a residual to every
     stream: the MTP draft's front, stock ``GemmaRMSNorm`` + plain matmuls, as
     ``Qwen4ExpMultiTokenPredictor.forward`` computes it."""
-    from vllm.model_executor.layers.layernorm import GemmaRMSNorm
     from vllm.models.qwen4_exp.amd.mono.layout import HC, HIDDEN
 
-    s = emb.size(0)
-    en_norm = GemmaRMSNorm(HIDDEN, eps=ne_eps).to(dtype=bf, device="cuda")
-    en_norm.weight.data.copy_(w_ne)
-    fe = F.linear(en_norm(emb), w_fe)
+    def gemma(x, w, eps):
+        # GemmaRMSNorm.forward_native: fp32, x rrms (1 + w), back to bf16
+        xf = x.float()
+        xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
+        return (xf * (1.0 + w.float())).to(x.dtype)
 
-    hn_norm = GemmaRMSNorm(HIDDEN * HC, eps=nh_eps).to(dtype=bf, device="cuda")
-    hn_norm.weight.data.copy_(w_nh)
-    hn = hn_norm(prev).view(s, HC, HIDDEN)
+    s = emb.size(0)
+    fe = F.linear(gemma(emb, w_ne, ne_eps), w_fe)
+    hn = gemma(prev, w_nh, nh_eps).view(s, HC, HIDDEN)
     fh = F.linear(hn, w_fh)
     return (fe.unsqueeze(1) + fh).flatten(1).contiguous()
 
@@ -985,6 +985,12 @@ def _head_worker(
                 q[row, byte] = (q[row, byte] & 0xF0) | 0x07
             sc[row, col // 32] = code
 
+        # a planted row's block scale applies to its whole 32-column block:
+        # zero the block's other codes first, or their random nibbles at the
+        # planted scale outgrow the plants
+        rows = (tie_a, tie_b, tie_c, tie_d, champ, pad_row, cross_lo)
+        for row in rows if this_rank == 0 else (cross_hi,):
+            q[row, :16] = 0
         if this_rank == 0:
             set_val(tie_a, 0, 180)
             set_val(tie_b, 0, 180)
