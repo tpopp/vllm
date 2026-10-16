@@ -230,6 +230,8 @@ class DraftMonoDecode(B.QwenMonoDecode):
         if mixer is None or mixer.use_combine:
             return "no final HC mixer"
         layer = model.layers[0]
+        if layer.ple is not None:
+            return "a PLE layer"
         # the draft's three launches tag the attention HC front at
         # layer.layer_idx, the mixer HC front at layer.layer_idx + 1, and K2
         # at TAG_SLOTS // 2 + layer.layer_idx: the mixer's slot must stay
