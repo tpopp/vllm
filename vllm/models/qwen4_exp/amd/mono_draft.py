@@ -58,6 +58,14 @@ def fused_head() -> bool:
     return envs.VLLM_ROCM_MONO_DRAFT_HEAD
 
 
+def position0() -> bool:
+    """Also take draft position 0 (each request's verify rows, k + 1 a request,
+    spec-as-decode) when it fits ``MAX_TOKENS`` rows and runs in a FULL graph."""
+    from vllm import envs
+
+    return envs.VLLM_ROCM_MONO_DRAFT_POS0
+
+
 def fused_front() -> bool:
     """The front as one ``mono.front`` launch (else stock ops + ``hc_front``)."""
     from vllm import envs
@@ -417,7 +425,7 @@ class DraftMonoDecode(B.QwenMonoDecode):
         m = md.get(self._probe)
         if m is None or m.num_prefills != 0:
             return False
-        if m.num_decode_tokens != m.num_decodes:
+        if m.num_decode_tokens != m.num_decodes and not position0():
             return False
         self.check_weights()
         return self.ok

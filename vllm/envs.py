@@ -159,6 +159,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_MONO_DRAFT: bool = False
     VLLM_ROCM_MONO_DRAFT_FRONT: bool = False
     VLLM_ROCM_MONO_DRAFT_HEAD: bool = True
+    VLLM_ROCM_MONO_DRAFT_POS0: bool = False
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
@@ -1411,6 +1412,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Greedy MTP draft tokens from one launch on an MXFP4 draft lm_head
     "VLLM_ROCM_MONO_DRAFT_HEAD": lambda: (
         os.getenv("VLLM_ROCM_MONO_DRAFT_HEAD", "1").lower() in ("true", "1")
+    ),
+    # Mono MTP draft position 0 (verify-shaped rows) too
+    "VLLM_ROCM_MONO_DRAFT_POS0": lambda: (
+        os.getenv("VLLM_ROCM_MONO_DRAFT_POS0", "0").lower() in ("true", "1")
     ),
     # Whether to use aiter triton kernels for gemm ops.
     # By default is enabled.
