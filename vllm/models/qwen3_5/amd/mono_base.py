@@ -146,6 +146,7 @@ class QwenMonoDecode:
     MAX_TOKENS: ClassVar[int]
     BLOCKS: ClassVar[int]  # a launch's CTAs, each resident
     MTP: ClassVar[bool]  # verify steps taken
+    ENV_NAME: ClassVar[str] = "VLLM_ROCM_MONO_DECODE"  # the opt-in env var, in errors
 
     def __init__(self, model, vllm_config):
         from vllm.models.kimi_k3.amd.mono.common.peer_memory import PeerBuffer
@@ -154,7 +155,7 @@ class QwenMonoDecode:
         self.spec = vllm_config.speculative_config is not None
         refused = self.refusals(vllm_config)
         if refused:
-            raise ValueError(f"VLLM_ROCM_MONO_DECODE {'; '.join(refused)}.")
+            raise ValueError(f"{self.ENV_NAME} {'; '.join(refused)}.")
         why = self.unsupported(model)
         self.ok = why is None
         self._weights_checked = False
@@ -264,7 +265,7 @@ class QwenMonoDecode:
         if not self._weights_checked:
             why = self.weights_unsupported()
             if why is not None:
-                raise ValueError(f"VLLM_ROCM_MONO_DECODE {why}.")
+                raise ValueError(f"{self.ENV_NAME} {why}.")
             self._weights_checked = True
 
     def eligible(self, input_ids, intermediate_tensors) -> bool:

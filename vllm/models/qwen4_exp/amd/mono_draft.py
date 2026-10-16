@@ -34,10 +34,13 @@ from functools import cached_property
 import torch
 
 from vllm.forward_context import get_forward_context, in_piecewise_cudagraph
+from vllm.logger import init_logger
 from vllm.models.qwen3_5.amd import mono_base as B
 from vllm.models.qwen4_exp.amd.mono import layout as L
 from vllm.models.qwen4_exp.amd.mono_decode import _qsa_core
 from vllm.platforms import current_platform
+
+logger = init_logger(__name__)
 
 
 def enabled() -> bool:
@@ -71,6 +74,7 @@ class DraftMonoDecode(B.QwenMonoDecode):
     MAX_TOKENS = L.MAX_TOKENS
     BLOCKS = L.BLOCKS
     MTP = True
+    ENV_NAME = "VLLM_ROCM_MONO_DRAFT"
 
     def __init__(self, model, vllm_config):
         super().__init__(model, vllm_config)
@@ -144,12 +148,58 @@ class DraftMonoDecode(B.QwenMonoDecode):
         )
         return out
 
+    def refusals(self, vllm_config) -> list[str]:
+        """As the base's, but without the base's MTP-conditional checks: they
+        read ``self.MAX_TOKENS`` as a verify step's row budget tied to
+        ``spec.num_speculative_tokens`` and require the GDN AITER/Triton
+        kernels a verify step's GDN core needs -- neither applies here, since
+        a draft step's width is its request count (checked per step in
+        ``eligible``, not statically here) and the draft layer is QSA-only,
+        no GDN core at all."""
+        from vllm.distributed import get_pp_group, get_tp_group
+        from vllm.platforms.rocm import get_cdna_version
+
+        pc = vllm_config.parallel_config
+        why = []
+        if get_cdna_version() not in B.CDNA_VERSIONS:
+            why.append(f"needs CDNA{'/'.join(map(str, B.CDNA_VERSIONS))}")
+        if get_tp_group().world_size not in self.TP_SIZES:
+            why.append(
+                f"needs tensor parallel size {'/'.join(map(str, self.TP_SIZES))}"
+            )
+        if get_pp_group().world_size != 1:
+            why.append("needs no pipeline parallelism")
+        if pc.enable_expert_parallel or pc.enable_eplb or pc.data_parallel_size > 1:
+            why.append("needs tensor parallelism only: no expert or data parallelism")
+        if pc.decode_context_parallel_size > 1 or pc.prefill_context_parallel_size > 1:
+            why.append("needs no context parallelism")
+        if vllm_config.lora_config is not None:
+            why.append("needs no LoRA")
+        spec = vllm_config.speculative_config
+        if spec is None or spec.method != "mtp":
+            why.append("needs MTP speculative decoding")
+        if vllm_config.kv_transfer_config is not None:
+            why.append("needs no KV connector")
+        cus = current_platform.num_compute_units(
+            torch.accelerator.current_device_index()
+        )
+        if cus < self.BLOCKS:
+            why.append(f"needs {self.BLOCKS} compute units, the GPU has {cus}")
+        return why
+
     def probe_prefix(self, model) -> str:
-        return model.layers[0].self_attn.layer_name
+        """The QSA side cache's metadata key: ``self_attn.layer_name`` is a
+        plain ``FlashAttentionMetadata`` (no ``num_prefills``; the merged QSA
+        owner's builder subclasses ``FlashAttentionMetadataBuilder``). The
+        indexer's raw-key-cache side cache is a ``QSAForwardMetadata``
+        (``num_prefills`` / ``num_decodes`` / ``num_decode_tokens``), the same
+        key ``qsa.py`` itself reads the request counts from."""
+        return model.layers[0].self_attn.indexer.raw_key_cache.prefix
 
     def unsupported(self, model) -> str | None:
         from vllm.distributed import get_tp_group
         from vllm.models.qwen4_exp.amd.model import Qwen4ExpSparseMoeBlock
+        from vllm.models.qwen4_exp.amd.mono import k2
         from vllm.models.qwen4_exp.amd.qsa import Qwen4ExpQSAAttention
 
         c = model.config
@@ -172,6 +222,12 @@ class DraftMonoDecode(B.QwenMonoDecode):
         if mixer is None or mixer.use_combine:
             return "no final HC mixer"
         layer = model.layers[0]
+        # the draft's three launches tag the attention HC front at
+        # layer.layer_idx, the mixer HC front at layer.layer_idx + 1, and K2
+        # at TAG_SLOTS // 2 + layer.layer_idx: the mixer's slot must stay
+        # below K2's half of the tag space
+        if layer.layer_idx + 1 >= k2.TAG_SLOTS // 2:
+            return "draft layer index too large for the mailbox tag space"
         mlp = layer.mlp
         if not isinstance(mlp, Qwen4ExpSparseMoeBlock):
             return "dense MLP"
@@ -205,6 +261,24 @@ class DraftMonoDecode(B.QwenMonoDecode):
             return k2.scratch_bytes(k2.K2Build(tokens=s, tp=self.tp))
 
         return k1_bytes, k2_bytes, k2.peer_bytes(L.MAX_TOKENS, self.tp)
+
+    def _fc_error(self, name: str, lin) -> str | None:
+        """Why ``lin`` (``fc_embedding`` / ``fc_hidden``) is unreadable as the
+        fused front's full, gathered weight, else None: it must be a plain
+        bf16 linear (``ColumnParallelLinear`` with no quantization the kernel
+        does not expect), its local shard ``[H / tp, H]`` as the module
+        shards it."""
+        from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+        if not isinstance(lin.quant_method, UnquantizedLinearMethod):
+            return f"{name}: quantized ({type(lin.quant_method).__name__})"
+        want = (L.HIDDEN // self.tp, L.HIDDEN)
+        if lin.weight.shape != want or lin.weight.dtype != torch.bfloat16:
+            return (
+                f"{name}: {tuple(lin.weight.shape)} {lin.weight.dtype}, "
+                f"want bf16 {want}"
+            )
+        return None
 
     def weights_unsupported(self) -> str | None:
         lay = self.lay
@@ -248,6 +322,22 @@ class DraftMonoDecode(B.QwenMonoDecode):
             return why
         if getattr(self, "_mixer_w_down", None) is None:
             return "the padded mixer down not built (prepare_weights)"
+        # the fused front is optional (``_front`` is the eager fallback): only
+        # check it when ``prepare_weights`` actually engaged it, so an
+        # unreadable fc_embedding / fc_hidden never disables the rest of the
+        # draft, just the fused front
+        fc = getattr(self, "_fc", None)
+        if fc is not None:
+            model = self.model
+            for fname, lin in (
+                ("fc_embedding", model.fc_embedding),
+                ("fc_hidden", model.fc_hidden),
+            ):
+                why = self._fc_error(fname, lin)
+                if why is not None:
+                    return why
+            if any(w.shape != (L.HIDDEN, L.HIDDEN) for w in fc):
+                return f"fused front gathered weights: {[tuple(w.shape) for w in fc]}"
         return None
 
     def prepare_weights(self) -> None:
@@ -266,25 +356,55 @@ class DraftMonoDecode(B.QwenMonoDecode):
             from vllm.distributed import tensor_model_parallel_all_gather
 
             model = self.model
-            # every rank's full fc weights: the kernel computes every output
-            # column, so no all-gather runs in the step
-            self._fc = tuple(
-                tensor_model_parallel_all_gather(lin.weight.data, dim=0).contiguous()
-                for lin in (model.fc_embedding, model.fc_hidden)
+            lins = (
+                ("fc_embedding", model.fc_embedding),
+                ("fc_hidden", model.fc_hidden),
             )
-            self.front_scratch = {
-                n: torch.zeros(
-                    (_front_bytes(n, self.tp) + 255) // 256 * 256,
-                    dtype=torch.uint8,
-                    device=self.epoch.device,
+            if all(self._fc_error(name, lin) is None for name, lin in lins):
+                # every rank's full fc weights: the kernel computes every
+                # output column, so no all-gather runs in the step
+                self._fc = tuple(
+                    tensor_model_parallel_all_gather(
+                        lin.weight.data, dim=0
+                    ).contiguous()
+                    for _, lin in lins
                 )
-                for n in self.k1_scratch
-            }
+                self.front_scratch = {
+                    n: torch.zeros(
+                        (_front_bytes(n, self.tp) + 255) // 256 * 256,
+                        dtype=torch.uint8,
+                        device=self.epoch.device,
+                    )
+                    for n in self.k1_scratch
+                }
+
+    def check_weights(self) -> None:
+        """As the base's, but an unreadable weight falls back to the stock
+        draft step instead of raising: unlike ``VLLM_ROCM_MONO_DECODE``'s
+        explicit opt-in for the target, the draft is an optimization, and
+        ``prepare_weights`` may never have run (e.g. ``--load-format
+        dummy``), which the base's checks would otherwise surface as an
+        ``AttributeError``, not the intended ``ValueError``."""
+        if self._weights_checked:
+            return
+        why = self.weights_unsupported()
+        if why is not None:
+            logger.warning_once(
+                "%s mono draft off: %s. Falling back to the stock draft step.",
+                self.LABEL,
+                why,
+            )
+            self.ok = False
+        self._weights_checked = True
 
     def eligible(self, input_ids, intermediate_tensors) -> bool:
         """A pure decode draft step of at most ``MAX_TOKENS`` rows: unlike the
         target, this never sees a verify step (it is bound to the draft
-        module only), so it needs no GDN state-index bookkeeping."""
+        module only), so it needs no GDN state-index bookkeeping. Draft
+        position 0 stays on stock: the QSA builder's
+        ``supports_spec_as_decode`` also reports ``num_prefills == 0`` there,
+        but its query_len is k + 1 (every request's whole draft chain), not
+        the 1-row-a-request decode this step assumes."""
         if not self.ok or intermediate_tensors is not None:
             return False
         if in_piecewise_cudagraph():
@@ -297,8 +417,10 @@ class DraftMonoDecode(B.QwenMonoDecode):
         m = md.get(self._probe)
         if m is None or m.num_prefills != 0:
             return False
+        if m.num_decode_tokens != m.num_decodes:
+            return False
         self.check_weights()
-        return True
+        return self.ok
 
     def forward(self, input_ids, positions, hidden_states, inputs_embeds):
         """Returns ``(sample_hidden_states, multi_hidden)``, the stock
@@ -313,9 +435,11 @@ class DraftMonoDecode(B.QwenMonoDecode):
         self.epoch.add_(1)
         layer = self.model.layers[0]
         attn_hc = layer.attn_hyper_connection
-        x = torch.empty(s, L.HIDDEN, dtype=hidden_states.dtype, device=self.epoch.device)
+        x = torch.empty(
+            s, L.HIDDEN, dtype=hidden_states.dtype, device=self.epoch.device
+        )
         inj = torch.empty(s, L.HC, dtype=x.dtype, device=x.device)
-        if self._fc is not None:
+        if getattr(self, "_fc", None) is not None:
             state = self._fused_front(input_ids, hidden_states, inputs_embeds, x, inj)
         else:
             state = self._front(input_ids, hidden_states, inputs_embeds)

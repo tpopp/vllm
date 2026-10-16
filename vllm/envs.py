@@ -157,7 +157,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_MONO_DECODE: bool = False
     VLLM_ROCM_MONO_DRAFT: bool = False
-    VLLM_ROCM_MONO_DRAFT_FRONT: bool = True
+    VLLM_ROCM_MONO_DRAFT_FRONT: bool = False
     VLLM_ROCM_MONO_DRAFT_HEAD: bool = True
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
@@ -1403,9 +1403,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_MONO_DRAFT": lambda: (
         os.getenv("VLLM_ROCM_MONO_DRAFT", "False").lower() in ("true", "1")
     ),
-    # The MTP mono draft step's front as one launch (mono/front.py)
+    # The MTP mono draft step's front as one launch (mono/front.py). Not yet
+    # validated on GPU: default off.
     "VLLM_ROCM_MONO_DRAFT_FRONT": lambda: (
-        os.getenv("VLLM_ROCM_MONO_DRAFT_FRONT", "1").lower() in ("true", "1")
+        os.getenv("VLLM_ROCM_MONO_DRAFT_FRONT", "0").lower() in ("true", "1")
     ),
     # Greedy MTP draft tokens from one launch on an MXFP4 draft lm_head
     "VLLM_ROCM_MONO_DRAFT_HEAD": lambda: (
