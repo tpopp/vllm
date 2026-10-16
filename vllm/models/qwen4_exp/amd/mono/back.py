@@ -183,6 +183,17 @@ def scratch_bytes(key: BackBuild) -> int:
     return max(o + n for o, n in scratch_layout(key).values())
 
 
+def _msq_final_put(c, key, mixer_msq, jj, t, k, v):
+    """K2's own ``stage_final`` sums-of-squares sink: publish through the
+    mixer's own ``msq`` mailbox region, and (``key.want_msq_out``, a build-
+    time flag) also a plain store into ``msq_out``, for debug / parity
+    tests -- production never reads it, since the mixer gets them through
+    the mailbox instead."""
+    c["put"](mixer_msq, (jj * c["S"] + t) * HC + k, v)
+    if key.want_msq_out:
+        bo.buffer_store(v, rsrc(c["args"]["msq_out"]), (jj * c["S"] + t) * HC + k)
+
+
 # ---------------------------------------------------------------- kernel
 _BUILDS: dict = {}
 
@@ -377,15 +388,9 @@ def build(key: BackBuild):
             "bin": scratch + fx.Int64(scr["bin"][0]),
             "inj_out": lambda t, r, vs: k2._put_inj(c, t, r, vs),
         }
-
-        def _msq_final_put(jj, t, k, v):
-            c["put"](mixer_msq, (jj * c["S"] + t) * HC + k, v)
-            if key.want_msq_out:
-                bo.buffer_store(
-                    v, rsrc(c["args"]["msq_out"]), (jj * c["S"] + t) * HC + k
-                )
-
-        c["msq_final_put"] = _msq_final_put
+        c["msq_final_put"] = lambda jj, t, k, v: _msq_final_put(
+            c, key, mixer_msq, jj, t, k, v
+        )
 
         # ---- phase 1: K2's own body (o_proj, the attention combine, the mlp
         # HC mix, router / sgate, the routed experts, the mlp combine);
