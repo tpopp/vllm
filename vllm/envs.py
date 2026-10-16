@@ -160,6 +160,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_MONO_DRAFT_FRONT: bool = False
     VLLM_ROCM_MONO_DRAFT_HEAD: bool = True
     VLLM_ROCM_MONO_DRAFT_POS0: bool = False
+    VLLM_ROCM_MONO_DRAFT_LAYER: bool = True
     VLLM_ROCM_MONO_DRAFT_BACK: bool = False
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
@@ -1425,6 +1426,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Mono MTP draft position 0 (verify-shaped rows) too
     "VLLM_ROCM_MONO_DRAFT_POS0": lambda: (
         os.getenv("VLLM_ROCM_MONO_DRAFT_POS0", "0").lower() in ("true", "1")
+    ),
+    # The mono MTP draft layer (off: only the fused draft head, if eligible)
+    "VLLM_ROCM_MONO_DRAFT_LAYER": lambda: (
+        os.getenv("VLLM_ROCM_MONO_DRAFT_LAYER", "1").lower() in ("true", "1")
     ),
     # Fuse the MTP draft step's K2 + final-mixer HC front + draft head into
     # one persistent launch (mono/back.py). Needs the MXFP4 ASM-GEMM draft

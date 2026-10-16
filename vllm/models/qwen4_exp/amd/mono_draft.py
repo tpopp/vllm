@@ -475,6 +475,10 @@ class DraftMonoDecode(B.QwenMonoDecode):
         ``supports_spec_as_decode`` also reports ``num_prefills == 0`` there,
         but its query_len is k + 1 (every request's whole draft chain), not
         the 1-row-a-request decode this step assumes."""
+        from vllm import envs
+
+        if not envs.VLLM_ROCM_MONO_DRAFT_LAYER:
+            return False
         if not self.ok or intermediate_tensors is not None:
             return False
         if in_piecewise_cudagraph():
