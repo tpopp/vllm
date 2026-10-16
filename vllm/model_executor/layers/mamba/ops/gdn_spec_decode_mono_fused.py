@@ -138,19 +138,14 @@ def _fused_gdn_verify_core_kernel(
 
     offset = accepted - 1
 
-    def _conv_base(ch_off):
-        return (
-            conv_state_ptr
-            + conv_slot * stride_conv_slot
-            + ch_off * stride_conv_dim
-        )
+    conv_slot_ptr = conv_state_ptr + conv_slot * stride_conv_slot
 
     # STEP 1: seed the width-4 FIR's CONV_W - 1 = 3 taps from the rolled-back
     # window (bit-for-bit the `_causal_conv1d_update_kernel` IS_SPEC_DECODING
     # read: `conv_state[offset + j]` for j in [0, CONV_W - 1)).
-    q_base = _conv_base(i_h * K + o_k)
-    k_base = _conv_base(KEY + i_h * K + o_k)
-    v_base = _conv_base(2 * KEY + i_hv * V + o_v)
+    q_base = conv_slot_ptr + (i_h * K + o_k) * stride_conv_dim
+    k_base = conv_slot_ptr + (KEY + i_h * K + o_k) * stride_conv_dim
+    v_base = conv_slot_ptr + (2 * KEY + i_hv * V + o_v) * stride_conv_dim
 
     q_t0 = tl.load(q_base + (offset + 0) * stride_conv_tok)
     q_t1 = tl.load(q_base + (offset + 1) * stride_conv_tok)
