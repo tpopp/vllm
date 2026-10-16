@@ -205,9 +205,12 @@ def test_eligible_rejects(monkeypatch: pytest.MonkeyPatch, setup: str) -> None:
     elif setup == "has_prefills":
         md = {mono._probe: _fake_qsa_metadata(num_prefills=1)}
     elif setup == "draft_position_0":
-        # supports_spec_as_decode also reports num_prefills == 0 here, but
-        # every request's query_len is k + 1 (3 requests, 4 rows each), not
-        # the 1-row-a-request decode this step assumes
+        # with VLLM_ROCM_MONO_DRAFT_POS0 off: supports_spec_as_decode also
+        # reports num_prefills == 0 here, but every request's query_len is
+        # k + 1 (3 requests, 4 rows each), not 1 row a request
+        from vllm import envs
+
+        monkeypatch.setattr(envs, "VLLM_ROCM_MONO_DRAFT_POS0", False)
         md = {mono._probe: _fake_qsa_metadata(num_decodes=3, num_decode_tokens=12)}
 
     _patch_context(monkeypatch, piecewise=piecewise, metadata=md)
