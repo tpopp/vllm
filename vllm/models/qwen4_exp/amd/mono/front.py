@@ -277,6 +277,7 @@ def stage_fc(c, g, fe_ops, fh_ops):
 
 
 # ---------------------------------------------------------------- F3
+@traced
 def wait_state(c):
     """Every F2 group's ``sflag``: ``state``'s stores are visible after."""
     if c["tid"] < hc.UP_TASKS:
