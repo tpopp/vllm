@@ -388,6 +388,8 @@ def build(key: BackBuild):
             "bin": scratch + fx.Int64(scr["bin"][0]),
             "inj_out": lambda t, r, vs: k2._put_inj(c, t, r, vs),
         }
+        # the mixer phase reads ``out`` on other XCDs: device-scope stores
+        c["out_cm"] = CM_DEV
         c["msq_final_put"] = lambda jj, t, k, v: _msq_final_put(
             c, key, mixer_msq, jj, t, k, v
         )

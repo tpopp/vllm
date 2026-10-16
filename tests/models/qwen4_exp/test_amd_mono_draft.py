@@ -429,9 +429,12 @@ def _assert_bitwise_or_report(
         return
     diff = (a.float() - b.float()).abs()
     bad = int((diff > 0).sum().item())
+    na, nb = torch.isnan(a.float()), torch.isnan(b.float())
+    where = torch.nonzero(na | nb)[:8].tolist()
     raise AssertionError(
-        f"{name} differs at s={s}: max abs diff {diff.max().item()}, "
-        f"{bad} / {diff.numel()} elements differ"
+        f"{name} differs at s={s}: max abs diff {diff.nan_to_num().max().item()}, "
+        f"{bad} / {diff.numel()} elements differ; nan a {int(na.sum())} "
+        f"b {int(nb.sum())} first {where}"
     )
 
 
@@ -620,9 +623,11 @@ def _draft_back_worker(
         )
         torch.accelerator.synchronize()
 
+        print(f"draft_back s={s} rank={rank}: ids {ids_b.tolist()} vs {ids.tolist()}, "
+              f"h nan {int(torch.isnan(h_b.float()).sum())}", flush=True)
         _assert_bitwise_or_report(state2_b, state2, "state2", s)
-        _assert_bitwise_or_report(h_b, h, "h", s)
         assert torch.equal(ids_b, ids), (s, ids_b.tolist(), ids.tolist())
+        _assert_bitwise_or_report(h_b, h, "h", s)
 
         outs = [torch.empty_like(ids_b) for _ in range(tp_size)]
         dist.all_gather(outs, ids_b)

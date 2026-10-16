@@ -235,7 +235,7 @@ def stage_final(c, j):
         c["state1"],
         CM_DEV,
         a["out"],
-        0,
+        c.get("out_cm", 0),
         c["msq_final_put"],
     )
 
