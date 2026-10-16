@@ -14,11 +14,8 @@ microseconds for: (1) ``draft_head``'s MXFP4 lm_head GEMV + TP argmax vs a
 bf16 and an MXFP4 stock greedy pick; (2) ``draft_front`` vs the stock norms +
 column-parallel GEMMs + ``k1.hc_front``; (3) the final mixer's ``hc_front``
 (zero-padded down) vs the unfused ``ops/hc.py`` sequence; (4) K2's
-``layer_post`` for the draft layer, its own time; (5) ``back.draft_back``
-(K2 + the mixer's ``hc_front`` + ``draft_head``, one launch) vs the three
-separate launches it replaces, the real 124160-row vocab shard a rank. Needs
-MI355X (gfx950), AITER, and the mono kernels; this file is authored CPU-only
-and not run here.
+``layer_post`` for the draft layer, its own time. Needs MI355X (gfx950),
+AITER, and the mono kernels; this file is authored CPU-only and not run here.
 """
 
 import argparse
@@ -309,107 +306,6 @@ def bench_k2_layer_post(s, device, rank, world_size, epoch, iters, peers):
     return [(name, _time_eager(_fused, iters), _time_graph(_fused, iters))]
 
 
-# ---------------------------------------------------------------- 5. draft_back
-def bench_draft_back(
-    s, device, rank, world_size, epoch, iters, k2_peers, head_peers, back_peers
-):
-    from tests.models.qwen3_5.test_amd_mono import _randn
-    from tests.models.qwen4_exp.test_amd_mono import (
-        _hc_weights,
-        _lmhead_weights,
-        _moe_weights,
-    )
-    from vllm.models.qwen4_exp.amd.mono import back, head, k1, k2
-    from vllm.models.qwen4_exp.amd.mono.layout import (
-        DOWN_ROWS,
-        HC,
-        HH,
-        HIDDEN,
-        LORA,
-        Layout,
-    )
-
-    lay = Layout(TP)
-    v_r = 124160  # the real per-rank vocab shard (no padding)
-    vocab_start = rank * v_r
-    gc = torch.Generator(device=device).manual_seed(51)
-    gr = torch.Generator(device=device).manual_seed(510 + rank)
-    state = _randn(gc, s, HH, scale=2.0)
-    inj_a = _randn(gc, s, HC)
-    core = _randn(gr, s, lay.CORE)
-    gate = _randn(gr, s, lay.CORE, scale=2.0)
-    w_o = _randn(gr, HIDDEN, lay.CORE, scale=0.02)  # bf16 o_proj: not asm_mxfp4
-    hw = _hc_weights(gc)
-    mixer_down = _randn(gc, LORA, HH, scale=0.01)
-    mixer_padded = torch.zeros(DOWN_ROWS, HH, dtype=bf, device=device)
-    mixer_padded[:LORA] = mixer_down
-    mixer_hw = {
-        "hc_w": _randn(gc, HH, scale=0.1),
-        "w_down": mixer_padded,
-        "w_up": _randn(gc, HH, LORA, scale=0.05),
-    }
-    mw = _moe_weights(rank, device)
-    _, _, head_w, head_ws = _lmhead_weights(rank, device, v_r)
-
-    state2 = torch.empty(s, HH, dtype=bf, device=device)
-    msq_out = torch.empty(20, s, HC, dtype=torch.float32, device=device)
-    h = torch.empty(s, HIDDEN, dtype=bf, device=device)
-    mixer_inj = torch.empty(s, HC, dtype=bf, device=device)
-    ids = torch.empty(s, dtype=torch.int64, device=device)
-    k2_key = k2.K2Build(tokens=s, tp=TP, og=True)
-    k2_scratch = torch.zeros(k2.scratch_bytes(k2_key), dtype=torch.uint8, device=device)
-    k1_key = k1.K1Build(tokens=s, tp=TP, self_msq=False, front_only=True)
-    k1_scratch = torch.zeros(k1.scratch_bytes(k1_key), dtype=torch.uint8, device=device)
-    head_key = head.HeadBuild(tokens=s, tp=TP, rows=v_r)
-    head_scratch = torch.zeros(
-        head.scratch_bytes(head_key), dtype=torch.uint8, device=device
-    )
-
-    def _three_launches():
-        epoch.add_(1)
-        k2.layer_post(
-            k2_key, core=core, gate=gate, state=state, inj_a=inj_a, w_o=w_o, **hw,
-            w_gate=mw["w_gate"], w_sg=mw["w_sg"], w13=mw["w13"], w13s=mw["w13s"],
-            w2=mw["w2"], w2s=mw["w2s"], out=state2, msq_out=msq_out,
-            scratch=k2_scratch, peers=k2_peers.addresses, rank=rank, epoch=epoch,
-            layer=k2.TAG_SLOTS // 2 + 48,
-        )
-        k1.hc_front(
-            k1_key, state=state2, msq_in=msq_out, **mixer_hw, inj_out=mixer_inj,
-            bin_out=h, scratch=k1_scratch, epoch=epoch, layer=49,
-        )
-        head.draft_head(
-            head_key, x=h, w=head_w, ws=head_ws, valid=v_r, vocab_start=vocab_start,
-            out=ids, scratch=head_scratch, peers=head_peers.addresses, rank=rank,
-            epoch=epoch, slot=0,
-        )
-
-    back_key = back.BackBuild(tokens=s, tp=TP, og=True, rows=v_r)
-    back_scratch = torch.zeros(
-        back.scratch_bytes(back_key), dtype=torch.uint8, device=device
-    )
-
-    def _fused():
-        epoch.add_(1)
-        back.draft_back(
-            back_key, core=core, gate=gate, state=state, inj_a=inj_a, w_o=w_o, **hw,
-            w_gate=mw["w_gate"], w_sg=mw["w_sg"], w13=mw["w13"], w13s=mw["w13s"],
-            w2=mw["w2"], w2s=mw["w2s"], mix_hc_w=mixer_hw["hc_w"],
-            mix_w_down=mixer_hw["w_down"], mix_w_up=mixer_hw["w_up"],
-            head_w=head_w, head_ws=head_ws, valid=v_r, vocab_start=vocab_start,
-            out=state2, h_out=h, ids=ids, scratch=back_scratch,
-            peers=back_peers.addresses, rank=rank, epoch=epoch, slot=0,
-        )
-
-    cases = (
-        ("3 launches: K2 + mixer hc_front + draft_head", _three_launches),
-        ("draft_back (fused)", _fused),
-    )
-    return [
-        (name, _time_eager(fn, iters), _time_graph(fn, iters)) for name, fn in cases
-    ]
-
-
 # ---------------------------------------------------------------- plumbing
 def setup_distributed():
     if not {"RANK", "WORLD_SIZE", "LOCAL_RANK"} <= os.environ.keys():
@@ -459,7 +355,7 @@ def main() -> None:
 
     from vllm.distributed import get_tp_group
     from vllm.models.kimi_k3.amd.mono.common.peer_memory import PeerBuffer
-    from vllm.models.qwen4_exp.amd.mono import back, head, k2
+    from vllm.models.qwen4_exp.amd.mono import head, k2
     from vllm.models.qwen4_exp.amd.mono.layout import MAX_TOKENS
 
     tp = get_tp_group()
@@ -468,21 +364,14 @@ def main() -> None:
     k2_peers = PeerBuffer(
         k2.peer_bytes(MAX_TOKENS, TP), tp.cpu_group, rank, world_size, device
     )
-    back_peers = PeerBuffer(back.peer_bytes(TP), tp.cpu_group, rank, world_size, device)
     head_peers.bytes.zero_()
     k2_peers.bytes.zero_()
-    back_peers.bytes.zero_()
 
     sections = (
         ("1. draft_head", bench_draft_head, {"peers": head_peers}),
         ("2. draft_front", bench_draft_front, {}),
         ("3. final mixer (hc_front)", bench_mixer, {}),
         ("4. K2 layer_post (draft layer)", bench_k2_layer_post, {"peers": k2_peers}),
-        (
-            "5. draft_back (K2 + mixer + draft_head, fused)",
-            bench_draft_back,
-            {"k2_peers": k2_peers, "head_peers": head_peers, "back_peers": back_peers},
-        ),
     )
     for s in s_list:
         if rank == 0:
@@ -500,7 +389,6 @@ def main() -> None:
 
     head_peers.close()
     k2_peers.close()
-    back_peers.close()
     dist.barrier()
 
 

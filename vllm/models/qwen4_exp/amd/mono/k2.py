@@ -222,11 +222,11 @@ def stage_attn_combine(c, j):
 
 
 def stage_final(c, j):
-    """``c["state1"]`` + the mlp combine -> ``c["args"]["out"]``; its sums of
-    squares -> ``c["msq_final_put"](j, t, k, v)``. K2's own build sets this to
-    a plain store into ``msq_out``; a fused kernel (``back.py``) can instead
-    publish it through another launch's mailbox region."""
     a = c["args"]
+
+    def msq_put(jj, t, k, v):
+        bo.buffer_store(v, rsrc(a["msq_out"]), (jj * c["S"] + t) * HC + k)
+
     hc.stage_combine(
         c,
         j,
@@ -235,8 +235,8 @@ def stage_final(c, j):
         c["state1"],
         CM_DEV,
         a["out"],
-        c.get("out_cm", 0),
-        c["msq_final_put"],
+        0,
+        msq_put,
     )
 
 
@@ -288,58 +288,6 @@ def stage_sgate(c, t):
             tot = tot + fx.ptr_load(red + w)
         c["put"](c["sgate"], t, sigmoid(bf16_round(tot)))
     gpu.barrier()
-
-
-@traced
-def k2_body(c):
-    """CTAs 0 .. 255 of a K2 launch's own phase: o_proj, the attention
-    combine, the mlp HC mix, router / sgate, the routed experts, the mlp
-    combine (``stage_final``). Reusable in a fused kernel (``back.py``):
-    reads ``c["ps"]`` in place of ``key.ps`` (``moe.run_ug``'s fused-shared-
-    expert-early flag) so the body itself needs no build key."""
-    bid, s, lay = c["bid"], c["S"], c["lay"]
-    is_r = (bid >= R0) & (bid < RT0)
-    is_g = (bid >= RT0) & (bid < RT0 + s)
-    # ---- o_proj, the attention combine, the mlp HC mix, router / sgate:
-    # a CTA's whole sequence in one branch, its weights in flight first
-    if bid < D0:
-        oops = moe.o_loads(c, bid, lay.CORE)
-        moe.run_oproj(c, [oops], lay.CORE)
-        if bid < hc.NRED:
-            stage_attn_combine(c, bid)
-        uops = hc.up_loads(c, bid)
-        hc.load_rrms(c)
-        hc.stage_up(c, bid, uops)
-    if (bid >= D0) & (bid < OTASKS):
-        oops = moe.o_loads(c, bid, lay.CORE)
-        dops = hc.down_loads(c, bid - D0)
-        moe.run_oproj(c, [oops], lay.CORE)
-        uops = hc.up_loads(c, bid)
-        hc.load_rrms(c)
-        hc.stage_down(c, bid - D0, dops)
-        hc.stage_up(c, bid, uops)
-    if is_r:
-        dops = hc.down_loads(c, bid - D0)
-        rops = router_loads(c, bid - R0)
-        hc.load_rrms(c)
-        hc.stage_down(c, bid - D0, dops)
-        hc.bin_to_lds(c, XROW)
-        stage_router(c, bid - R0, rops)
-    if bid >= RT0:
-        dops = hc.down_loads(c, bid - D0)
-        hc.load_rrms(c)
-        hc.stage_down(c, bid - D0, dops)
-        if is_g:
-            hc.bin_to_lds(c, XROW)
-            stage_sgate(c, bid - RT0)
-    # ---- the routed experts (x: the router / sgate CTAs' is in LDS)
-    nu = moe.run_ug(c, c["ps"], PS0, lambda: _bin_to_lds(c, ~(is_r | is_g)))
-    if bid < OTASKS:
-        dops = moe.down_loads(c, bid, nu, fx.min(c["wave"], nu - 1))
-        moe.load_inter(c)
-        moe.stage_down(c, bid, nu, dops)
-    if bid < hc.NRED:
-        stage_final(c, bid)
 
 
 # ---------------------------------------------------------------- kernel
@@ -453,7 +401,6 @@ def build(key: K2Build):
             "oq": key.oq,
             "og": key.og,
             "u1": key.u1,
-            "ps": key.ps,
             "KT": KT,
             "put": mb.put,
             "put_bf": mb.put_bf,
@@ -511,10 +458,48 @@ def build(key: K2Build):
             "bin": scratch + fx.Int64(scr["bin"][0]),
             "inj_out": lambda t, r, vs: _put_inj(c, t, r, vs),
         }
-        c["msq_final_put"] = lambda jj, t, k, v: bo.buffer_store(
-            v, rsrc(c["args"]["msq_out"]), (jj * c["S"] + t) * HC + k
-        )
-        k2_body(c)
+        is_r = (bid >= R0) & (bid < RT0)
+        is_g = (bid >= RT0) & (bid < RT0 + s)
+        # ---- o_proj, the attention combine, the mlp HC mix, router / sgate:
+        # a CTA's whole sequence in one branch, its weights in flight first
+        if bid < D0:
+            oops = moe.o_loads(c, bid, lay.CORE)
+            moe.run_oproj(c, [oops], lay.CORE)
+            if bid < hc.NRED:
+                stage_attn_combine(c, bid)
+            uops = hc.up_loads(c, bid)
+            hc.load_rrms(c)
+            hc.stage_up(c, bid, uops)
+        if (bid >= D0) & (bid < OTASKS):
+            oops = moe.o_loads(c, bid, lay.CORE)
+            dops = hc.down_loads(c, bid - D0)
+            moe.run_oproj(c, [oops], lay.CORE)
+            uops = hc.up_loads(c, bid)
+            hc.load_rrms(c)
+            hc.stage_down(c, bid - D0, dops)
+            hc.stage_up(c, bid, uops)
+        if is_r:
+            dops = hc.down_loads(c, bid - D0)
+            rops = router_loads(c, bid - R0)
+            hc.load_rrms(c)
+            hc.stage_down(c, bid - D0, dops)
+            hc.bin_to_lds(c, XROW)
+            stage_router(c, bid - R0, rops)
+        if bid >= RT0:
+            dops = hc.down_loads(c, bid - D0)
+            hc.load_rrms(c)
+            hc.stage_down(c, bid - D0, dops)
+            if is_g:
+                hc.bin_to_lds(c, XROW)
+                stage_sgate(c, bid - RT0)
+        # ---- the routed experts (x: the router / sgate CTAs' is in LDS)
+        nu = moe.run_ug(c, key.ps, PS0, lambda: _bin_to_lds(c, ~(is_r | is_g)))
+        if bid < OTASKS:
+            dops = moe.down_loads(c, bid, nu, fx.min(c["wave"], nu - 1))
+            moe.load_inter(c)
+            moe.stage_down(c, bid, nu, dops)
+        if bid < hc.NRED:
+            stage_final(c, bid)
 
     @flyc.jit
     def launch(

@@ -227,7 +227,7 @@ def mono_env(monkeypatch: pytest.MonkeyPatch):
     from vllm.models.qwen3_5.amd.mono import layout as QL
     from vllm.models.qwen4_exp.amd import mono_draft
     from vllm.models.qwen4_exp.amd.model import Qwen4ExpSparseMoeBlock
-    from vllm.models.qwen4_exp.amd.mono import back, front, head, k1, k2
+    from vllm.models.qwen4_exp.amd.mono import front, head, k1, k2
     from vllm.models.qwen4_exp.amd.mono import layout as L
     from vllm.models.qwen4_exp.amd.qsa import Qwen4ExpQSAAttention
     from vllm.platforms import current_platform
@@ -263,7 +263,6 @@ def mono_env(monkeypatch: pytest.MonkeyPatch):
         "k2": _patch_build(monkeypatch, k2),
         "front": _patch_build(monkeypatch, front),
         "head": _patch_build(monkeypatch, head),
-        "back": _patch_build(monkeypatch, back),
     }
 
     # ---- _qsa_core (GPU / Triton QSA attention): a fixed random (core, gate)
@@ -404,7 +403,6 @@ def mono_env(monkeypatch: pytest.MonkeyPatch):
         k2=k2,
         front=front,
         head=head,
-        back=back,
         L=L,
         lay=lay,
         model=model,
@@ -416,20 +414,16 @@ def mono_env(monkeypatch: pytest.MonkeyPatch):
     )
 
 
-def _make_mono(
-    env, monkeypatch: pytest.MonkeyPatch, *, fused_front: bool, use_back: bool = False
-):
+def _make_mono(env, monkeypatch: pytest.MonkeyPatch, *, fused_front: bool):
     import vllm.envs as envs
 
     monkeypatch.setattr(envs, "VLLM_ROCM_MONO_DRAFT_FRONT", fused_front)
-    monkeypatch.setattr(envs, "VLLM_ROCM_MONO_DRAFT_BACK", use_back)
     mono = env.mono_draft.DraftMonoDecode(env.model, env.vllm_config)
     assert mono.ok, "the fake model graph should pass unsupported()"
     mono.prepare_weights()
     mono.check_weights()
     assert mono.ok, "the fake model graph's weights should pass weights_unsupported()"
     assert (mono._fc is not None) == fused_front
-    assert (mono._back is not None) == use_back
     return mono
 
 
@@ -627,89 +621,3 @@ def test_head_eligible_only_for_asm_mxfp4_lm_head(mono_env, monkeypatch) -> None
     # not the lm_head asm_mxfp4 was told about
     other = types.SimpleNamespace(tp_size=TP)
     assert mono.head_eligible(other, logits_processor, hidden_states) is False
-
-
-# ---------------------------------------------------------------- draft_back
-@pytest.mark.cpu_test
-@pytest.mark.parametrize("s", [1, 3, 8])
-def test_forward_uses_back_once_head_eligible_has_run(
-    mono_env, monkeypatch, s: int
-) -> None:
-    """``forward``'s ``_use_back`` decision: ``forward`` never receives
-    ``lm_head`` (the MTP wrapper owns it, not the predictor ``forward`` is
-    bound to), so it trusts the lm_head-format part of the LAST
-    ``head_eligible`` call. Before that has ever run, ``forward`` falls back
-    to K2 + the mixer's own ``hc_front`` (the existing wiring, already
-    checked by ``test_forward_wiring``); once it has, ``forward`` launches
-    ``back.draft_back`` instead (the attention HC front still runs -- only
-    the post-QSA-core part is replaced), and ``top_tokens`` returns its ids
-    without launching the head again."""
-    env = mono_env
-    L = env.L
-    mono = _make_mono(env, monkeypatch, fused_front=False, use_back=True)
-
-    layer = env.model.layers[0]
-    mlp_hc = layer.mlp_hyper_connection
-    mixer = env.model.hyper_connection_mixer
-    o_proj = layer.self_attn.o_proj
-    mlp = layer.mlp
-    ex = mlp.experts.routed_experts
-
-    input_ids = torch.randint(0, 1000, (s,), dtype=torch.int64)
-    positions = torch.arange(s, dtype=torch.int64)
-    hidden_states = torch.randn(s, L.HH).to(bf)
-
-    # ---- before any head_eligible() call: falls back to the unfused wiring
-    for rec in env.records.values():
-        rec.clear()
-    assert mono._use_back() is False
-    mono.forward(input_ids, positions, hidden_states, None)
-    assert len(env.records["k2"]) == 1
-    assert len(env.records["back"]) == 0
-
-    # ---- head_eligible (as get_top_tokens calls it) caches the lm_head check
-    logits_processor = types.SimpleNamespace(soft_cap=None, scale=1.0)
-    assert mono.head_eligible(env.lm_head, logits_processor, hidden_states) is True
-    assert mono._use_back() is True
-
-    # ---- the next step: forward() now fuses via draft_back
-    for rec in env.records.values():
-        rec.clear()
-    h, state2 = mono.forward(input_ids, positions, hidden_states, None)
-    assert len(env.records["back"]) == 1
-    assert len(env.records["k2"]) == 0
-    assert len(env.records["k1"]) == 1, "the attention HC front still runs"
-
-    call = env.records["back"][0]
-    args, key = call["args"], call["key"]
-    assert key.tokens == s and key.tp == TP
-    assert key.rows == env.lm_head.weight.size(0)
-    assert args["out"] == state2.data_ptr()
-    assert args["h_out"] == h.data_ptr()
-    assert args["w_gate"] == mlp.gate.weight.data_ptr()
-    assert args["w_sg"] == mlp.shared_expert_gate.weight.data_ptr()
-    assert args["w13"] == ex.w13_weight.data_ptr()
-    assert args["w2"] == ex.w2_weight.data_ptr()
-    assert args["w_o"] == o_proj.weight.data_ptr()
-    assert args["hc_w"] == mlp_hc.hc_norm.weight.data_ptr()
-    assert (
-        args["w_down"] == mlp_hc.input_mix_weight_down_block_inject.weight.data_ptr()
-    )
-    assert args["w_up"] == mlp_hc.input_mix_weight_up.weight.data_ptr()
-    assert args["mix_hc_w"] == mixer.hc_norm.weight.data_ptr()
-    assert args["mix_w_down"] == mono._mixer_w_down.data_ptr()
-    assert args["mix_w_up"] == mixer.input_mix_weight_up.weight.data_ptr()
-    assert args["head_w"] == env.lm_head.weight.data_ptr()
-    assert args["head_ws"] == env.lm_head.weight_scale.data_ptr()
-    assert args["valid"] == 124160
-    assert args["vocab_start"] == 0
-    assert args["slot"] == 0
-
-    # ---- top_tokens picks up the pending ids, no further head launch
-    assert s in mono._pending_ids
-    ids = mono._pending_ids[s]
-    assert args["ids"] == ids.data_ptr()
-    out = mono.top_tokens(env.lm_head, h)
-    assert out is ids
-    assert s not in mono._pending_ids, "top_tokens: clears the mark"
-    assert len(env.records["head"]) == 0, "top_tokens: no separate head launch"
