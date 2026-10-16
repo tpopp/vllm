@@ -98,9 +98,41 @@ def test_padded_mixer_down_matches_unpadded() -> None:
 
 
 # ---------------------------------------------------------------- (b) eligible
-class _FakeMetadata:
-    def __init__(self, num_prefills: int):
-        self.num_prefills = num_prefills
+def _fake_qsa_metadata(
+    *, num_prefills: int = 0, num_decodes: int = 3, num_decode_tokens: int | None = None
+):
+    """A real ``QSAForwardMetadata`` (the type ``self_attn.indexer.raw_key_
+    cache.prefix`` actually keys in ``attn_metadata``, unlike the plain
+    ``FlashAttentionMetadata`` at ``self_attn.layer_name``, which has no
+    ``num_prefills``): every field but the three ``eligible`` reads is an
+    empty placeholder. ``num_decode_tokens`` defaults to ``num_decodes`` (a
+    1-row-a-request decode step); pass it explicitly > ``num_decodes`` for a
+    draft-position-0-shaped step (query_len k + 1)."""
+    from vllm.models.qwen4_exp.common.qsa_cache import QSAForwardMetadata
+
+    if num_decode_tokens is None:
+        num_decode_tokens = num_decodes
+    empty = torch.empty(0, dtype=torch.int32)
+    return QSAForwardMetadata(
+        block_table=empty,
+        slot_mapping=empty,
+        seq_lens=empty,
+        query_start_loc=empty,
+        token_to_req=empty,
+        logical_positions=empty,
+        visible_blocks=empty,
+        k_work_metadata=empty,
+        num_actual_tokens=num_decode_tokens,
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decode_tokens,
+        num_prefills=num_prefills,
+        num_prefill_tokens=0,
+        max_query_len=1,
+        decode_query_len=1,
+        max_seq_len=1,
+        storage_block_size=1,
+        compress_ratio=1,
+    )
 
 
 def _fake_mono():
@@ -110,7 +142,7 @@ def _fake_mono():
 
     mono = object.__new__(mono_draft.DraftMonoDecode)
     mono.ok = True
-    mono._probe = "model.layers.48.self_attn.attn"
+    mono._probe = "model.layers.48.self_attn.indexer.raw_key_cache"
     mono.checked = 0
     mono.check_weights = lambda: setattr(mono, "checked", mono.checked + 1)
     return mono
@@ -126,7 +158,7 @@ def _patch_context(monkeypatch, *, piecewise: bool, metadata):
 
 def test_eligible_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     mono = _fake_mono()
-    md = {mono._probe: _FakeMetadata(num_prefills=0)}
+    md = {mono._probe: _fake_qsa_metadata()}
     _patch_context(monkeypatch, piecewise=False, metadata=md)
     input_ids = torch.zeros(3, dtype=torch.int64)
     assert mono.eligible(input_ids, None) is True
@@ -144,6 +176,7 @@ def test_eligible_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
         "no_metadata_dict",
         "missing_probe",
         "has_prefills",
+        "draft_position_0",
     ],
 )
 def test_eligible_rejects(monkeypatch: pytest.MonkeyPatch, setup: str) -> None:
@@ -153,7 +186,7 @@ def test_eligible_rejects(monkeypatch: pytest.MonkeyPatch, setup: str) -> None:
     input_ids = torch.zeros(3, dtype=torch.int64)
     intermediate_tensors = None
     piecewise = False
-    md: object = {mono._probe: _FakeMetadata(num_prefills=0)}
+    md: object = {mono._probe: _fake_qsa_metadata()}
 
     if setup == "not_ok":
         mono.ok = False
@@ -170,7 +203,12 @@ def test_eligible_rejects(monkeypatch: pytest.MonkeyPatch, setup: str) -> None:
     elif setup == "missing_probe":
         md = {}
     elif setup == "has_prefills":
-        md = {mono._probe: _FakeMetadata(num_prefills=1)}
+        md = {mono._probe: _fake_qsa_metadata(num_prefills=1)}
+    elif setup == "draft_position_0":
+        # supports_spec_as_decode also reports num_prefills == 0 here, but
+        # every request's query_len is k + 1 (3 requests, 4 rows each), not
+        # the 1-row-a-request decode this step assumes
+        md = {mono._probe: _fake_qsa_metadata(num_decodes=3, num_decode_tokens=12)}
 
     _patch_context(monkeypatch, piecewise=piecewise, metadata=md)
     assert mono.eligible(input_ids, intermediate_tensors) is False

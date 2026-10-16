@@ -143,11 +143,11 @@ def _front_ref(emb, prev, w_ne, w_nh, w_fe, w_fh, ne_eps, nh_eps):
     from vllm.models.qwen4_exp.amd.mono.layout import HC, HIDDEN
 
     s = emb.size(0)
-    en_norm = GemmaRMSNorm(HIDDEN, eps=ne_eps).cuda()
+    en_norm = GemmaRMSNorm(HIDDEN, eps=ne_eps).to(dtype=bf, device="cuda")
     en_norm.weight.data.copy_(w_ne)
     fe = F.linear(en_norm(emb), w_fe)
 
-    hn_norm = GemmaRMSNorm(HIDDEN * HC, eps=nh_eps).cuda()
+    hn_norm = GemmaRMSNorm(HIDDEN * HC, eps=nh_eps).to(dtype=bf, device="cuda")
     hn_norm.weight.data.copy_(w_nh)
     hn = hn_norm(prev).view(s, HC, HIDDEN)
     fh = F.linear(hn, w_fh)
@@ -174,11 +174,14 @@ def test_draft_front_matches_vllm_ops(s: int) -> None:
     w_fe = _randn(g, HIDDEN, HIDDEN, scale=0.05)
     w_fh = _randn(g, HIDDEN, HIDDEN, scale=0.05)
     hw = _hc_weights(g)
+    # distinct from each other and from _mix_ref's hardcoded hc eps (1e-6):
+    # a kernel that swapped ne_eps / nh_eps would still pass with equal values
+    ne_eps, nh_eps = 1e-5, 3e-6
 
-    want_state = _front_ref(emb, prev, w_ne, w_nh, w_fe, w_fh, 1e-6, 1e-6)
+    want_state = _front_ref(emb, prev, w_ne, w_nh, w_fe, w_fh, ne_eps, nh_eps)
     want_x, want_inj, _ = _mix_ref(want_state, hw)
 
-    key = front.FrontBuild(tokens=s, tp=TP)
+    key = front.FrontBuild(tokens=s, tp=TP, ne_eps=ne_eps, nh_eps=nh_eps)
     state = torch.full((s, HH), float("nan"), dtype=bf, device="cuda")
     x = torch.full((s, HIDDEN), float("nan"), dtype=bf, device="cuda")
     inj = torch.full((s, HC), float("nan"), dtype=bf, device="cuda")
@@ -186,6 +189,7 @@ def test_draft_front_matches_vllm_ops(s: int) -> None:
     epoch = torch.ones(1, dtype=torch.int32, device="cuda")
 
     def _fused():
+        epoch.add_(1)
         front.draft_front(
             key,
             emb=emb,
@@ -218,7 +222,8 @@ def test_draft_front_matches_vllm_ops(s: int) -> None:
     k1scratch = torch.zeros(k1.scratch_bytes(k1key), dtype=torch.uint8, device="cuda")
 
     def _stock():
-        state_ref = _front_ref(emb, prev, w_ne, w_nh, w_fe, w_fh, 1e-6, 1e-6)
+        epoch.add_(1)
+        state_ref = _front_ref(emb, prev, w_ne, w_nh, w_fe, w_fh, ne_eps, nh_eps)
         k1.hc_front(
             k1key,
             state=state_ref,

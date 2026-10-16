@@ -391,12 +391,13 @@ def build(key: FrontBuild):
             "inj_out": lambda t, r, vs: _put_inj(c, t, r, vs),
         }
         # ---- F1 (norms) + F2 (fc projections), CTAs 0 .. 159 double as F1's
-        # producers (0 .. 19) and the HC front's up tasks
-        if bid < hc.NRED:
-            stage_front_msq(c, bid)
+        # producers (0 .. 19) and the HC front's up tasks; w_fe / w_fh loaded
+        # first (in flight while F1's producers run and load_rrms_front polls)
         if bid < hc.UP_TASKS:
             fe_ops = gemv.loads(c["lane"], c["wave"], w_fe, bid * ROWS, H)
             fh_ops = gemv.loads(c["lane"], c["wave"], w_fh, bid * ROWS, H)
+            if bid < hc.NRED:
+                stage_front_msq(c, bid)
             load_rrms_front(c)
             stage_fc(c, bid, fe_ops, fh_ops)
         # ---- F3: k1's front_only HC front, waiting on every F2 flag first;
