@@ -73,6 +73,16 @@ def fused_front() -> bool:
     return envs.VLLM_ROCM_MONO_DRAFT_FRONT
 
 
+def back_enabled() -> bool:
+    """K2 + the final mixer's HC front + the draft head fused into one
+    launch (``mono.back``), instead of K2 + a separate ``hc_front``. Needs
+    the MXFP4 ASM-GEMM draft head (``fused_head()``); see
+    ``DraftMonoDecode._use_back``."""
+    from vllm import envs
+
+    return envs.VLLM_ROCM_MONO_DRAFT_BACK
+
+
 class DraftMonoDecode(B.QwenMonoDecode):
     """Bound to one ``Qwen4ExpMultiTokenPredictor``; built at model init on
     every rank."""
@@ -87,6 +97,17 @@ class DraftMonoDecode(B.QwenMonoDecode):
     def __init__(self, model, vllm_config):
         super().__init__(model, vllm_config)
         self._head = None
+        self._back = None
+        # top_tokens() can't launch the head twice a step: forward() stashes
+        # draft_back's ids here, by width, for top_tokens() to pick up
+        self._pending_ids: dict[int, torch.Tensor] = {}
+        # forward() decides whether to fuse via draft_back, but it is never
+        # given lm_head (the MTP wrapper owns it, not the predictor forward()
+        # is bound to) -- it trusts the static part of the last
+        # head_eligible() call instead (see _use_back); the very first draft
+        # step of a run (before head_eligible has ever run) always falls back
+        self._lm_head_static_ok = False
+        self._lm_head = None
         if not self.ok or not fused_head():
             return
         from vllm.distributed import get_tp_group
@@ -114,6 +135,28 @@ class DraftMonoDecode(B.QwenMonoDecode):
             ),
         }
         self._head["peers"].bytes.zero_()
+        if back_enabled():
+            from vllm.models.qwen4_exp.amd.mono import back
+
+            # its own epoch, scratch and peers too: draft_back's own tag
+            # space must never alias the attention-HC-front / K2 launches'
+            self._back = {
+                "epoch": torch.zeros(1, dtype=torch.int32, device=dev),
+                "scratch": {
+                    n: torch.zeros(
+                        (back.scratch_bytes(back.BackBuild(tokens=n, tp=self.tp)) + 255)
+                        // 256
+                        * 256,
+                        dtype=torch.uint8,
+                        device=dev,
+                    )
+                    for n in self.k1_scratch
+                },
+                "peers": PeerBuffer(
+                    back.peer_bytes(self.tp), tp.cpu_group, self.rank, self.tp, dev
+                ),
+            }
+            self._back["peers"].bytes.zero_()
 
     @cached_property
     def lay(self) -> L.Layout:
@@ -121,21 +164,38 @@ class DraftMonoDecode(B.QwenMonoDecode):
 
     def head_eligible(self, lm_head, logits_processor, hidden_states) -> bool:
         """``get_top_tokens`` of at most ``MAX_TOKENS`` rows on the MXFP4
-        draft head (every rank decides alike: shapes and module state)."""
+        draft head (every rank decides alike: shapes and module state).
+        Also caches the lm_head-format part of this check (``_lm_head_static_
+        ok`` / ``_lm_head``) for ``forward()``'s own ``_use_back`` decision:
+        ``forward()`` never receives ``lm_head`` itself."""
         if self._head is None or in_piecewise_cudagraph():
             return False
         if not 1 <= hidden_states.size(0) <= self.MAX_TOKENS:
             return False
         if logits_processor.soft_cap is not None or logits_processor.scale != 1.0:
             return False
-        return B.asm_mxfp4(lm_head) and lm_head.tp_size == self.tp
+        ok = B.asm_mxfp4(lm_head) and lm_head.tp_size == self.tp
+        self._lm_head_static_ok, self._lm_head = ok, lm_head
+        return ok
+
+    def _use_back(self) -> bool:
+        """Whether ``forward()`` should fuse via ``back.draft_back`` instead
+        of K2 + the mixer's own ``hc_front``: the back buffers were built
+        (``back_enabled()`` at construction) and the last ``head_eligible()``
+        call found an MXFP4 ASM-GEMM lm_head at this rank's TP size (the only
+        part of that check that doesn't vary step to step)."""
+        return self._back is not None and self._lm_head_static_ok
 
     def top_tokens(self, lm_head, hidden_states) -> torch.Tensor:
-        """Greedy draft tokens: ``LogitsProcessor.get_top_tokens``'s result
-        from one ``mono.head`` launch."""
+        """Greedy draft tokens: ``LogitsProcessor.get_top_tokens``'s result,
+        from this step's ``draft_back`` launch if ``forward()`` already
+        computed them, else from one ``mono.head`` launch."""
         from vllm.models.qwen4_exp.amd.mono import head
 
         s = hidden_states.size(0)
+        pending = self._pending_ids.pop(s, None)
+        if pending is not None:
+            return pending
         hd = self._head
         hd["epoch"].add_(1)
         si = lm_head.shard_indices
@@ -474,6 +534,9 @@ class DraftMonoDecode(B.QwenMonoDecode):
             )
         core, gate = _qsa_core(layer.self_attn, x, positions)
 
+        if self._use_back():
+            return self._back_step(layer, state, inj, core, gate)
+
         mlp_hc = layer.mlp_hyper_connection
         mlp = layer.mlp
         ex = mlp.experts.routed_experts
@@ -535,6 +598,72 @@ class DraftMonoDecode(B.QwenMonoDecode):
             epoch=self.epoch,
             layer=layer.layer_idx + 1,
         )
+        return h, state2
+
+    def _back_step(self, layer, state, inj, core, gate):
+        """``forward()``'s K2 + mixer-front replacement: one ``back.
+        draft_back`` launch for K2, the final mixer's HC front and the draft
+        head together, stashing the head's ids for ``top_tokens`` (see
+        ``_use_back``)."""
+        from vllm.models.qwen4_exp.amd.mono import back
+
+        s = core.size(0)
+        mixer = self.model.hyper_connection_mixer
+        mlp_hc = layer.mlp_hyper_connection
+        mlp = layer.mlp
+        ex = mlp.experts.routed_experts
+        o = B.o_proj(layer)
+        oq = B.asm_mxfp4(o)
+        lm_head = self._lm_head
+        si = lm_head.shard_indices
+
+        bd = self._back
+        bd["epoch"].add_(1)
+        state2 = torch.empty_like(state)
+        h = torch.empty(s, L.HIDDEN, dtype=state.dtype, device=state.device)
+        ids = torch.empty(s, dtype=torch.int64, device=state.device)
+        back.draft_back(
+            back.BackBuild(
+                tokens=s,
+                tp=self.tp,
+                eps=mlp_hc.config.rms_norm_eps,
+                mixer_eps=mixer.config.rms_norm_eps,
+                oq=oq,
+                og=gate is not None,
+                rows=lm_head.weight.size(0),
+            ),
+            core=core,
+            gate=gate,
+            state=state,
+            inj_a=inj,
+            w_o=o.weight,
+            w_os=o.weight_scale if oq else None,
+            hc_w=mlp_hc.hc_norm.weight,
+            w_down=mlp_hc.input_mix_weight_down_block_inject.weight,
+            w_up=mlp_hc.input_mix_weight_up.weight,
+            w_gate=mlp.gate.weight,
+            w_sg=mlp.shared_expert_gate.weight,
+            w13=ex.w13_weight,
+            w13s=ex.w13_weight_scale,
+            w2=ex.w2_weight,
+            w2s=ex.w2_weight_scale,
+            mix_hc_w=mixer.hc_norm.weight,
+            mix_w_down=self._mixer_w_down,
+            mix_w_up=mixer.input_mix_weight_up.weight,
+            head_w=lm_head.weight,
+            head_ws=lm_head.weight_scale,
+            valid=si.org_vocab_end_index - si.org_vocab_start_index,
+            vocab_start=si.org_vocab_start_index,
+            out=state2,
+            h_out=h,
+            ids=ids,
+            scratch=bd["scratch"][s],
+            peers=bd["peers"].addresses,
+            rank=self.rank,
+            epoch=bd["epoch"],
+            slot=0,
+        )
+        self._pending_ids[s] = ids
         return h, state2
 
     def _fused_front(self, input_ids, hidden_states, inputs_embeds, x, inj):

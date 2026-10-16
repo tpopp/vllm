@@ -262,6 +262,20 @@ def stage_token_rank(c, t):
         _store_i64(c["args"]["out"], t, fi)
 
 
+@traced
+def head_body(c, groups):
+    """``quant_x`` / ``run_head`` / ``stage_cta`` / ``stage_token_rank``:
+    every CTA's row groups -> a (max, local row), then the TP-wide argmax ->
+    ``c["args"]["out"]``. Reusable in a fused kernel (``back.py``) whose x
+    rows are already MXFP4-exact in ``c["xl"]`` (there loaded by an earlier
+    phase's ``hc.bin_to_lds``, not this module's own ``gemv.rows_to_lds``)."""
+    quant_x(c, H)
+    c["best"] = run_head(c, groups)
+    stage_cta(c)
+    if (c["bid"] == 0) & (c["wave"] < c["S"]):
+        stage_token_rank(c, c["wave"])
+
+
 # ---------------------------------------------------------------- kernel
 _BUILDS: dict = {}
 
@@ -346,15 +360,7 @@ def build(key: HeadBuild):
 
         # ---- every CTA: x into LDS, MXFP4-exact (as the ASM GEMM reads it)
         gemv.rows_to_lds(tid, x, H, s, xl, XROW)
-        quant_x(c, H)
-
-        # ---- the shard's row groups -> one (max, local row) a token a CTA
-        c["best"] = run_head(c, groups)
-        stage_cta(c)
-
-        # ---- CTA 0, a token a wave: every CTA's winner, then every rank's
-        if (bid == 0) & (wave < s):
-            stage_token_rank(c, wave)
+        head_body(c, groups)
 
     @flyc.jit
     def launch(

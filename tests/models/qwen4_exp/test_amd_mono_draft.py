@@ -10,6 +10,8 @@
 - the draft's three launches (the attention HC front, K2, the mixer HC
   front) against the stock torch ops, on MI355X (skipped elsewhere, as
   ``test_amd_mono.py``).
+- ``back.draft_back`` (K2 + the mixer HC front + the draft head, one fused
+  launch) against the equivalent three separate launches, on MI355X.
 """
 
 import types
@@ -415,3 +417,237 @@ def _draft_step_worker(
         dist.all_gather(outs, h)
         assert all(torch.equal(outs[0], o) for o in outs), (s, "ranks disagree")
     peers.close()
+
+
+# ---------------------------------------------------------------- draft_back
+def _assert_bitwise_or_report(
+    a: torch.Tensor, b: torch.Tensor, name: str, s: int
+) -> None:
+    """``a`` and ``b`` bitwise equal, else an ``AssertionError`` reporting the
+    max absolute difference and how many elements differ."""
+    if torch.equal(a, b):
+        return
+    diff = (a.float() - b.float()).abs()
+    bad = int((diff > 0).sum().item())
+    raise AssertionError(
+        f"{name} differs at s={s}: max abs diff {diff.max().item()}, "
+        f"{bad} / {diff.numel()} elements differ"
+    )
+
+
+def _draft_back_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    tp_size: int,
+    pp_size: int,
+    rank: int,
+    distributed_init_port: str,
+) -> None:
+    """``back.draft_back`` against the equivalent three separate launches
+    (K2 -> the mixer's ``hc_front`` -> ``draft_head``), identical inputs and
+    weights, two ranks. A small lm_head shard (rows 4832, a non-16-aligned
+    valid cutoff at 4800, as ``test_amd_mono.py``'s ``_head_worker``), so the
+    comparison runs quickly; the head's own numerics are already checked
+    against a dequantized reference there."""
+    import torch.distributed as dist
+
+    from tests.models.qwen3_5.test_amd_mono import _randn
+    from tests.models.qwen4_exp.test_amd_mono import (
+        _hc_weights,
+        _lmhead_weights,
+        _moe_weights,
+    )
+    from tests.utils import init_test_distributed_environment
+    from vllm.distributed import get_tp_group
+    from vllm.models.kimi_k3.amd.mono.common.peer_memory import PeerBuffer
+    from vllm.models.qwen4_exp.amd.mono import back, head, k1, k2
+    from vllm.models.qwen4_exp.amd.mono.layout import (
+        DOWN_ROWS,
+        HC,
+        HH,
+        HIDDEN,
+        LORA,
+        MAX_TOKENS,
+        Layout,
+    )
+
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    device = torch.device(f"cuda:{rank}")
+    torch.accelerator.set_device_index(device)
+    init_test_distributed_environment(tp_size, pp_size, rank, distributed_init_port)
+
+    lay = Layout(TP)
+    tp = get_tp_group()
+    k2_peers = PeerBuffer(
+        k2.peer_bytes(MAX_TOKENS, TP), tp.cpu_group, rank, tp_size, device
+    )
+    head_peers = PeerBuffer(head.peer_bytes(TP), tp.cpu_group, rank, tp_size, device)
+    back_peers = PeerBuffer(back.peer_bytes(TP), tp.cpu_group, rank, tp_size, device)
+    for p in (k2_peers, head_peers, back_peers):
+        p.bytes.zero_()
+    epoch = torch.zeros(1, dtype=torch.int32, device=device)
+    back_epoch = torch.zeros(1, dtype=torch.int32, device=device)
+
+    gc = torch.Generator(device=device).manual_seed(61)  # replicated weights
+    mlp_hw = _hc_weights(gc)  # K2's own mlp HC
+    mixer_down = _randn(gc, LORA, HH, scale=0.01)
+    mixer_padded = torch.zeros(DOWN_ROWS, HH, dtype=bf, device=device)
+    mixer_padded[:LORA] = mixer_down
+    mixer_hw = {
+        "hc_w": _randn(gc, HH, scale=0.1),
+        "w_down": mixer_padded,
+        "w_up": _randn(gc, HH, LORA, scale=0.05),
+    }
+    w_o = _randn(gc, HIDDEN, lay.CORE, scale=0.02)  # bf16 o_proj: not asm_mxfp4
+    mw = _moe_weights(rank, device)
+
+    v_r, valid = 4832, 4800  # a small shard: rows a multiple of 32, non-aligned valid
+    vocab_start = rank * v_r
+    _, _, head_w, head_ws = _lmhead_weights(rank, device, v_r)
+
+    for s in (1, 3, 8):
+        epoch.add_(1)
+        back_epoch.add_(1)
+        gr = torch.Generator(device=device).manual_seed(610 + rank * 100 + s)
+        state = _randn(gc, s, HH, scale=2.0)
+        inj_a = _randn(gc, s, HC)
+        core = _randn(gr, s, lay.CORE)
+        gate = _randn(gr, s, lay.CORE, scale=2.0)
+
+        # ---- reference: the three separate launches
+        state2 = torch.full((s, HH), float("nan"), dtype=bf, device=device)
+        msq = torch.full((20, s, HC), float("nan"), device=device)
+        k2_key = k2.K2Build(tokens=s, tp=TP, og=True)
+        scratch2 = torch.zeros(
+            k2.scratch_bytes(k2_key), dtype=torch.uint8, device=device
+        )
+        k2.layer_post(
+            k2_key,
+            core=core,
+            gate=gate,
+            state=state,
+            inj_a=inj_a,
+            w_o=w_o,
+            **mlp_hw,
+            w_gate=mw["w_gate"],
+            w_sg=mw["w_sg"],
+            w13=mw["w13"],
+            w13s=mw["w13s"],
+            w2=mw["w2"],
+            w2s=mw["w2s"],
+            out=state2,
+            msq_out=msq,
+            scratch=scratch2,
+            peers=k2_peers.addresses,
+            rank=rank,
+            epoch=epoch,
+            layer=k2.TAG_SLOTS // 2 + 48,
+        )
+        h = torch.full((s, HIDDEN), float("nan"), dtype=bf, device=device)
+        mixer_inj = torch.full((s, HC), float("nan"), dtype=bf, device=device)
+        k1_key = k1.K1Build(tokens=s, tp=TP, self_msq=False, front_only=True)
+        scratch1 = torch.zeros(
+            k1.scratch_bytes(k1_key), dtype=torch.uint8, device=device
+        )
+        k1.hc_front(
+            k1_key,
+            state=state2,
+            msq_in=msq,
+            **mixer_hw,
+            inj_out=mixer_inj,
+            bin_out=h,
+            scratch=scratch1,
+            epoch=epoch,
+            layer=49,
+        )
+        ids = torch.full((s,), -1, dtype=torch.int64, device=device)
+        head_key = head.HeadBuild(tokens=s, tp=TP, rows=v_r)
+        hscratch = torch.zeros(
+            head.scratch_bytes(head_key), dtype=torch.uint8, device=device
+        )
+        head.draft_head(
+            head_key,
+            x=h,
+            w=head_w,
+            ws=head_ws,
+            valid=valid,
+            vocab_start=vocab_start,
+            out=ids,
+            scratch=hscratch,
+            peers=head_peers.addresses,
+            rank=rank,
+            epoch=epoch,
+            slot=0,
+        )
+        torch.accelerator.synchronize()
+
+        # ---- draft_back: one launch, the identical inputs and weights
+        state2_b = torch.full((s, HH), float("nan"), dtype=bf, device=device)
+        h_b = torch.full((s, HIDDEN), float("nan"), dtype=bf, device=device)
+        ids_b = torch.full((s,), -1, dtype=torch.int64, device=device)
+        back_key = back.BackBuild(tokens=s, tp=TP, og=True, rows=v_r)
+        bscratch = torch.zeros(
+            back.scratch_bytes(back_key), dtype=torch.uint8, device=device
+        )
+        back.draft_back(
+            back_key,
+            core=core,
+            gate=gate,
+            state=state,
+            inj_a=inj_a,
+            w_o=w_o,
+            **mlp_hw,
+            w_gate=mw["w_gate"],
+            w_sg=mw["w_sg"],
+            w13=mw["w13"],
+            w13s=mw["w13s"],
+            w2=mw["w2"],
+            w2s=mw["w2s"],
+            mix_hc_w=mixer_hw["hc_w"],
+            mix_w_down=mixer_hw["w_down"],
+            mix_w_up=mixer_hw["w_up"],
+            head_w=head_w,
+            head_ws=head_ws,
+            valid=valid,
+            vocab_start=vocab_start,
+            out=state2_b,
+            h_out=h_b,
+            ids=ids_b,
+            scratch=bscratch,
+            peers=back_peers.addresses,
+            rank=rank,
+            epoch=back_epoch,
+            slot=0,
+        )
+        torch.accelerator.synchronize()
+
+        _assert_bitwise_or_report(state2_b, state2, "state2", s)
+        _assert_bitwise_or_report(h_b, h, "h", s)
+        assert torch.equal(ids_b, ids), (s, ids_b.tolist(), ids.tolist())
+
+        outs = [torch.empty_like(ids_b) for _ in range(tp_size)]
+        dist.all_gather(outs, ids_b)
+        assert all(torch.equal(outs[0], o) for o in outs), (s, "ranks disagree")
+
+    k2_peers.close()
+    head_peers.close()
+    back_peers.close()
+
+
+@pytest.mark.skipif(
+    not _on_gfx950(), reason="the Flash-Next mono kernels need gfx950 (MI355X)"
+)
+def test_draft_back_matches_three_launches(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``back.draft_back`` (K2 + the final mixer's HC front + the draft head,
+    one launch) against the equivalent three separate launches, S in
+    {1, 3, 8}, two ranks: the materialized state2, the mixer's block input h,
+    and the draft token ids must agree exactly -- the fused kernel reuses the
+    SAME body functions (``k2.k2_body`` / ``k1.front_body`` / ``head.
+    head_body``) unmodified, only its cross-phase hand-offs move from
+    separate launches' external tensors to one launch's mailbox / device-
+    scope stores of the identical values."""
+    import ray
+
+    from tests.utils import multi_process_parallel
+
+    worker = ray.remote(num_gpus=1, max_calls=1)(_draft_back_worker)
+    multi_process_parallel(monkeypatch, 2, 1, worker)

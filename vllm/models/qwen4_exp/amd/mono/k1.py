@@ -190,6 +190,32 @@ def _ba_of(c, t, h):
     return G.ba_sums(c, t, h, BA_PARTS)
 
 
+@traced
+def front_body(c):
+    """``front_only``'s whole body: the HC front's msq / down / up part,
+    reusable in a fused kernel (``back.py``)'s mixer phase. Reads
+    ``c["self_msq"]`` in place of ``key.self_msq``; the GDN-layer (non-
+    front_only) build's in_proj / recurrence stay K1's own, never shared."""
+    bid = c["bid"]
+    if const_expr(c["self_msq"]):  # noqa: SIM102 (traced: `and` does not combine traced values)
+        if bid < hc.NRED:
+            hc.stage_msq(c, bid)
+    if bid < D0:
+        uops = hc.up_loads(c, bid)
+        hc.load_rrms(c)
+        hc.stage_up(c, bid, uops)
+    if (bid >= D0) & (bid < hc.UP_TASKS):
+        dops = hc.down_loads(c, bid - D0)
+        uops = hc.up_loads(c, bid)
+        hc.load_rrms(c)
+        hc.stage_down(c, bid - D0, dops)
+        hc.stage_up(c, bid, uops)
+    if bid >= hc.UP_TASKS:
+        dops = hc.down_loads(c, bid - D0)
+        hc.load_rrms(c)
+        hc.stage_down(c, bid - D0, dops)
+
+
 # ---------------------------------------------------------------- kernel
 def _put_inj(c, t, r, vs):
     """The injection rows r, r + 1 of token t -> ``inj_out`` [S, HC] bf16."""
@@ -343,27 +369,24 @@ def build(key: K1Build):
         }
         # ---- the HC front: a CTA's whole sequence in one branch, its weights
         # (and its in_proj_qkvz ones) in flight first
-        if const_expr(not key.front_only):
-            qops = [qkvz_loads(c, bid + BLOCKS * j) for j in range(2)]
-        if const_expr(key.self_msq):  # noqa: SIM102 (traced: `and` does not combine traced values)
-            if bid < hc.NRED:
-                hc.stage_msq(c, bid)
-        if bid < D0:
-            uops = hc.up_loads(c, bid)
-            hc.load_rrms(c)
-            hc.stage_up(c, bid, uops)
-        if (bid >= D0) & (bid < hc.UP_TASKS):
-            dops = hc.down_loads(c, bid - D0)
-            uops = hc.up_loads(c, bid)
-            hc.load_rrms(c)
-            hc.stage_down(c, bid - D0, dops)
-            hc.stage_up(c, bid, uops)
+        c["self_msq"] = key.self_msq
         if const_expr(key.front_only):
-            if bid >= hc.UP_TASKS:
+            front_body(c)
+        else:
+            qops = [qkvz_loads(c, bid + BLOCKS * j) for j in range(2)]
+            if const_expr(key.self_msq):  # noqa: SIM102 (traced: `and` does not combine traced values)
+                if bid < hc.NRED:
+                    hc.stage_msq(c, bid)
+            if bid < D0:
+                uops = hc.up_loads(c, bid)
+                hc.load_rrms(c)
+                hc.stage_up(c, bid, uops)
+            if (bid >= D0) & (bid < hc.UP_TASKS):
                 dops = hc.down_loads(c, bid - D0)
+                uops = hc.up_loads(c, bid)
                 hc.load_rrms(c)
                 hc.stage_down(c, bid - D0, dops)
-        else:
+                hc.stage_up(c, bid, uops)
             is_ba = (bid >= BA0) & (bid < BA0 + nba)
             if is_ba:
                 dops = hc.down_loads(c, bid - D0)
