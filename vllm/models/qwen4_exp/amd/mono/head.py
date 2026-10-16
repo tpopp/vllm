@@ -44,10 +44,11 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import gpu, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int32, Int64
 
 from vllm.models.kimi_k3.amd.mono.common.ops import (
+    CM_NT,
     bf16_round,
     ld_i32,
     load_ptr64,
@@ -70,6 +71,7 @@ from vllm.models.kimi_k3.amd.mono.common.sync import Mailbox, preg, shift, sreg
 from vllm.models.kimi_k3.amd.mono.stages import gemv
 from vllm.models.qwen3_5.amd.mono.moe import fp4_gemv, fp4_gemv_loads, quant_x, step_tag
 from vllm.models.qwen4_exp.amd.mono import layout as L
+from vllm.models.qwen4_exp.amd.mono import stamps
 from vllm.models.qwen4_exp.amd.mono.layout import need
 from vllm.models.qwen4_exp.amd.mono.sources import digest
 
@@ -88,6 +90,10 @@ class HeadBuild:
     tokens: int
     tp: int = 2
     rows: int = 124160  # this rank's vocab shard, padding included: a multiple of 32
+    ahead: int = AHEAD  # row groups' weights kept in flight (Stage 0c E0.b sweep)
+    cm: int = CM_NT  # weight-tile load cache policy (E0.b/c: cm=0 is device-scope)
+    loads_only: bool = False  # E0.d: XOR-sink the GEMV, barriers off (loop floor)
+    trace: bool = False  # emit in-kernel timestamps to a `dbg` buffer (stamps.py)
 
 
 ABI = KernelAbi(
@@ -103,6 +109,7 @@ ABI = KernelAbi(
         "rank",
         "epoch",
         "slot",
+        "dbg",  # Stage 0a: stamps.py target, 256 * stamps.NSLOT int32; 0 when off
     )
 )
 
@@ -154,9 +161,21 @@ def _better(val, idx, best_val, best_idx):
 
 
 def _group_ops(c, gi):
-    """Row group ``gi``'s online-MXFP4 operands for this wave."""
+    """Row group ``gi``'s online-MXFP4 operands for this wave. ``c["cm"]``:
+    the weight-tile load's cache policy (default ``CM_NT``, as before this
+    knob existed; Stage 0c E0.b/E0.c sweep it to test MALL residency)."""
     a = c["args"]
-    return fp4_gemv_loads(c["lane"], c["wave"], a["w"], a["ws"], gi, H)
+    return fp4_gemv_loads(c["lane"], c["wave"], a["w"], a["ws"], gi, H, cm=c.get("cm", CM_NT))
+
+
+def _xor_fold(acc, op):
+    """``op`` (an ``fp4_gemv_loads`` operand: a dwordx4 ``fx.Vector`` tile, or
+    a plain ``fx.Int32`` scale word) XOR-folded into ``acc``: E0.d's
+    ``loads_only`` sink, enough to keep the loads from being dead-code-
+    eliminated without paying for the real GEMV / row reduce / barriers."""
+    if isinstance(op, fx.Vector):
+        return acc ^ op[0] ^ op[3]
+    return acc ^ op
 
 
 def _store_i64(ptr, i, v):
@@ -172,36 +191,60 @@ def _store_i64(ptr, i, v):
 def run_head(c, groups):
     """This rank's vocab shard, 16-row groups ``bid, bid + 256, ...`` (a
     dynamic loop: a CTA whose first group is already past ``groups`` never
-    runs its body, as a non-live round used to be masked): ``AHEAD`` groups'
-    online-MXFP4 operands kept in flight (``run_ug``'s union-task pipelining),
-    each group's bf16-rounded logits folded into a running (max, global row)
-    a token. Returns (best_val, best_idx)."""
+    runs its body, as a non-live round used to be masked): ``c["ahead"]``
+    groups' online-MXFP4 operands kept in flight (``run_ug``'s union-task
+    pipelining; ``AHEAD`` default, Stage 0c E0.b sweeps it), each group's
+    bf16-rounded logits folded into a running (max, global row) a token.
+
+    ``c["loads_only"]`` (E0.d): skip the GEMV, row reduce, and the loop's two
+    barriers, XOR-folding the loaded tiles into a sink instead -- isolates
+    the load pipeline's time from the compute/sync floor, at the cost of a
+    meaningless ``(best_val, best_idx)`` (never read back by a caller that
+    sets this).
+
+    Returns (best_val, best_idx)."""
     lane, wave, tid, s, red = c["lane"], c["wave"], c["tid"], c["S"], c["red"]
     xl, valid, bid = c["xl"], c["valid"], c["bid"]
+    # ``.get`` with the pre-knob defaults: ``back.py``'s fused kernel reuses
+    # this function (and ``_group_ops``, above) through its own ``c``, which
+    # never sets these keys -- this keeps that caller's behavior unchanged
+    # rather than a KeyError.
+    ahead, loads_only = c.get("ahead", AHEAD), c.get("loads_only", False)
     last = groups - 1
     g = bid
-    ops = [_group_ops(c, fx.min(g + BLOCKS * j, last)) for j in range(AHEAD)]
+    ops = [_group_ops(c, fx.min(g + BLOCKS * j, last)) for j in range(ahead)]
     best_val = fx.Float32(NEG_INF)
     best_idx = fx.Int32(0)
+    sink = fx.Int32(0)
     mine = tid < RP * s
     r = 2 * (tid % RP)
     t = fx.min(tid // RP, s - 1)
     while g < groups:
-        ops_n = _group_ops(c, fx.min(g + BLOCKS * AHEAD, last))
-        acc = fp4_gemv(lane, wave, xl, XROW, H, s, g, ops[0])
-        fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
-        gpu.barrier()
-        v0 = _safe(bf16_round(row_sum(red, r, t)))
-        v1 = _safe(bf16_round(row_sum(red, r + 1, t)))
-        idx0 = g * ROWS + r
-        idx1 = idx0 + 1
-        cv0 = (mine & (idx0 < valid)).select(v0, fx.Float32(NEG_INF))
-        cv1 = (mine & (idx1 < valid)).select(v1, fx.Float32(NEG_INF))
-        best_val, best_idx = _better(cv0, idx0, best_val, best_idx)
-        best_val, best_idx = _better(cv1, idx1, best_val, best_idx)
-        gpu.barrier()
+        ops_n = _group_ops(c, fx.min(g + BLOCKS * ahead, last))
+        if const_expr(loads_only):
+            for i in range_constexpr(len(ops[0])):
+                sink = _xor_fold(sink, ops[0][i])
+        else:
+            acc = fp4_gemv(lane, wave, xl, XROW, H, s, g, ops[0])
+            fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
+            gpu.barrier()
+            v0 = _safe(bf16_round(row_sum(red, r, t)))
+            v1 = _safe(bf16_round(row_sum(red, r + 1, t)))
+            idx0 = g * ROWS + r
+            idx1 = idx0 + 1
+            cv0 = (mine & (idx0 < valid)).select(v0, fx.Float32(NEG_INF))
+            cv1 = (mine & (idx1 < valid)).select(v1, fx.Float32(NEG_INF))
+            best_val, best_idx = _better(cv0, idx0, best_val, best_idx)
+            best_val, best_idx = _better(cv1, idx1, best_val, best_idx)
+            gpu.barrier()
         g = g + BLOCKS
         ops = ops[1:] + [ops_n]
+    if const_expr(loads_only):
+        # keep `sink` live (never dead-code-eliminated) without perturbing
+        # the real result: this sentinel value is never hit in practice (a
+        # NaN-pattern logit would already have lost any real comparison).
+        if (tid == 0) & (sink == fx.Int32(0x7EADBEEF)):
+            best_val = fx.Float32(NEG_INF)
     return best_val, best_idx
 
 
@@ -270,7 +313,9 @@ def head_body(c, groups):
     rows are already MXFP4-exact in ``c["xl"]`` (there loaded by an earlier
     phase's ``hc.bin_to_lds``, not this module's own ``gemv.rows_to_lds``)."""
     quant_x(c, H)
+    stamps.stamp(c, 8)  # Stage 0a: after rows_to_lds (kernel entry) + quant_x
     c["best"] = run_head(c, groups)
+    stamps.stamp(c, 9)  # Stage 0a: after run_head
     stage_cta(c)
     if (c["bid"] == 0) & (c["wave"] < c["S"]):
         stage_token_rank(c, c["wave"])
@@ -318,6 +363,7 @@ def build(key: HeadBuild):
         rank: Int32,
         epoch: Int64,
         slot: Int32,
+        dbg: Int64,
     ):
         _ = keyed
         tid = fx.thread_idx.x
@@ -355,12 +401,18 @@ def build(key: HeadBuild):
             "cta": sreg(scratch, scr["cta"][0], "cta"),
             "peer_head": peer_head,
             "peer_head_own": peer_head_own,
+            "ahead": key.ahead,
+            "cm": key.cm,
+            "loads_only": key.loads_only,
+            "dbg": dbg if key.trace else None,
             "args": {"w": w, "ws": ws, "out": out},
         }
 
+        stamps.stamp(c, 0)  # Stage 0a: kernel entry
         # ---- every CTA: x into LDS, MXFP4-exact (as the ASM GEMM reads it)
         gemv.rows_to_lds(tid, x, H, s, xl, XROW)
         head_body(c, groups)
+        stamps.stamp(c, 10)  # Stage 0a: kernel end
 
     @flyc.jit
     def launch(
@@ -375,11 +427,12 @@ def build(key: HeadBuild):
         rank: Int32,
         epoch: Int64,
         slot: Int32,
+        dbg: Int64,
         stream: fx.Stream = _STREAM,
     ):
         _ = keyed
         head(
-            x, w, ws, valid, vocab_start, out, scratch, peers, rank, epoch, slot
+            x, w, ws, valid, vocab_start, out, scratch, peers, rank, epoch, slot, dbg
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     ABI.check(head, launch)
@@ -401,6 +454,7 @@ def draft_head(
     rank: int,
     epoch,
     slot: int,
+    dbg=None,
 ):
     """Host launcher: one persistent launch of the draft head's MXFP4 lm_head
     GEMV + greedy argmax over the full vocab and the TP ranks. ``x`` [S, H]
@@ -416,7 +470,8 @@ def draft_head(
     carries the step's epoch). ``peers``: the int64 table of every rank's
     peer buffer (>= ``peer_bytes(key.tp)`` each, as ``PeerBuffer`` gives K2).
     ``epoch`` a device int32 bumped once a step, ``slot`` this launch's tag
-    slot."""
+    slot. ``dbg``: Stage 0a's stamp buffer (``stamps.dbg_buffer``), required
+    iff ``key.trace``; ignored (and may be omitted) otherwise."""
     s = key.tokens
     bf = torch.bfloat16
     fp4s = (torch.uint8, torch.float4_e2m1fn_x2)
@@ -432,6 +487,7 @@ def draft_head(
     need(0 <= valid <= key.rows, "valid: rows of this shard that are real vocab")
     need(out.shape == (s,) and out.dtype == torch.int64, f"out: int64 [{s}]")
     need(all(t.is_contiguous() for t in (x, w, ws, out)), "a non-contiguous input")
+    need(key.trace == (dbg is not None), "dbg: required iff key.trace")
     f = build(key)
     f(
         *ABI.pack(
@@ -447,6 +503,7 @@ def draft_head(
                 "rank": rank,
                 "epoch": epoch.data_ptr(),
                 "slot": slot,
+                "dbg": 0 if dbg is None else dbg.data_ptr(),
             }
         ),
         stream=torch.cuda.current_stream(),

@@ -42,7 +42,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T
 
 from vllm.models.kimi_k3.amd.mono.common.ops import (
@@ -51,10 +51,12 @@ from vllm.models.kimi_k3.amd.mono.common.ops import (
     bf16_round,
     bf_hi,
     bf_lo,
+    ld_i32,
     hw_rsq,
     row_sum,
     rsrc,
     traced,
+    uniform,
     wave_sum,
 )
 from vllm.models.kimi_k3.amd.mono.common.plan import (
@@ -70,6 +72,7 @@ from vllm.models.kimi_k3.amd.mono.stages import gemv
 from vllm.models.qwen3_5.amd.mono.moe import step_tag
 from vllm.models.qwen4_exp.amd.mono import hc
 from vllm.models.qwen4_exp.amd.mono import layout as L
+from vllm.models.qwen4_exp.amd.mono import stamps
 from vllm.models.qwen4_exp.amd.mono.layout import need
 from vllm.models.qwen4_exp.amd.mono.sources import digest
 
@@ -89,6 +92,9 @@ class FrontBuild:
     eps: float = 1e-6  # the attention HC norm (k1 / k2's)
     ne_eps: float = 1e-6  # pre_fc_norm_embedding
     nh_eps: float = 1e-6  # pre_fc_norm_hidden (one norm over all 4 H)
+    trace: bool = False  # emit in-kernel timestamps to a `dbg` buffer (stamps.py)
+    pre_fh: bool = False  # E6.1: fh := prev[.., kH + 16g ..] straight (no fc_hidden)
+    emb_ids: bool = False  # E6b.2: `emb` is a replicated vocab table, gather by `ids`
 
 
 ABI = KernelAbi(
@@ -108,6 +114,8 @@ ABI = KernelAbi(
         "scratch",
         "epoch",
         "slot",
+        "dbg",  # Stage 0a: stamps.py target, 256 * stamps.NSLOT int32; 0 when off
+        "ids",  # E6b.2 (emb_ids): int64 [S], back's picked token ids; 0 when off
     )
 )
 
@@ -136,46 +144,68 @@ def stage_front_msq(c, j):
     """Columns 128 j .. (``hc.COLS`` wide): ``emb``'s sums of squares (one
     value a token) -> MSQE(j, t); ``prev``'s over all 4 streams together (the
     single ``pre_fc_norm_hidden`` norm, not one a stream) -> MSQH(j, t). Wave
-    t token t."""
+    t token t.
+
+    ``c["pre_fh"]`` (E6.1): ``fc_hidden`` never runs, so ``prev``'s sums of
+    squares (MSQH) are never consumed -- skip computing and publishing them
+    (``load_rrms_front`` skips polling MSQH to match, or this would hang
+    waiting for a put that never comes)."""
     s, tid, lane = c["S"], c["tid"], c["lane"]
     a = c["args"]
     mine = tid < s * 64
     t = fx.min(tid // 64, s - 1)
     col = j * hc.COLS + 2 * (tid % 64)
+    if const_expr(c["emb_ids"]):
+        row = uniform(fx.ptr_load(c["ids_lds"] + t))
+    else:
+        row = t
     we = fx.Int32(
-        bo.buffer_load(rsrc(a["emb"]), (t * H + col) // 2, vec_width=1, dtype=T.i32)
+        bo.buffer_load(rsrc(a["emb"]), (row * H + col) // 2, vec_width=1, dtype=T.i32)
     )
     e0, e1 = bf_lo(we), bf_hi(we)
     en_sq = wave_sum(e0 * e0 + e1 * e1)
-    hn_sq = fx.Float32(0.0)
-    for k in range_constexpr(HC):
-        wp = fx.Int32(
-            bo.buffer_load(
-                rsrc(a["prev"]), (t * HH + k * H + col) // 2, vec_width=1, dtype=T.i32
+    if const_expr(not c["pre_fh"]):
+        hn_sq = fx.Float32(0.0)
+        for k in range_constexpr(HC):
+            wp = fx.Int32(
+                bo.buffer_load(
+                    rsrc(a["prev"]), (t * HH + k * H + col) // 2, vec_width=1, dtype=T.i32
+                )
             )
-        )
-        p0, p1 = bf_lo(wp), bf_hi(wp)
-        hn_sq = hn_sq + p0 * p0 + p1 * p1
-    hn_sq = wave_sum(hn_sq)
+            p0, p1 = bf_lo(wp), bf_hi(wp)
+            hn_sq = hn_sq + p0 * p0 + p1 * p1
+        hn_sq = wave_sum(hn_sq)
     if mine & (lane == 0):
         c["put"](c["msqe"], j * s + t, en_sq)
-        c["put"](c["msqh"], j * s + t, hn_sq)
+        if const_expr(not c["pre_fh"]):
+            c["put"](c["msqh"], j * s + t, hn_sq)
 
 
 @traced
 def load_rrms_front(c):
     """Every F1 task's sums of squares -> rrms_en, rrms_hn (t) = rsqrt(mean +
-    eps) -> LDS ``rs2`` [t, 2]. Wave t token t, lane j task j's."""
+    eps) -> LDS ``rs2`` [t, 2]. Wave t token t, lane j task j's.
+
+    ``c["pre_fh"]`` (E6.1): rrms_hn is never used (``fc_hidden`` never
+    runs), and MSQH was never published (``stage_front_msq``) -- poll only
+    MSQE, and store a dummy 0 for ``rs2[t, 1]``."""
     s, lane, wave = c["S"], c["lane"], c["wave"]
     if wave < s:
         j = fx.min(lane, hc.NRED - 1)
         at = j * s + wave
-        got = c["poll"]([(c["msqe"], at, 1), (c["msqh"], at, 1)])
         live = lane < hc.NRED
-        en_v = live.select(f32_of(got[0][0]), fx.Float32(0.0))
-        hn_v = live.select(f32_of(got[1][0]), fx.Float32(0.0))
+        if const_expr(c["pre_fh"]):
+            got = c["poll"]([(c["msqe"], at, 1)])
+            en_v = live.select(f32_of(got[0][0]), fx.Float32(0.0))
+            r_hn = fx.Float32(0.0)
+        else:
+            got = c["poll"]([(c["msqe"], at, 1), (c["msqh"], at, 1)])
+            en_v = live.select(f32_of(got[0][0]), fx.Float32(0.0))
+            hn_v = live.select(f32_of(got[1][0]), fx.Float32(0.0))
+            r_hn = hw_rsq(
+                wave_sum(hn_v) * fx.Float32(1.0 / HH) + fx.Float32(c["nh_eps"])
+            )
         r_en = hw_rsq(wave_sum(en_v) * fx.Float32(1.0 / H) + fx.Float32(c["ne_eps"]))
-        r_hn = hw_rsq(wave_sum(hn_v) * fx.Float32(1.0 / HH) + fx.Float32(c["nh_eps"]))
         if lane == 0:
             fx.ptr_store(r_en, c["rs2"] + wave * 2)
             fx.ptr_store(r_hn, c["rs2"] + wave * 2 + 1)
@@ -216,9 +246,47 @@ def _norm_to_lds(c, src, ldk, off, w, w_off, r_idx):
     gpu.barrier()
 
 
+@traced
+def _en_to_lds_ids(c):
+    """``en_to_lds``'s math (E6b.2, ``emb_ids``): token t's embedding row is
+    ``emb_table[ids[t]]``, not ``emb[t]`` -- the row is read back from
+    ``c["ids_lds"]`` (loaded once at kernel entry) instead of being ``t``
+    itself. Otherwise identical to ``_norm_to_lds(c, emb, H, 0, w_ne, 0,
+    0)``: same Gemma norm, LDS layout, and tid -> (t, kk) traversal."""
+    s, tid = c["S"], c["tid"]
+    a = c["args"]
+    w = a["w_ne"]
+    words = s * H // 8
+    for i in range_constexpr((words + THREADS - 1) // THREADS):
+        e = fx.min(tid + THREADS * i, words - 1)
+        t = e // (H // 8)
+        kk = e % (H // 8) * 8
+        row = fx.ptr_load(c["ids_lds"] + t)
+        sv = fx.Vector(
+            bo.buffer_load(rsrc(a["emb"]), (row * H + kk) // 2, vec_width=4, dtype=T.i32)
+        )
+        wv = fx.Vector(bo.buffer_load(rsrc(w), kk // 2, vec_width=4, dtype=T.i32))
+        r = fx.ptr_load(c["rs2"] + t * 2)
+        ys = [
+            bf16_pair(
+                hc.gemma(bf_lo(sv[d]), r, bf_lo(wv[d])),
+                hc.gemma(bf_hi(sv[d]), r, bf_hi(wv[d])),
+            ).bitcast(fx.Int32)
+            for d in range(4)
+        ]
+        if tid + THREADS * i < words:
+            fx.ptr_store(
+                fx.Vector.from_elements(ys, fx.Int32), c["xl"] + (t * XROW + kk) // 2
+            )
+    gpu.barrier()
+
+
 def en_to_lds(c):
     a = c["args"]
-    _norm_to_lds(c, a["emb"], H, 0, a["w_ne"], 0, 0)
+    if c["emb_ids"]:
+        _en_to_lds_ids(c)
+    else:
+        _norm_to_lds(c, a["emb"], H, 0, a["w_ne"], 0, 0)
 
 
 def hn_to_lds(c, k):
@@ -234,8 +302,16 @@ def stage_fc(c, g, fe_ops, fh_ops):
     ``w_fh`` is one weight shared across streams) -> state[:, kH + 16g ..] =
     bf16(fe + fh_k) -> global ``state`` + ``sflag[g]``. The HC norm's sums of
     squares are NOT computed here: they're read back from ``state`` by the
-    unmodified ``hc.stage_msq``, gated by ``sflag`` (``wait_state``)."""
+    unmodified ``hc.stage_msq``, gated by ``sflag`` (``wait_state``).
+
+    ``c["pre_fh"]`` (E6.1): skip the real ``fc_hidden`` (the 4 ``hn_to_lds`` /
+    GEMV passes, and ``fh_ops`` -- never loaded by the caller either) and read
+    fh straight out of ``prev`` at ``[t, kH + 16g + 2rp ..]`` instead (two
+    bf16 a (row-pair, stream)): a stand-in for ``fc_hidden(norm(prev))``,
+    exactly the memory layout a precomputed ``fh`` would need to match for a
+    correctness check (random bytes are fine for the perf-only probe)."""
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
+    a = c["args"]
     en_to_lds(c)
     acc = gemv.mfmas(lane, wave, c["xl"], XROW, H, s, fe_ops)
     fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
@@ -248,31 +324,60 @@ def stage_fc(c, g, fe_ops, fh_ops):
         fx.ptr_store(fe0, c["fe"] + tt * ROWS + 2 * rp)
         fx.ptr_store(fe1, c["fe"] + tt * ROWS + 2 * rp + 1)
     gpu.barrier()
-    for k in range_constexpr(HC):
-        hn_to_lds(c, k)
-        acc2 = gemv.mfmas(lane, wave, c["xl"], XROW, H, s, fh_ops)
-        fx.ptr_store(acc2, red + (wave * 64 + lane) * 4)
-        gpu.barrier()
+    stamps.stamp(c, 2)  # Stage 0a: after the fe pass
+    if const_expr(c["pre_fh"]):
         if tid < (ROWS // 2) * s:
             rp = tid % (ROWS // 2)
             tt = tid // (ROWS // 2)
             fe0 = fx.ptr_load(c["fe"] + tt * ROWS + 2 * rp)
             fe1 = fx.ptr_load(c["fe"] + tt * ROWS + 2 * rp + 1)
-            fh0 = bf16_round(row_sum(red, 2 * rp, tt))
-            fh1 = bf16_round(row_sum(red, 2 * rp + 1, tt))
-            v0 = bf16_round(fe0 + fh0)
-            v1 = bf16_round(fe1 + fh1)
-            bo.buffer_store(
-                bf16_pair(v0, v1).bitcast(fx.Int32),
-                rsrc(c["hc"]["state"]),
-                (tt * HH + k * H + g * ROWS + 2 * rp) // 2,
-                cache_modifier=CM_DEV,
-            )
+            col = g * ROWS + 2 * rp
+            for k in range_constexpr(HC):
+                wp = fx.Int32(
+                    bo.buffer_load(
+                        rsrc(a["prev"]), (tt * HH + k * H + col) // 2,
+                        vec_width=1, dtype=T.i32,
+                    )
+                )  # fmt: skip
+                fh0, fh1 = bf_lo(wp), bf_hi(wp)
+                v0 = bf16_round(fe0 + fh0)
+                v1 = bf16_round(fe1 + fh1)
+                bo.buffer_store(
+                    bf16_pair(v0, v1).bitcast(fx.Int32),
+                    rsrc(c["hc"]["state"]),
+                    (tt * HH + k * H + g * ROWS + 2 * rp) // 2,
+                    cache_modifier=CM_DEV,
+                )
         gpu.barrier()
+        stamps.stamp(c, 3)  # Stage 0a: after the (single, combined) hn pass
+    else:
+        for k in range_constexpr(HC):
+            hn_to_lds(c, k)
+            acc2 = gemv.mfmas(lane, wave, c["xl"], XROW, H, s, fh_ops)
+            fx.ptr_store(acc2, red + (wave * 64 + lane) * 4)
+            gpu.barrier()
+            if tid < (ROWS // 2) * s:
+                rp = tid % (ROWS // 2)
+                tt = tid // (ROWS // 2)
+                fe0 = fx.ptr_load(c["fe"] + tt * ROWS + 2 * rp)
+                fe1 = fx.ptr_load(c["fe"] + tt * ROWS + 2 * rp + 1)
+                fh0 = bf16_round(row_sum(red, 2 * rp, tt))
+                fh1 = bf16_round(row_sum(red, 2 * rp + 1, tt))
+                v0 = bf16_round(fe0 + fh0)
+                v1 = bf16_round(fe1 + fh1)
+                bo.buffer_store(
+                    bf16_pair(v0, v1).bitcast(fx.Int32),
+                    rsrc(c["hc"]["state"]),
+                    (tt * HH + k * H + g * ROWS + 2 * rp) // 2,
+                    cache_modifier=CM_DEV,
+                )
+            gpu.barrier()
+            stamps.stamp(c, 3 + k)  # Stage 0a: after hn pass k (3, 4, 5, 6)
     rocdl.s_waitcnt(vmcnt=0)  # drain this CTA's state stores
     gpu.barrier()
     if tid == 0:
         c["put"](c["sflag"], g, fx.Int32(1))
+    stamps.stamp(c, 7)  # Stage 0a: after the sflag put
     gpu.barrier()
 
 
@@ -283,6 +388,7 @@ def wait_state(c):
     if c["tid"] < hc.UP_TASKS:
         c["poll"]([(c["sflag"], c["tid"], 1)])
     gpu.barrier()
+    stamps.stamp(c, 8)  # Stage 0a: after wait_state
 
 
 def _put_inj(c, t, r, vs):
@@ -317,6 +423,7 @@ def build(key: FrontBuild):
         rs2: fx.Array[fx.Float32, L.MAX_TOKENS * 2, 16]
         fe: fx.Array[fx.Float32, L.MAX_TOKENS * ROWS, 16]
         ll: fx.Array[fx.Int32, s * hc.LROW // 2, 16]
+        ids: fx.Array[fx.Int32, L.MAX_TOKENS, 16]  # E6b.2 (emb_ids) only
 
     keyed = key_tuple(key, digest())
     name = f"flashnext_mono_front_s{s}_t{key.tp}"
@@ -338,6 +445,8 @@ def build(key: FrontBuild):
         scratch: Int64,
         epoch: Int64,
         slot: Int32,
+        dbg: Int64,
+        ids: Int64,
     ):
         _ = keyed
         tid = fx.thread_idx.x
@@ -355,6 +464,9 @@ def build(key: FrontBuild):
             "eps": key.eps,
             "ne_eps": key.ne_eps,
             "nh_eps": key.nh_eps,
+            "pre_fh": key.pre_fh,
+            "emb_ids": key.emb_ids,
+            "dbg": dbg if key.trace else None,
             "put": mb.put,
             "put_bf": mb.put_bf,
             "poll": mb.poll,
@@ -363,6 +475,7 @@ def build(key: FrontBuild):
             "rs2": lds.rs2.ptr,
             "fe": lds.fe.ptr,
             "ll": lds.ll.ptr,
+            "ids_lds": lds.ids.ptr,
             "xl": xst.xl.ptr,
             "msqe": sreg(scratch, scr["msqe"][0], "msqe"),
             "msqh": sreg(scratch, scr["msqh"][0], "msqh"),
@@ -391,15 +504,26 @@ def build(key: FrontBuild):
             "bin": bin_out,
             "inj_out": lambda t, r, vs: _put_inj(c, t, r, vs),
         }
+        stamps.stamp(c, 0)  # Stage 0a: kernel entry
+        # ---- E6b.2 (emb_ids): every CTA's own LDS copy of `ids` (int64, low
+        # dword only), read once so later per-element lookups are LDS reads
+        if const_expr(key.emb_ids):
+            if tid < s:
+                fx.ptr_store(ld_i32(ids, 2 * tid), c["ids_lds"] + tid)
+            gpu.barrier()
         # ---- F1 (norms) + F2 (fc projections), CTAs 0 .. 159 double as F1's
         # producers (0 .. 19) and the HC front's up tasks; w_fe / w_fh loaded
         # first (in flight while F1's producers run and load_rrms_front polls)
         if bid < hc.UP_TASKS:
             fe_ops = gemv.loads(c["lane"], c["wave"], w_fe, bid * ROWS, H)
-            fh_ops = gemv.loads(c["lane"], c["wave"], w_fh, bid * ROWS, H)
+            if const_expr(not key.pre_fh):
+                fh_ops = gemv.loads(c["lane"], c["wave"], w_fh, bid * ROWS, H)
+            else:
+                fh_ops = None
             if bid < hc.NRED:
                 stage_front_msq(c, bid)
             load_rrms_front(c)
+            stamps.stamp(c, 1)  # Stage 0a: after load_rrms_front
             stage_fc(c, bid, fe_ops, fh_ops)
         # ---- F3: k1's front_only HC front, waiting on every F2 flag first;
         # the HC norm's own sums of squares (``hc.stage_msq``, unmodified)
@@ -423,6 +547,7 @@ def build(key: FrontBuild):
             wait_state(c)
             hc.load_rrms(c)
             hc.stage_down(c, bid - D0, dops)
+        stamps.stamp(c, 10)  # Stage 0a: kernel end
 
     @flyc.jit
     def launch(
@@ -441,6 +566,8 @@ def build(key: FrontBuild):
         scratch: Int64,
         epoch: Int64,
         slot: Int32,
+        dbg: Int64,
+        ids: Int64,
         stream: fx.Stream = _STREAM,
     ):
         _ = keyed
@@ -460,6 +587,8 @@ def build(key: FrontBuild):
             scratch,
             epoch,
             slot,
+            dbg,
+            ids,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     ABI.check(front, launch)
@@ -469,10 +598,16 @@ def build(key: FrontBuild):
 
 def _shape_checks(
     s, emb, prev, w_ne, w_nh, w_fe, w_fh, hc_w, w_down, w_up, state_out, bin_out,
-    inj_out,
+    inj_out, emb_ids=False,
 ):  # fmt: skip
     bf = torch.bfloat16
-    need(emb.shape == (s, H) and emb.dtype == bf, "emb: bf16 [S, H]")
+    if emb_ids:
+        need(
+            emb.dim() == 2 and emb.shape[1] == H and emb.dtype == bf,
+            "emb (emb_ids=True): bf16 [V, H], a replicated vocab table",
+        )
+    else:
+        need(emb.shape == (s, H) and emb.dtype == bf, "emb: bf16 [S, H]")
     need(prev.shape == (s, HH) and prev.dtype == bf, "prev: bf16 [S, 4 H]")
     need(w_ne.shape == (H,) and w_ne.dtype == bf, "pre_fc_norm_embedding weight: [H]")
     need(w_nh.shape == (HH,) and w_nh.dtype == bf, "pre_fc_norm_hidden weight: [4 H]")
@@ -511,6 +646,8 @@ def draft_front(
     scratch,
     epoch,
     slot,
+    dbg=None,
+    ids=None,
 ):
     """Host launcher of the MTP draft step's front: the ``fc_embedding`` /
     ``fc_hidden`` projections (every rank's full, gathered weights) folded
@@ -521,12 +658,22 @@ def draft_front(
     this step's materialized multi-stream state (K2's next input); ``bin_out``
     / ``inj_out``: the QSA layer's attention input and injection logits, as
     ``k1.hc_front`` produces them. ``epoch`` a device int32 bumped once a
-    step, ``slot`` this launch's tag slot."""
+    step, ``slot`` this launch's tag slot. ``dbg``: Stage 0a's stamp buffer
+    (``stamps.dbg_buffer``), required iff ``key.trace``. ``ids``: E6b.2's
+    per-token vocab ids (int64 [S]), required iff ``key.emb_ids`` -- then
+    ``emb`` is the full replicated vocab table ``[V, H]``, not ``[S, H]``."""
     s = key.tokens
     _shape_checks(
         s, emb, prev, w_ne, w_nh, w_fe, w_fh, hc_w, w_down, w_up, state_out, bin_out,
-        inj_out,
+        inj_out, emb_ids=key.emb_ids,
     )  # fmt: skip
+    need(key.trace == (dbg is not None), "dbg: required iff key.trace")
+    need(key.emb_ids == (ids is not None), "ids: required iff key.emb_ids")
+    if ids is not None:
+        need(
+            ids.shape == (s,) and ids.dtype == torch.int64 and ids.is_contiguous(),
+            "ids: int64 [S]",
+        )
     vals = {
         "emb": emb.data_ptr(),
         "prev": prev.data_ptr(),
@@ -543,5 +690,7 @@ def draft_front(
         "scratch": scratch.data_ptr(),
         "epoch": epoch.data_ptr(),
         "slot": slot,
+        "dbg": 0 if dbg is None else dbg.data_ptr(),
+        "ids": 0 if ids is None else ids.data_ptr(),
     }
     build(key)(*ABI.pack(vals), stream=torch.cuda.current_stream())

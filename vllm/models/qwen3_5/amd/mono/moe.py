@@ -172,10 +172,13 @@ def fp4_mfmas(tile, scale, xl, xoff, acc):
     return acc
 
 
-def fp4_tile(r_w, at):
-    return fx.Vector(
-        bo.buffer_load(r_w, at, vec_width=4, dtype=T.i32, cache_modifier=CM_NT)
-    )
+def fp4_tile(r_w, at, cm=CM_NT):
+    """``cm``: the load's cache policy (default ``CM_NT``, every caller's
+    behavior before this parameter existed). A probe's knob (IDEAS_5_6_DESIGN
+    Stage 0c E0.b/E0.c): a cold/``CM_NT`` head is bandwidth-bound past L2, a
+    warm/``CM_DEV`` (or ``0``, device-scope) one may hit a resident MALL
+    copy."""
+    return fx.Vector(bo.buffer_load(r_w, at, vec_width=4, dtype=T.i32, cache_modifier=cm))
 
 
 def scale_word(r_s, byte_index):
@@ -189,11 +192,13 @@ def _paired(k):
     return k // L.FP4_STEP % (2 * WAVES) == 0
 
 
-def fp4_gemv_loads(lane, wave, w, ws, rg, k):
+def fp4_gemv_loads(lane, wave, w, ws, rg, k, cm=CM_NT):
     """An online-MXFP4 linear's rows 16 rg .. (K ``k``, the ASM FP4 GEMM's
     shuffled weight and scales) for this wave: its K steps' tiles and their
     scale words (``_paired``; past the last step clamped, ``fp4_gemv`` zeroes
-    those)."""
+    those). ``cm``: the tile loads' cache policy, forwarded to ``fp4_tile``
+    (default ``CM_NT``, every caller's behavior before this parameter
+    existed; scale words always load plain, unaffected)."""
     n = k // L.FP4_STEP
     r_w, r_s = rsrc(w), rsrc(ws)
     row = rg * ROWS + lane % ROWS
@@ -201,7 +206,7 @@ def fp4_gemv_loads(lane, wave, w, ws, rg, k):
     if const_expr(_paired(k)):
         per = n // WAVES
         tiles = [
-            fp4_tile(r_w, L.fp4_tile_dword(0, rg, k, wave * per + i, lane))
+            fp4_tile(r_w, L.fp4_tile_dword(0, rg, k, wave * per + i, lane), cm=cm)
             for i in range(per)
         ]
         words = [
@@ -213,7 +218,7 @@ def fp4_gemv_loads(lane, wave, w, ws, rg, k):
         return tiles + words
     per = (n + WAVES - 1) // WAVES
     sts = [fx.min(wave + WAVES * i, n - 1) for i in range(per)]
-    tiles = [fp4_tile(r_w, L.fp4_tile_dword(0, rg, k, st, lane)) for st in sts]
+    tiles = [fp4_tile(r_w, L.fp4_tile_dword(0, rg, k, st, lane), cm=cm) for st in sts]
     words = [
         scale_word(r_s, L.scale_index(row, 4 * st + lane // 16, cols)) for st in sts
     ]

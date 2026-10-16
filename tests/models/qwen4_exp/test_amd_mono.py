@@ -1166,3 +1166,165 @@ def test_draft_head_matches_vllm_ops_full_vocab(
     summation order can differ between the kernel's MFMA tree and torch's
     enough to flip an exact near-tie."""
     multi_process_parallel(monkeypatch, 2, 1, _head_worker_full_vocab)
+
+
+# ---------------------------------------------------------------- IDEAS_5_6_DESIGN probes
+@ray.remote(num_gpus=1, max_calls=1)
+def _head_knobs_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    tp_size: int,
+    pp_size: int,
+    rank: int,
+    distributed_init_port: str,
+) -> None:
+    """IDEAS_5_6_DESIGN.md Stage 0c: ``HeadBuild(cm=0)`` and ``ahead=4`` must
+    give bitwise the same argmax ids as the default build at the real vocab
+    shard -- both knobs only change the weight load's cache policy / the
+    software pipeline's depth, never the arithmetic."""
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    device = torch.device(f"cuda:{rank}")
+    torch.accelerator.set_device_index(device)
+    init_test_distributed_environment(tp_size, pp_size, rank, distributed_init_port)
+
+    from vllm.distributed import get_tp_group
+    from vllm.models.kimi_k3.amd.mono.common.peer_memory import PeerBuffer
+    from vllm.models.qwen4_exp.amd.mono import head
+    from vllm.models.qwen4_exp.amd.mono.layout import HIDDEN
+
+    tp = get_tp_group()
+    peers = PeerBuffer(head.peer_bytes(TP), tp.cpu_group, rank, tp_size, device)
+    peers.bytes.zero_()
+    epoch = torch.zeros(1, dtype=torch.int32, device=device)
+
+    v_r = 124160  # the real per-rank vocab shard
+    _, _, w, ws = _lmhead_weights(rank, device, v_r)
+    for s in (1, 8):
+        g = torch.Generator(device=device).manual_seed(960 + s)
+        x = _randn(g, s, HIDDEN, scale=0.3)
+        default_key = head.HeadBuild(tokens=s, tp=TP, rows=v_r)
+        scratch = torch.zeros(
+            head.scratch_bytes(default_key), dtype=torch.uint8, device=device
+        )
+        out_default = torch.full((s,), -1, dtype=torch.int64, device=device)
+        epoch.add_(1)
+        head.draft_head(
+            default_key, x=x, w=w, ws=ws, valid=v_r, vocab_start=rank * v_r,
+            out=out_default, scratch=scratch, peers=peers.addresses, rank=rank,
+            epoch=epoch, slot=0,
+        )
+        torch.accelerator.synchronize()
+
+        for knob_key in (
+            head.HeadBuild(tokens=s, tp=TP, rows=v_r, cm=0),
+            head.HeadBuild(tokens=s, tp=TP, rows=v_r, ahead=4),
+        ):
+            out = torch.full((s,), -1, dtype=torch.int64, device=device)
+            ks = torch.zeros(
+                head.scratch_bytes(knob_key), dtype=torch.uint8, device=device
+            )
+            epoch.add_(1)
+            head.draft_head(
+                knob_key, x=x, w=w, ws=ws, valid=v_r, vocab_start=rank * v_r,
+                out=out, scratch=ks, peers=peers.addresses, rank=rank,
+                epoch=epoch, slot=0,
+            )
+            torch.accelerator.synchronize()
+            torch.testing.assert_close(out, out_default, atol=0, rtol=0)
+    peers.close()
+
+
+@multi_gpu_test(num_gpus=2)
+def test_draft_head_knobs_match_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """IDEAS_5_6_DESIGN.md Stage 0c probe knobs (``cm``, ``ahead``): default
+    behavior at the default values is unchanged, and non-default values
+    change only timing, never the result."""
+    multi_process_parallel(monkeypatch, 2, 1, _head_knobs_worker)
+
+
+@pytest.mark.parametrize("s", [1, 8])
+@torch.inference_mode()
+def test_draft_front_pre_fh_matches_stock(s: int) -> None:
+    """IDEAS_5_6_DESIGN.md E6.1: ``FrontBuild(pre_fh=True)`` skips the real
+    ``fc_hidden`` chain and reads ``fh`` straight out of ``prev`` at
+    ``[t, kH + 16g ..]`` instead. Feeding a synthetic ``prev`` whose bytes
+    there already hold ``bf16_round(fc_hidden(gemma4H(prev_real)))`` (what
+    ``_front_ref`` computes as ``fh`` internally) must match the real
+    front's ``state_out`` within the existing 2e-2 tolerance -- the design
+    doc's own correctness claim for this knob."""
+    from vllm.models.qwen4_exp.amd.mono import front
+    from vllm.models.qwen4_exp.amd.mono.layout import HC, HH, HIDDEN
+
+    g = torch.Generator(device="cuda").manual_seed(2000 + s)
+    emb = _randn(g, s, HIDDEN, scale=2.0)
+    prev = _randn(g, s, HH, scale=2.0)
+    w_ne = _randn(g, HIDDEN, scale=0.1)
+    w_nh = _randn(g, HH, scale=0.1)
+    w_fe = _randn(g, HIDDEN, HIDDEN, scale=0.05)
+    w_fh = _randn(g, HIDDEN, HIDDEN, scale=0.05)
+    ne_eps, nh_eps = 1e-5, 3e-6
+    want_state = _front_ref(emb, prev, w_ne, w_nh, w_fe, w_fh, ne_eps, nh_eps)
+
+    def gemma(x, w, eps):
+        xf = x.float()
+        xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
+        return (xf * (1.0 + w.float())).to(x.dtype)
+
+    hn = gemma(prev, w_nh, nh_eps).view(s, HC, HIDDEN)
+    fh = F.linear(hn, w_fh).to(bf).flatten(1).contiguous()  # [S, 4H]: pre_fh's "prev"
+
+    hw = _hc_weights(g)
+    key = front.FrontBuild(tokens=s, tp=TP, ne_eps=ne_eps, nh_eps=nh_eps, pre_fh=True)
+    state = torch.full((s, HH), float("nan"), dtype=bf, device="cuda")
+    x_bin = torch.full((s, HIDDEN), float("nan"), dtype=bf, device="cuda")
+    inj = torch.full((s, HC), float("nan"), dtype=bf, device="cuda")
+    scratch = torch.zeros(front.scratch_bytes(key), dtype=torch.uint8, device="cuda")
+    front.draft_front(
+        key, emb=emb, prev=fh, w_ne=w_ne, w_nh=w_nh, w_fe=w_fe, w_fh=w_fh, **hw,
+        state_out=state, bin_out=x_bin, inj_out=inj, scratch=scratch,
+        epoch=torch.ones(1, dtype=torch.int32, device="cuda"), slot=0,
+    )
+    torch.accelerator.synchronize()
+    assert _cos(state, want_state) > COS_MIN
+    torch.testing.assert_close(state, want_state, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("s", [1, 8])
+@torch.inference_mode()
+def test_draft_front_emb_ids_bitwise_matches_table_lookup(s: int) -> None:
+    """IDEAS_5_6_DESIGN.md E6b.2: ``FrontBuild(emb_ids=True)`` gathers its
+    own embedding row from a replicated table (``emb[ids[t]]``) instead of
+    taking a precomputed ``[S, H]`` tensor -- must be bitwise identical to
+    ``front(emb=table[ids])``, not merely close."""
+    from vllm.models.qwen4_exp.amd.mono import front
+    from vllm.models.qwen4_exp.amd.mono.layout import HC, HH, HIDDEN
+
+    v_r = 300  # a small table suffices: only the gather path is under test
+    g = torch.Generator(device="cuda").manual_seed(3000 + s)
+    table = _randn(g, v_r, HIDDEN, scale=2.0)
+    ids = torch.randint(0, v_r, (s,), generator=g, device="cuda").to(torch.int64)
+    emb_rows = table[ids].contiguous()
+    prev = _randn(g, s, HH, scale=2.0)
+    w_ne = _randn(g, HIDDEN, scale=0.1)
+    w_nh = _randn(g, HH, scale=0.1)
+    w_fe = _randn(g, HIDDEN, HIDDEN, scale=0.05)
+    w_fh = _randn(g, HIDDEN, HIDDEN, scale=0.05)
+    hw = _hc_weights(g)
+    epoch = torch.ones(1, dtype=torch.int32, device="cuda")
+
+    def _run(emb_ids: bool, emb, ids_arg):
+        key = front.FrontBuild(tokens=s, tp=TP, emb_ids=emb_ids)
+        state = torch.full((s, HH), float("nan"), dtype=bf, device="cuda")
+        x_bin = torch.full((s, HIDDEN), float("nan"), dtype=bf, device="cuda")
+        inj = torch.full((s, HC), float("nan"), dtype=bf, device="cuda")
+        scratch = torch.zeros(front.scratch_bytes(key), dtype=torch.uint8, device="cuda")
+        front.draft_front(
+            key, emb=emb, prev=prev, w_ne=w_ne, w_nh=w_nh, w_fe=w_fe, w_fh=w_fh,
+            **hw, state_out=state, bin_out=x_bin, inj_out=inj, scratch=scratch,
+            epoch=epoch, slot=0, ids=ids_arg,
+        )
+        torch.accelerator.synchronize()
+        return state
+
+    want = _run(False, emb_rows, None)
+    got = _run(True, table, ids)
+    torch.testing.assert_close(got, want, atol=0, rtol=0)
