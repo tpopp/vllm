@@ -95,6 +95,7 @@ class FrontBuild:
     trace: bool = False  # emit in-kernel timestamps to a `dbg` buffer (stamps.py)
     pre_fh: bool = False  # E6.1: fh := prev[.., kH + 16g ..] straight (no fc_hidden)
     emb_ids: bool = False  # E6b.2: `emb` is a replicated vocab table, gather by `ids`
+    ids_dw: int = 2  # dwords per `ids` element: 2 = int64, 1 = int32 (the step's input_ids)
 
 
 ABI = KernelAbi(
@@ -509,7 +510,7 @@ def build(key: FrontBuild):
         # dword only), read once so later per-element lookups are LDS reads
         if const_expr(key.emb_ids):
             if tid < s:
-                fx.ptr_store(ld_i32(ids, 2 * tid), c["ids_lds"] + tid)
+                fx.ptr_store(ld_i32(ids, key.ids_dw * tid), c["ids_lds"] + tid)
             gpu.barrier()
         # ---- F1 (norms) + F2 (fc projections), CTAs 0 .. 159 double as F1's
         # producers (0 .. 19) and the HC front's up tasks; w_fe / w_fh loaded
@@ -671,8 +672,10 @@ def draft_front(
     need(key.emb_ids == (ids is not None), "ids: required iff key.emb_ids")
     if ids is not None:
         need(
-            ids.shape == (s,) and ids.dtype == torch.int64 and ids.is_contiguous(),
-            "ids: int64 [S]",
+            ids.shape == (s,)
+            and ids.dtype == (torch.int64 if key.ids_dw == 2 else torch.int32)
+            and ids.is_contiguous(),
+            "ids: int64 [S] (int32 with ids_dw=1)",
         )
     vals = {
         "emb": emb.data_ptr(),

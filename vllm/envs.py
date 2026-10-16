@@ -158,6 +158,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_MONO_DECODE: bool = False
     VLLM_ROCM_MONO_DRAFT: bool = False
     VLLM_ROCM_MONO_DRAFT_FRONT: bool = False
+    VLLM_ROCM_MONO_DRAFT_EMB: bool = False
     VLLM_ROCM_MONO_DRAFT_HEAD: bool = True
     VLLM_ROCM_MONO_DRAFT_POS0: bool = False
     VLLM_ROCM_MONO_DRAFT_LAYER: bool = True
@@ -1416,6 +1417,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # The MTP mono draft step's front as one launch (mono/front.py). Not yet
     # validated on GPU: default off.
+    # The fused draft front gathers the token embedding rows itself from a
+    # replicated vocab table (+V*H*2 bytes a rank) instead of the stock
+    # vocab-parallel embedding (masks + index_select + all-reduce).
+    "VLLM_ROCM_MONO_DRAFT_EMB": lambda: (
+        os.getenv("VLLM_ROCM_MONO_DRAFT_EMB", "0").lower() in ("true", "1")
+    ),
     "VLLM_ROCM_MONO_DRAFT_FRONT": lambda: (
         os.getenv("VLLM_ROCM_MONO_DRAFT_FRONT", "0").lower() in ("true", "1")
     ),

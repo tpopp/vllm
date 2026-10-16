@@ -439,6 +439,15 @@ class DraftMonoDecode(B.QwenMonoDecode):
                     ).contiguous()
                     for _, lin in lins
                 )
+                self._emb = None
+                from vllm import envs
+
+                if envs.VLLM_ROCM_MONO_DRAFT_EMB:
+                    # the whole vocab table on every rank (contiguous
+                    # vocab-parallel shards, so row = token id)
+                    self._emb = tensor_model_parallel_all_gather(
+                        model.embed_tokens.weight.data, dim=0
+                    ).contiguous()
                 self.front_scratch = {
                     n: torch.zeros(
                         (_front_bytes(n, self.tp) + 255) // 256 * 256,
@@ -679,12 +688,18 @@ class DraftMonoDecode(B.QwenMonoDecode):
         layer = model.layers[0]
         attn_hc = layer.attn_hyper_connection
         s = x.size(0)
-        if inputs_embeds is None:
+        ids = None
+        if inputs_embeds is None and getattr(self, "_emb", None) is not None:
+            ids = input_ids[:s]
+            inputs_embeds = self._emb
+        elif inputs_embeds is None:
             inputs_embeds = model.embed_input_ids(input_ids)
         state = torch.empty(s, L.HH, dtype=x.dtype, device=x.device)
         front.draft_front(
             front.FrontBuild(
                 tokens=s,
+                emb_ids=ids is not None,
+                ids_dw=2 if ids is None or ids.dtype == torch.int64 else 1,
                 tp=self.tp,
                 eps=attn_hc.config.rms_norm_eps,
                 ne_eps=model.pre_fc_norm_embedding.variance_epsilon,
@@ -705,6 +720,7 @@ class DraftMonoDecode(B.QwenMonoDecode):
             scratch=self.front_scratch[s],
             epoch=self.epoch,
             slot=layer.layer_idx,
+            ids=ids,
         )
         return state
 
