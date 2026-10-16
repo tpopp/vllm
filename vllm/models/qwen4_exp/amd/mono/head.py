@@ -4,24 +4,26 @@
 launch a draft step, ``BLOCKS`` x ``THREADS``, S <= 8 rows:
 
     gemv     (every CTA, row groups 16 g .. of this rank's vocab shard, g =
-             bid, bid + 256, ... < ceil(rows / 16); the next group's weights
-             in flight while the current one's MFMAs run, as K1's in_proj):
-             an online-MXFP4 GEMV (``quant_x`` first) of the shard's rows
-             against the block's x, bf16-rounded, folded into a running
-             (max, global row) a token (padding rows -- >= ``valid`` -- and a
-             non-live last group never win)
+             bid, bid + 256, ... < ceil(rows / 16), ``AHEAD`` groups' weights
+             kept in flight, as ``run_ug``'s union tasks): an online-MXFP4
+             GEMV (``quant_x`` first) of the shard's rows against the block's
+             x, bf16-rounded, folded into a running (max, global row) a token
+             (padding rows -- >= ``valid`` -- never win; a non-live group
+             never runs at all, the dynamic loop just exits)
     cta      (every CTA): the running best reduced to one a token (a
-             wave-0 lane butterfly: the 8 row-pair threads of a token share a
-             4/8-lane xor-shuffle window) -> every CTA's (value, local row)
-             to a scratch mailbox
-    rank     (CTA 0, a token a thread): CTA 0's own mailbox polled whole,
-             reduced to this rank's (value, global row = local row +
-             ``vocab_start``); put to every rank's peer region, polled back
-             in rank order, reduced to the step's global argmax -> ``out``
+             4/2/1-lane xor-shuffle window: the 8 row-pair threads of a
+             token) -> every CTA's (value, local row) to a scratch mailbox
+    rank     (CTA 0, a token a wave): the 64 lanes each poll 4 of the 256
+             CTAs' winners (one batched poll a lane), a 64-lane butterfly to
+             this rank's (value, local row); + ``vocab_start``; lane 0 puts
+             to every rank's peer region, polls back in rank order, reduces
+             to the step's global argmax -> ``out``
 
 Every rank runs the same reduce in the same order (CTA order, then rank
 order), so every rank's ``out`` agrees. Ties break to the lowest global index
-(``torch.argmax``'s); a NaN logit never wins.
+(``torch.argmax``'s); a NaN logit never wins, checked by its bit pattern (an
+ordered compare is not relied on) -- this diverges from ``torch.argmax``,
+whose own NaN behavior is undefined / backend-dependent.
 
 The shard's weight / scales hold the ASM FP4 GEMM's layout (``shuffle_weight
 (layout=(16, 16))`` / its e8m0 swizzle, what ``Mxfp4OnlineLinearMethod`` +
@@ -29,6 +31,11 @@ The shard's weight / scales hold the ASM FP4 GEMM's layout (``shuffle_weight
 the mono kernels already read this layout for ``in_proj_qkvz`` / ``out_proj``
 -- ``fp4_gemv_loads`` / ``fp4_gemv``), so ``rows`` (this rank's shard, padding
 included) must be a multiple of 32: the scale swizzle's block.
+
+``scratch`` need not be zeroed between launches: the mailbox tag is the
+step's epoch, so a stale pair from an earlier launch never matches the
+current poll, and every (CTA, token) slot is overwritten by this launch
+before anything polls it.
 """
 
 from dataclasses import dataclass
@@ -46,6 +53,7 @@ from vllm.models.kimi_k3.amd.mono.common.ops import (
     load_ptr64,
     row_sum,
     rsrc,
+    traced,
     uniform,
     xshfl,
 )
@@ -69,7 +77,8 @@ H = L.HIDDEN  # 2560
 ROWS = L.ROWS  # 16: a weight row group
 RP = ROWS // 2  # 8: the fold's row-pair threads a token
 XROW = H + gemv.LDS_PAD
-NEG_INF = -(2.0**127)  # a logit that never wins (moe.py's NaN sentinel)
+NEG_INF = -(2.0**127)  # a logit that never wins
+AHEAD = 2  # row groups' weights kept in flight (raise to 3 if VGPRs allow)
 
 _STREAM = fx.Stream(None)
 
@@ -129,8 +138,11 @@ def f32_of(w):
 
 
 def _safe(v):
-    """``v``, or the sentinel if it is NaN: a NaN logit never wins."""
-    return (v == v).select(v, fx.Float32(NEG_INF))
+    """``v``, or the sentinel if it is NaN (checked by its bit pattern: a NaN
+    is an all-ones exponent with a nonzero mantissa, so its magnitude bits
+    exceed +inf's 0x7F800000): a NaN logit never wins."""
+    bits = v.bitcast(fx.Int32) & fx.Int32(0x7FFFFFFF)
+    return (bits <= fx.Int32(0x7F800000)).select(v, fx.Float32(NEG_INF))
 
 
 def _better(val, idx, best_val, best_idx):
@@ -155,6 +167,101 @@ def _store_i64(ptr, i, v):
     )
 
 
+# ---------------------------------------------------------------- stages
+@traced
+def run_head(c, groups):
+    """This rank's vocab shard, 16-row groups ``bid, bid + 256, ...`` (a
+    dynamic loop: a CTA whose first group is already past ``groups`` never
+    runs its body, as a non-live round used to be masked): ``AHEAD`` groups'
+    online-MXFP4 operands kept in flight (``run_ug``'s union-task pipelining),
+    each group's bf16-rounded logits folded into a running (max, global row)
+    a token. Returns (best_val, best_idx)."""
+    lane, wave, tid, s, red = c["lane"], c["wave"], c["tid"], c["S"], c["red"]
+    xl, valid, bid = c["xl"], c["valid"], c["bid"]
+    last = groups - 1
+    g = bid
+    ops = [_group_ops(c, fx.min(g + BLOCKS * j, last)) for j in range(AHEAD)]
+    best_val = fx.Float32(NEG_INF)
+    best_idx = fx.Int32(0)
+    mine = tid < RP * s
+    r = 2 * (tid % RP)
+    t = fx.min(tid // RP, s - 1)
+    while g < groups:
+        ops_n = _group_ops(c, fx.min(g + BLOCKS * AHEAD, last))
+        acc = fp4_gemv(lane, wave, xl, XROW, H, s, g, ops[0])
+        fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
+        gpu.barrier()
+        v0 = _safe(bf16_round(row_sum(red, r, t)))
+        v1 = _safe(bf16_round(row_sum(red, r + 1, t)))
+        idx0 = g * ROWS + r
+        idx1 = idx0 + 1
+        cv0 = (mine & (idx0 < valid)).select(v0, fx.Float32(NEG_INF))
+        cv1 = (mine & (idx1 < valid)).select(v1, fx.Float32(NEG_INF))
+        best_val, best_idx = _better(cv0, idx0, best_val, best_idx)
+        best_val, best_idx = _better(cv1, idx1, best_val, best_idx)
+        gpu.barrier()
+        g = g + BLOCKS
+        ops = ops[1:] + [ops_n]
+    return best_val, best_idx
+
+
+@traced
+def stage_cta(c):
+    """Every CTA: the running best (``c["best"]``) xor-shuffled (4, 2, 1: the
+    8 row-pair threads of a token share that window) to one (max, local row);
+    one thread a token (wave 0, lane 0, 8, 16, ..) publishes it to the
+    scratch mailbox."""
+    best_val, best_idx = c["best"]
+    for off in (4, 2, 1):
+        ov, oi = xshfl(best_val, off), xshfl(best_idx, off)
+        best_val, best_idx = _better(ov, oi, best_val, best_idx)
+    lane, wave, s, bid = c["lane"], c["wave"], c["S"], c["bid"]
+    tt = lane // RP
+    if (wave == 0) & ((lane % RP) == 0) & (tt < s):
+        slot_i = (bid * s + tt) * 2
+        c["put_words"](c["cta"], slot_i, [best_val.bitcast(fx.Int32), best_idx])
+
+
+@traced
+def stage_token_rank(c, t):
+    """Token t (wave t of CTA 0): the 64 lanes each poll 4 of the 256 CTAs'
+    winners (lane l: CTAs l, l + 64, l + 128, l + 192, one batched poll), a
+    64-lane xor-shuffle butterfly (32, 16, 8, 4, 2, 1) to this rank's (max,
+    local row); + ``vocab_start``. Lane 0 puts the result to every TP rank's
+    peer region, polls its own back in rank order, reduces again, and stores
+    ``out[t]`` (int64, two dwords)."""
+    lane, s = c["lane"], c["S"]
+    specs = [(c["cta"], ((lane + 64 * j) * s + t) * 2, 2) for j in range(4)]
+    got = c["poll"](specs)
+    rv = fx.Float32(NEG_INF)
+    ri = fx.Int32(0)
+    for j in range_constexpr(4):
+        wv, wi = got[j]
+        rv, ri = _better(f32_of(wv), wi, rv, ri)
+    for off in (32, 16, 8, 4, 2, 1):
+        ov, oi = xshfl(rv, off), xshfl(ri, off)
+        rv, ri = _better(ov, oi, rv, ri)
+    ri = ri + c["vocab_start"]
+    if lane == 0:
+        tp = c["TP"]
+        for p in range_constexpr(tp):
+            c["put_words"](
+                c["peer_head"][p], (c["rank"] * s + t) * 2, [rv.bitcast(fx.Int32), ri]
+            )
+        got2 = c["poll"](
+            [
+                (c["peer_head_own"], src * s * 2 + t * 2, 2)
+                for src in range_constexpr(tp)
+            ]
+        )
+        fv = fx.Float32(NEG_INF)
+        fi = fx.Int32(0)
+        for j in range_constexpr(tp):
+            wv, wi = got2[j]
+            fv, fi = _better(f32_of(wv), wi, fv, fi)
+        _store_i64(c["args"]["out"], t, fi)
+
+
 # ---------------------------------------------------------------- kernel
 _BUILDS: dict = {}
 
@@ -171,7 +278,6 @@ def build(key: HeadBuild):
     )
     L.Layout(tp)  # validates tp against L.TPS
     groups = key.rows // ROWS
-    rounds = -(-groups // BLOCKS)
     scr = scratch_layout(key)
     play = peer_layout(L.MAX_TOKENS, tp)
     half = peer_bytes(tp) // 2
@@ -209,93 +315,46 @@ def build(key: HeadBuild):
         red = lds.red.ptr
         xl = lds.xl.ptr
         mb = Mailbox(step_tag(epoch, slot) - 1)
+        # every CTA's peer addresses (as K2's), though only CTA 0 uses them
+        par = uniform(ld_i32(epoch, 0)) % 2
+        bases = peer_bases(peers, tp)
+        own = load_ptr64(peers, rank)
+        hoff = play["head"][0]
+        peer_head = [
+            shift(preg(pb, hoff, "head"), fx.Int64(par) * half) for pb in bases
+        ]
+        peer_head_own = shift(preg(own, hoff, "head"), fx.Int64(par) * half)
         c = {
             "S": s,
+            "TP": tp,
             "tid": tid,
+            "bid": bid,
             "lane": lane,
             "wave": wave,
             "xl": xl,
-            "args": {"w": w, "ws": ws},
+            "red": red,
+            "rank": rank,
+            "valid": valid,
+            "vocab_start": vocab_start,
+            "put_words": mb.put_words,
+            "poll": mb.poll,
+            "cta": sreg(scratch, scr["cta"][0], "cta"),
+            "peer_head": peer_head,
+            "peer_head_own": peer_head_own,
+            "args": {"w": w, "ws": ws, "out": out},
         }
 
         # ---- every CTA: x into LDS, MXFP4-exact (as the ASM GEMM reads it)
         gemv.rows_to_lds(tid, x, H, s, xl, XROW)
         quant_x(c, H)
 
-        # ---- the shard's row groups, the next group's weights in flight
-        g0 = fx.min(bid, groups - 1)
-        ops = _group_ops(c, g0)
-        best_val = fx.Float32(NEG_INF)
-        best_idx = fx.Int32(0)
-        for i in range_constexpr(rounds):
-            g = bid + BLOCKS * i
-            live = g < groups
-            gi = fx.min(g, groups - 1)
-            if i + 1 < rounds:
-                gi_next = fx.min(bid + BLOCKS * (i + 1), groups - 1)
-                ops_next = _group_ops(c, gi_next)
-            acc = fp4_gemv(lane, wave, xl, XROW, H, s, gi, ops)
-            fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
-            gpu.barrier()
-            mine = tid < RP * s
-            r = 2 * (tid % RP)
-            t = fx.min(tid // RP, s - 1)
-            v0 = _safe(bf16_round(row_sum(red, r, t)))
-            v1 = _safe(bf16_round(row_sum(red, r + 1, t)))
-            idx0 = gi * ROWS + r
-            idx1 = idx0 + 1
-            ok0 = mine & live & (idx0 < valid)
-            ok1 = mine & live & (idx1 < valid)
-            cv0 = ok0.select(v0, fx.Float32(NEG_INF))
-            cv1 = ok1.select(v1, fx.Float32(NEG_INF))
-            best_val, best_idx = _better(cv0, idx0, best_val, best_idx)
-            best_val, best_idx = _better(cv1, idx1, best_val, best_idx)
-            gpu.barrier()
-            if i + 1 < rounds:
-                ops = ops_next
+        # ---- the shard's row groups -> one (max, local row) a token a CTA
+        c["best"] = run_head(c, groups)
+        stage_cta(c)
 
-        # ---- one (max, local row) a token: the 8 row-pair threads' window
-        for off in (4, 2, 1):
-            ov = xshfl(best_val, off)
-            oi = xshfl(best_idx, off)
-            best_val, best_idx = _better(ov, oi, best_val, best_idx)
-
-        cta = sreg(scratch, scr["cta"][0], "cta")
-        tt = lane // RP
-        if (wave == 0) & ((lane % RP) == 0) & (tt < s):
-            slot_i = (bid * s + tt) * 2
-            mb.put_words(cta, slot_i, [best_val.bitcast(fx.Int32), best_idx])
-
-        # ---- CTA 0, a token a thread: every CTA's winner, then every rank's
-        if (bid == 0) & (tid < s):
-            t = tid
-            specs = [(cta, (b * s + t) * 2, 2) for b in range(BLOCKS)]
-            got = mb.poll(specs)
-            rv = fx.Float32(NEG_INF)
-            ri = fx.Int32(0)
-            for wv, wi in got:
-                rv, ri = _better(f32_of(wv), wi, rv, ri)
-            ri = ri + vocab_start
-            par = uniform(ld_i32(epoch, 0)) % 2
-            bases = peer_bases(peers, tp)
-            own = load_ptr64(peers, rank)
-            hoff = play["head"][0]
-            peer_head = [
-                shift(preg(pb, hoff, "head"), fx.Int64(par) * half) for pb in bases
-            ]
-            peer_head_own = shift(preg(own, hoff, "head"), fx.Int64(par) * half)
-            for p in range(tp):
-                mb.put_words(
-                    peer_head[p], (rank * s + t) * 2, [rv.bitcast(fx.Int32), ri]
-                )
-            got2 = mb.poll(
-                [(peer_head_own, src * s * 2 + t * 2, 2) for src in range(tp)]
-            )
-            fv = fx.Float32(NEG_INF)
-            fi = fx.Int32(0)
-            for wv, wi in got2:
-                fv, fi = _better(f32_of(wv), wi, fv, fi)
-            _store_i64(out, t, fi)
+        # ---- CTA 0, a token a wave: every CTA's winner, then every rank's
+        if (bid == 0) & (wave < s):
+            stage_token_rank(c, wave)
 
     @flyc.jit
     def launch(
@@ -347,8 +406,9 @@ def draft_head(
     never win). ``vocab_start``: this rank's first row's global vocab id
     (``rank * key.rows``). ``out`` [S] int64: every rank writes the same
     global argmax token ids. ``scratch``: device mailboxes (>=
-    ``scratch_bytes(key)``). ``peers``: the int64 table of every rank's peer
-    buffer (>= ``peer_bytes(key.tp)`` each, as ``PeerBuffer`` gives K2).
+    ``scratch_bytes(key)``; never zeroed between launches -- the mailbox tag
+    carries the step's epoch). ``peers``: the int64 table of every rank's
+    peer buffer (>= ``peer_bytes(key.tp)`` each, as ``PeerBuffer`` gives K2).
     ``epoch`` a device int32 bumped once a step, ``slot`` this launch's tag
     slot."""
     s = key.tokens

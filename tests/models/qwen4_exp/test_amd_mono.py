@@ -829,6 +829,43 @@ def _lmhead_reference(x, tp: int, v_r: int, valid: int, device):
     return torch.argmax(torch.cat(logits, dim=-1), dim=-1)
 
 
+def _bf16_ulp(v):
+    """One bf16 ulp below ``v`` (already bf16-exact, held as fp32)."""
+    vb = v.to(bf)
+    nxt = torch.nextafter(vb, torch.full_like(vb, float("-inf")))
+    return (vb.float() - nxt.float()).abs()
+
+
+def _lmhead_check(out, x, tp: int, v_r: int, valid: int, device) -> int:
+    """Checks the kernel's ``out`` against the reference, one rank's huge
+    dequantized shard at a time (computed, used, freed -- never holding two
+    ranks' shards live together). Requires an exact match to the reference
+    argmax OR (fp32 summation order can differ between the kernel's MFMA
+    reduction tree and torch's, which can flip the argmax between two
+    near-tied logits) that the kernel's picked logit is within 1 bf16 ulp of
+    the true per-token max. Returns the number of exact matches."""
+    s = x.shape[0]
+    best_val = torch.full((s,), float("-inf"), device=device)
+    picked_val = torch.full((s,), float("nan"), device=device)
+    for r in range(tp):
+        q, sc, _, _ = _lmhead_weights(r, device, v_r)
+        lg = _lmhead_logits(x, q, sc)
+        lg[:, valid:] = float("-inf")
+        best_val = torch.maximum(best_val, lg.max(dim=-1).values)
+        local = (out - r * v_r).clamp(0, v_r - 1)
+        mine = (out >= r * v_r) & (out < r * v_r + v_r)
+        picked_val = torch.where(
+            mine, lg.gather(-1, local.unsqueeze(-1)).squeeze(-1), picked_val
+        )
+        del q, sc, lg
+        torch.cuda.empty_cache()
+    exact = picked_val == best_val
+    tol = _bf16_ulp(best_val)
+    close = (best_val - picked_val).abs() <= tol
+    assert torch.all(exact | close), (picked_val, best_val, out)
+    return int(exact.sum().item())
+
+
 def _reshuffle_lmhead(q, sc):
     """``_mxfp4_linear``'s shuffle, standalone: raw (q, sc) -> (w, ws). Lets a
     test plant specific rows in the raw codes, then re-derive the kernel's
@@ -857,27 +894,42 @@ def _head_worker(
     from vllm.distributed import get_tp_group
     from vllm.models.kimi_k3.amd.mono.common.peer_memory import PeerBuffer
     from vllm.models.qwen4_exp.amd.mono import head
-    from vllm.models.qwen4_exp.amd.mono.layout import HIDDEN
+    from vllm.models.qwen4_exp.amd.mono.layout import HIDDEN, MAX_TOKENS
 
     tp = get_tp_group()
     peers = PeerBuffer(head.peer_bytes(TP), tp.cpu_group, rank, tp_size, device)
     peers.bytes.zero_()
     epoch = torch.zeros(1, dtype=torch.int32, device=device)
-    step = 0
 
     # a padded shard smaller than the real one, a non-16-aligned valid cutoff
     v_r, valid = 16 * 300 + 32, 16 * 300 + 5
     vocab_start = rank * v_r
     q, sc, w, ws = _lmhead_weights(rank, device, v_r)
 
-    for s in (1, 3, 8):
-        step += 1
+    # layout sanity: (w, ws) is what AITER's own ASM FP4 GEMM reads, cross-
+    # checked against the dequantized reference (as _k2_worker does for
+    # in_proj_qkvz / out_proj), not just internally self-consistent
+    gl = torch.Generator(device=device).manual_seed(950)
+    xl = _randn(gl, 4, HIDDEN, scale=0.3)
+    stock = _mxfp4_linear_stock(xl, w, ws)
+    ref_l = F.linear(_mxfp4_qdq(xl).to(bf), _mxfp4_dequant(q, sc).to(bf))
+    assert _cos(stock, ref_l) > STOCK_COS_MIN
+
+    # production pattern: one scratch buffer (sized for the widest S), one
+    # fixed tag slot, mixed widths across launches -- only ``epoch`` (bumped
+    # every launch) keeps the mailbox tags apart
+    slot = 0
+    scratch = torch.zeros(
+        head.scratch_bytes(head.HeadBuild(tokens=MAX_TOKENS, tp=TP, rows=v_r)),
+        dtype=torch.uint8,
+        device=device,
+    )
+    for s in (1, 3, 8, 3, 1):
         epoch.add_(1)
         key = head.HeadBuild(tokens=s, tp=TP, rows=v_r)
         g = torch.Generator(device=device).manual_seed(900 + s)
         x = _randn(g, s, HIDDEN, scale=0.3)
         out = torch.full((s,), -1, dtype=torch.int64, device=device)
-        scratch = torch.zeros(head.scratch_bytes(key), dtype=torch.uint8, device=device)
         head.draft_head(
             key,
             x=x,
@@ -886,11 +938,11 @@ def _head_worker(
             valid=valid,
             vocab_start=vocab_start,
             out=out,
-            scratch=scratch,
+            scratch=scratch[: head.scratch_bytes(key)],
             peers=peers.addresses,
             rank=rank,
             epoch=epoch,
-            slot=step,
+            slot=slot,
         )
         torch.accelerator.synchronize()
         want = _lmhead_reference(x, TP, v_r, valid, device)
@@ -899,36 +951,58 @@ def _head_worker(
         dist.all_gather(outs, out)
         assert all(torch.equal(outs[0], o) for o in outs), (s, "ranks disagree")
 
-    # planted ties (the lower of two equal rows must win) and a planted max
-    # in a padding row (must be ignored): token 0 the plant, token 1 ordinary
-    step += 1
+    # four independent planted scenarios (each its own token and weight
+    # column, so none of them can interact): a tie within one thread (rows
+    # 4 / 5, the same row-pair thread's idx0 / idx1), a tie within a CTA
+    # across lanes (rows 5 / 13, different row-pair threads of the same
+    # group), a clear valid winner next to a bigger padding-row value that
+    # must be ignored (row 45 vs the padding row 60), and a cross-rank tie
+    # (rank 0's row 20 against rank 1's row 0: rank 0 must win on vocab_start
+    # alone, 0 < pv_r)
     epoch.add_(1)
     pv_r, pvalid = 64, 48
-    tie_lo, tie_hi, pad_row = 5, 40, 60
+    tie_a, tie_b = 4, 5
+    tie_c, tie_d = 5, 13
+    champ, pad_row = 45, 60
+    cross_lo, cross_hi = 20, 0
 
-    def _plant(q, sc):
-        """Rows ``tie_lo`` / ``tie_hi`` (two valid rows, column 0): an
-        identical, huge dequantized value -- a guaranteed, decisive tie. Row
-        ``pad_row`` (a padding row, column 0): an even huger value, that must
-        never win. nibble 7 -> e2m1 magnitude 6.0 (``_mxfp4_dequant``'s
-        ``_FP4`` max); column 0 is byte 0's low nibble. The high nibble
-        (column 1) is left random: x is zero there, so it never contributes
-        to the dot product."""
-        for row, code in ((tie_lo, 180), (tie_hi, 180), (pad_row, 220)):
-            q[row, 0] = (q[row, 0] & 0xF0) | 0x7
-            sc[row, 0] = code
+    def _plant(q, sc, this_rank):
+        """Nibble 7 -> e2m1 magnitude 6.0 (``_mxfp4_dequant``'s ``_FP4``
+        max); ``col``'s byte is ``col // 2``, its low nibble if ``col`` is
+        even, high if odd. Every plant lives in its own column, zero in
+        every other token's x row, so the scenarios cannot interact."""
 
-    s = 2
+        def set_val(row, col, code):
+            byte, hi = col // 2, col % 2 == 1
+            if hi:
+                q[row, byte] = (q[row, byte] & 0x0F) | 0x70
+            else:
+                q[row, byte] = (q[row, byte] & 0xF0) | 0x07
+            sc[row, col // 32] = code
+
+        if this_rank == 0:
+            set_val(tie_a, 0, 180)
+            set_val(tie_b, 0, 180)
+            set_val(tie_c, 1, 180)
+            set_val(tie_d, 1, 180)
+            set_val(champ, 2, 170)
+            set_val(pad_row, 2, 220)
+            set_val(cross_lo, 3, 180)
+        else:
+            set_val(cross_hi, 3, 180)
+
+    s = 4
     g = torch.Generator(device=device).manual_seed(901)
     x = _randn(g, s, HIDDEN, scale=0.3)
-    x[0, 0], x[0, 1:] = 1.0, 0.0
+    for tok, col in enumerate((0, 1, 2, 3)):
+        x[tok].zero_()
+        x[tok, col] = 1.0
     pq, psc, _, _ = _lmhead_weights(rank, device, pv_r)
-    if rank == 0:
-        _plant(pq, psc)
+    _plant(pq, psc, rank)
     pw, pws = _reshuffle_lmhead(pq, psc)
     key = head.HeadBuild(tokens=s, tp=TP, rows=pv_r)
     out = torch.full((s,), -1, dtype=torch.int64, device=device)
-    scratch = torch.zeros(head.scratch_bytes(key), dtype=torch.uint8, device=device)
+    pscratch = torch.zeros(head.scratch_bytes(key), dtype=torch.uint8, device=device)
     head.draft_head(
         key,
         x=x,
@@ -937,27 +1011,25 @@ def _head_worker(
         valid=pvalid,
         vocab_start=rank * pv_r,
         out=out,
-        scratch=scratch,
+        scratch=pscratch,
         peers=peers.addresses,
         rank=rank,
         epoch=epoch,
-        slot=step,
+        slot=slot,
     )
     torch.accelerator.synchronize()
-    # the reference, reconstructed identically on every rank (the plant
-    # applies to rank 0's shard regardless of which rank computes it here)
+    # the reference, reconstructed identically on every rank (the plant is a
+    # pure function of the rank being reconstructed, not of this process)
     logits = []
     for r in range(TP):
         rq, rsc, _, _ = _lmhead_weights(r, device, pv_r)
-        if r == 0:
-            _plant(rq, rsc)
+        _plant(rq, rsc, r)
         lg = _lmhead_logits(x, rq, rsc)
         lg[:, pvalid:] = float("-inf")
         logits.append(lg)
     want = torch.argmax(torch.cat(logits, dim=-1), dim=-1)
-    # sanity: the plant's own reasoning -- the lower tied row wins token 0,
-    # unperturbed by the (dwarfed) padding row or any ordinary random row
-    assert want[0].item() == tie_lo, want
+    # sanity: the plants' own reasoning
+    assert want.tolist() == [tie_a, tie_c, champ, cross_lo], want
     torch.testing.assert_close(out, want, atol=0, rtol=0)
     outs = [torch.empty_like(out) for _ in range(tp_size)]
     dist.all_gather(outs, out)
@@ -970,9 +1042,11 @@ def _head_worker(
 def test_draft_head_matches_vllm_ops(monkeypatch: pytest.MonkeyPatch) -> None:
     """``draft_head``'s MXFP4 lm_head GEMV + greedy argmax across the vocab
     shard and the TP ranks, against a dequantized fp32 reference, at a small
-    padded vocab shard (a non-16-aligned valid cutoff); plus planted ties
-    (the lower index must win) and a planted max in a padding row (must be
-    ignored)."""
+    padded vocab shard (a non-16-aligned valid cutoff) replayed at mixed
+    widths from one scratch buffer and tag slot (the production pattern);
+    plus a layout sanity check against AITER's own ASM FP4 GEMM, and four
+    independent planted ties / a planted padding-row max (must be ignored) /
+    a cross-rank tie."""
     multi_process_parallel(monkeypatch, 2, 1, _head_worker)
 
 
@@ -999,6 +1073,9 @@ def _head_worker_full_vocab(
     peers.bytes.zero_()
     epoch = torch.zeros(1, dtype=torch.int32, device=device)
 
+    # 124160 / 16 = 7760 = 30 * 256 + 80 row groups: CTAs 80 .. 255 run one
+    # fewer loop iteration than CTAs 0 .. 79 here too, not only in the small
+    # shard above
     v_r = 124160  # Qwen3.8-Flash-Next draft head's real per-rank vocab shard
     _, _, w, ws = _lmhead_weights(rank, device, v_r)
     s = 8
@@ -1020,11 +1097,12 @@ def _head_worker_full_vocab(
         peers=peers.addresses,
         rank=rank,
         epoch=epoch,
-        slot=1,
+        slot=0,
     )
     torch.accelerator.synchronize()
-    want = _lmhead_reference(x, TP, v_r, v_r, device)
-    torch.testing.assert_close(out, want, atol=0, rtol=0)
+    n_exact = _lmhead_check(out, x, TP, v_r, v_r, device)
+    if rank == 0:
+        print(f"draft_head s={s} rows={v_r}: {n_exact}/{s} tokens exact")
 
     # both ranks must keep launching in lockstep (the cross-rank reduce
     # rendezvous-waits on every rank), so only the timing / print is rank 0's
@@ -1048,7 +1126,7 @@ def _head_worker_full_vocab(
             peers=peers.addresses,
             rank=rank,
             epoch=epoch,
-            slot=1,
+            slot=0,
         )
     if rank == 0:
         end.record()
@@ -1056,6 +1134,10 @@ def _head_worker_full_vocab(
     if rank == 0:
         us = start.elapsed_time(end) * 1000 / n_iters
         print(f"draft_head s={s} rows={v_r}: {us:.1f} us/iter")
+    # re-check correctness after the timing loop, not just once up front
+    n_exact = _lmhead_check(out, x, TP, v_r, v_r, device)
+    if rank == 0:
+        print(f"draft_head s={s} rows={v_r}: {n_exact}/{s} tokens exact (post-timing)")
     peers.close()
 
 
@@ -1065,6 +1147,11 @@ def test_draft_head_matches_vllm_ops_full_vocab(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """``draft_head`` at the real Qwen3.8-Flash-Next draft head's per-rank
-    vocab shard (124160 rows, no padding), S = 8; also times 100 iterations
-    (CUDA events) and prints the per-iteration microseconds."""
+    vocab shard (124160 rows, no padding), S = 8, checked before and after
+    timing 100 iterations (CUDA events, per-iteration microseconds printed).
+    The reference (``_lmhead_check``) dequantizes one rank's ~169 MB shard at
+    a time and accepts the kernel's pick if it is within 1 bf16 ulp of the
+    true max, not only an exact match: at 8 x 248320 candidates, fp32
+    summation order can differ between the kernel's MFMA tree and torch's
+    enough to flip an exact near-tie."""
     multi_process_parallel(monkeypatch, 2, 1, _head_worker_full_vocab)
