@@ -32,6 +32,17 @@ there is no all-reduce here.
               waiting on every ``sflag`` (``wait_state``) before any of them
               reads ``state`` -- the HC norm's own sums of squares are read
               back from the just-written ``state``, not recomputed in F2
+    F4 qkv    (``key.qkv``, idea #7): every CTA, past the HC front -- the QSA
+              layer's ``qkv_proj`` (``lay.QKV`` rows) and the indexer's
+              ``index_qk_proj`` (``L.IDXQK`` rows, replicated) GEMVs against
+              the just-produced block input ``x`` (``hc.bin_to_lds``, gated on
+              every F3 up task's ``binf``), 16 output rows a task, more tasks
+              than CTAs so some CTAs take two (``qkv_rounds``); a CTA past the
+              real task count still runs a harmless, unstored GEMV on a
+              clamped row rather than branch around it -> ``qkv_out`` /
+              ``idx_out`` bf16, so the draft step's two skinny BF16 GEMMs
+              after this launch (``attn.qkv_proj`` / ``indexer.index_qk_proj``)
+              are no longer needed
 
 See ``README_front.md`` for the design rationale and LDS budget.
 """
@@ -96,6 +107,7 @@ class FrontBuild:
     pre_fh: bool = False  # E6.1: fh := prev[.., kH + 16g ..] straight (no fc_hidden)
     emb_ids: bool = False  # E6b.2: `emb` is a replicated vocab table, gather by `ids`
     ids_dw: int = 2  # dwords per `ids` element: 2 = int64, 1 = int32 (the step's input_ids)
+    qkv: bool = False  # idea #7: F4, qkv_proj / index_qk_proj folded in
 
 
 ABI = KernelAbi(
@@ -117,6 +129,10 @@ ABI = KernelAbi(
         "slot",
         "dbg",  # Stage 0a: stamps.py target, 256 * stamps.NSLOT int32; 0 when off
         "ids",  # E6b.2 (emb_ids): int64 [S], back's picked token ids; 0 when off
+        "w_qkv",  # F4 (qkv): bf16 [lay.QKV, H], this rank's qkv_proj; 0 when off
+        "w_idx",  # F4 (qkv): bf16 [L.IDXQK, H], index_qk_proj, replicated; 0 when off
+        "qkv_out",  # F4 (qkv): bf16 [S, lay.QKV] output; 0 when off
+        "idx_out",  # F4 (qkv): bf16 [S, L.IDXQK] output; 0 when off
     )
 )
 
@@ -400,6 +416,35 @@ def _put_inj(c, t, r, vs):
     )
 
 
+# ------------------------------------------------------- F4: qkv / idx proj
+@traced
+def stage_proj(c, rg, valid, ops, out, nrows):
+    """Row group ``rg`` (16 of ``out``'s ``nrows`` output columns, clamped
+    into range by the caller) against the block input already in ``c["xl"]``
+    (``hc.bin_to_lds``): bf16(x @ w[rg]^T) -- the same GEMV ``stage_fc`` runs
+    for ``fe`` -- -> ``out`` [S, nrows] bf16 (device-scope), stored only while
+    ``valid``. The clamp keeps the GEMV itself always in range, so a CTA past
+    the real task count (more 16-row tasks than CTAs) still runs it, harmlessly
+    throwing the result away, rather than branch around it."""
+    s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
+    acc = gemv.mfmas(lane, wave, c["xl"], XROW, H, s, ops)
+    fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
+    gpu.barrier()
+    if tid < (ROWS // 2) * s:
+        rp = tid % (ROWS // 2)
+        tt = tid // (ROWS // 2)
+        v0 = bf16_round(row_sum(red, 2 * rp, tt))
+        v1 = bf16_round(row_sum(red, 2 * rp + 1, tt))
+        if valid:
+            bo.buffer_store(
+                bf16_pair(v0, v1).bitcast(fx.Int32),
+                rsrc(out),
+                (tt * nrows + rg * ROWS + 2 * rp) // 2,
+                cache_modifier=CM_DEV,
+            )
+    gpu.barrier()
+
+
 # ---------------------------------------------------------------- kernel
 _BUILDS: dict = {}
 
@@ -410,6 +455,12 @@ def build(key: FrontBuild):
     s = key.tokens
     need(1 <= s <= L.MAX_TOKENS, f"{s} rows, the kernels take 1..{L.MAX_TOKENS}")
     need(key.tp in L.TPS, f"tensor parallel size {key.tp}, built for {L.TPS}")
+    lay = L.Layout(key.tp)
+    need(lay.QKV % ROWS == 0, "F4: qkv_proj rows, a whole number of 16-row tasks")
+    need(L.IDXQK % ROWS == 0, "F4: index_qk_proj rows, a whole number of 16-row tasks")
+    qkv_tasks = lay.QKV // ROWS
+    qkv_rounds = -(-qkv_tasks // BLOCKS)  # tasks > BLOCKS: some CTAs take 2
+    idx_tasks = L.IDXQK // ROWS
     scr = scratch_layout(key)
     xwords = s * (max(H, hc.DK) + gemv.LDS_PAD) // 2
 
@@ -448,6 +499,10 @@ def build(key: FrontBuild):
         slot: Int32,
         dbg: Int64,
         ids: Int64,
+        w_qkv: Int64,
+        w_idx: Int64,
+        qkv_out: Int64,
+        idx_out: Int64,
     ):
         _ = keyed
         tid = fx.thread_idx.x
@@ -501,7 +556,7 @@ def build(key: FrontBuild):
             "msq_in": None,
             "dpart": sreg(scratch, scr["dpart"][0], "dpart"),
             "lora": sreg(scratch, scr["lora"][0], "lora"),
-            "binf": None,
+            "binf": sreg(scratch, scr["binf"][0], "binf") if key.qkv else None,
             "bin": bin_out,
             "inj_out": lambda t, r, vs: _put_inj(c, t, r, vs),
         }
@@ -548,6 +603,22 @@ def build(key: FrontBuild):
             wait_state(c)
             hc.load_rrms(c)
             hc.stage_down(c, bid - D0, dops)
+        # ---- F4 (idea #7): every CTA, past the whole HC front -- qkv_proj /
+        # index_qk_proj against the block input ``x`` F3 just produced,
+        # gated on every up task's ``binf`` (``hc.bin_to_lds``); more 16-row
+        # tasks than CTAs, so some take a second round (``qkv_rounds``), the
+        # row clamped into range so a CTA past the real task count still
+        # runs its GEMV, just never stores it (``stage_proj``'s ``valid``)
+        if const_expr(key.qkv):
+            hc.bin_to_lds(c, XROW)
+            for j in range_constexpr(qkv_rounds):
+                rg_raw = bid + BLOCKS * j
+                rg = fx.min(rg_raw, qkv_tasks - 1)
+                ops = gemv.loads(c["lane"], c["wave"], w_qkv, rg * ROWS, H)
+                stage_proj(c, rg, rg_raw < qkv_tasks, ops, qkv_out, lay.QKV)
+            idx_rg = fx.min(bid, idx_tasks - 1)
+            idx_ops = gemv.loads(c["lane"], c["wave"], w_idx, idx_rg * ROWS, H)
+            stage_proj(c, idx_rg, bid < idx_tasks, idx_ops, idx_out, L.IDXQK)
         stamps.stamp(c, 10)  # Stage 0a: kernel end
 
     @flyc.jit
@@ -569,6 +640,10 @@ def build(key: FrontBuild):
         slot: Int32,
         dbg: Int64,
         ids: Int64,
+        w_qkv: Int64,
+        w_idx: Int64,
+        qkv_out: Int64,
+        idx_out: Int64,
         stream: fx.Stream = _STREAM,
     ):
         _ = keyed
@@ -590,6 +665,10 @@ def build(key: FrontBuild):
             slot,
             dbg,
             ids,
+            w_qkv,
+            w_idx,
+            qkv_out,
+            idx_out,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     ABI.check(front, launch)
@@ -599,7 +678,8 @@ def build(key: FrontBuild):
 
 def _shape_checks(
     s, emb, prev, w_ne, w_nh, w_fe, w_fh, hc_w, w_down, w_up, state_out, bin_out,
-    inj_out, emb_ids=False,
+    inj_out, emb_ids=False, qkv=False, w_qkv=None, w_idx=None, qkv_out=None,
+    idx_out=None, lay=None,
 ):  # fmt: skip
     bf = torch.bfloat16
     if emb_ids:
@@ -626,6 +706,25 @@ def _shape_checks(
         emb, prev, w_ne, w_nh, w_fe, w_fh, hc_w, w_down, w_up, state_out, bin_out,
         inj_out,
     ]  # fmt: skip
+    if qkv:
+        need(lay is not None, "lay: required iff qkv")
+        need(
+            w_qkv.shape == (lay.QKV, H) and w_qkv.dtype == bf,
+            f"qkv_proj: bf16 [{lay.QKV}, {H}]",
+        )
+        need(
+            w_idx.shape == (L.IDXQK, H) and w_idx.dtype == bf,
+            f"index_qk_proj: bf16 [{L.IDXQK}, {H}]",
+        )
+        need(
+            qkv_out.shape == (s, lay.QKV) and qkv_out.dtype == bf,
+            f"qkv_out: bf16 [S, {lay.QKV}]",
+        )
+        need(
+            idx_out.shape == (s, L.IDXQK) and idx_out.dtype == bf,
+            f"idx_out: bf16 [S, {L.IDXQK}]",
+        )
+        tensors += [w_qkv, w_idx, qkv_out, idx_out]
     need(all(t.is_contiguous() for t in tensors), "a non-contiguous input")
 
 
@@ -649,6 +748,10 @@ def draft_front(
     slot,
     dbg=None,
     ids=None,
+    w_qkv=None,
+    w_idx=None,
+    qkv_out=None,
+    idx_out=None,
 ):
     """Host launcher of the MTP draft step's front: the ``fc_embedding`` /
     ``fc_hidden`` projections (every rank's full, gathered weights) folded
@@ -662,14 +765,26 @@ def draft_front(
     step, ``slot`` this launch's tag slot. ``dbg``: Stage 0a's stamp buffer
     (``stamps.dbg_buffer``), required iff ``key.trace``. ``ids``: E6b.2's
     per-token vocab ids (int64 [S]), required iff ``key.emb_ids`` -- then
-    ``emb`` is the full replicated vocab table ``[V, H]``, not ``[S, H]``."""
+    ``emb`` is the full replicated vocab table ``[V, H]``, not ``[S, H]``.
+    ``w_qkv`` / ``w_idx`` / ``qkv_out`` / ``idx_out`` (idea #7): this rank's
+    ``qkv_proj`` weight and the replicated ``index_qk_proj`` weight, and F4's
+    two GEMV outputs; required iff ``key.qkv``, else unread."""
     s = key.tokens
+    lay = L.Layout(key.tp) if key.qkv else None
     _shape_checks(
         s, emb, prev, w_ne, w_nh, w_fe, w_fh, hc_w, w_down, w_up, state_out, bin_out,
-        inj_out, emb_ids=key.emb_ids,
+        inj_out, emb_ids=key.emb_ids, qkv=key.qkv, w_qkv=w_qkv, w_idx=w_idx,
+        qkv_out=qkv_out, idx_out=idx_out, lay=lay,
     )  # fmt: skip
     need(key.trace == (dbg is not None), "dbg: required iff key.trace")
     need(key.emb_ids == (ids is not None), "ids: required iff key.emb_ids")
+    qkv_given = (
+        w_qkv is not None
+        and w_idx is not None
+        and qkv_out is not None
+        and idx_out is not None
+    )
+    need(key.qkv == qkv_given, "w_qkv/w_idx/qkv_out/idx_out: all required iff key.qkv")
     if ids is not None:
         need(
             ids.shape == (s,)
@@ -695,5 +810,9 @@ def draft_front(
         "slot": slot,
         "dbg": 0 if dbg is None else dbg.data_ptr(),
         "ids": 0 if ids is None else ids.data_ptr(),
+        "w_qkv": 0 if w_qkv is None else w_qkv.data_ptr(),
+        "w_idx": 0 if w_idx is None else w_idx.data_ptr(),
+        "qkv_out": 0 if qkv_out is None else qkv_out.data_ptr(),
+        "idx_out": 0 if idx_out is None else idx_out.data_ptr(),
     }
     build(key)(*ABI.pack(vals), stream=torch.cuda.current_stream())

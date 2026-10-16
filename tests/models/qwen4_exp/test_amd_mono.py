@@ -260,6 +260,77 @@ def test_draft_front_matches_vllm_ops(s: int) -> None:
     )
 
 
+@pytest.mark.parametrize("s", [1, 3, 8])
+@torch.inference_mode()
+def test_draft_front_qkv_matches_vllm_ops(s: int) -> None:
+    """Idea #7: ``FrontBuild(qkv=True)`` folds the QSA layer's ``qkv_proj``
+    and the indexer's ``index_qk_proj`` GEMVs into F4, the same launch, after
+    the HC front -- against plain ``F.linear`` on the reference block input
+    (``_mix_ref``'s ``x``, the same input the stock skinny GEMMs run on)."""
+    from vllm.models.qwen4_exp.amd.mono import front
+    from vllm.models.qwen4_exp.amd.mono.layout import HC, HH, HIDDEN, IDXQK, Layout
+
+    lay = Layout(TP)
+    g = torch.Generator(device="cuda").manual_seed(100 + s)
+    emb = _randn(g, s, HIDDEN, scale=2.0)
+    prev = _randn(g, s, HH, scale=2.0)
+    w_ne = _randn(g, HIDDEN, scale=0.1)
+    w_nh = _randn(g, HH, scale=0.1)
+    w_fe = _randn(g, HIDDEN, HIDDEN, scale=0.05)
+    w_fh = _randn(g, HIDDEN, HIDDEN, scale=0.05)
+    hw = _hc_weights(g)
+    w_qkv = _randn(g, lay.QKV, HIDDEN, scale=0.05)
+    w_idx = _randn(g, IDXQK, HIDDEN, scale=0.05)
+    ne_eps, nh_eps = 1e-5, 3e-6
+
+    want_state = _front_ref(emb, prev, w_ne, w_nh, w_fe, w_fh, ne_eps, nh_eps)
+    want_x, want_inj, _ = _mix_ref(want_state, hw)
+    want_qkv = F.linear(want_x, w_qkv)
+    want_idx = F.linear(want_x, w_idx)
+
+    key = front.FrontBuild(tokens=s, tp=TP, ne_eps=ne_eps, nh_eps=nh_eps, qkv=True)
+    state = torch.full((s, HH), float("nan"), dtype=bf, device="cuda")
+    x = torch.full((s, HIDDEN), float("nan"), dtype=bf, device="cuda")
+    inj = torch.full((s, HC), float("nan"), dtype=bf, device="cuda")
+    qkv_out = torch.full((s, lay.QKV), float("nan"), dtype=bf, device="cuda")
+    idx_out = torch.full((s, IDXQK), float("nan"), dtype=bf, device="cuda")
+    scratch = torch.zeros(front.scratch_bytes(key), dtype=torch.uint8, device="cuda")
+    epoch = torch.ones(1, dtype=torch.int32, device="cuda")
+
+    front.draft_front(
+        key,
+        emb=emb,
+        prev=prev,
+        w_ne=w_ne,
+        w_nh=w_nh,
+        w_fe=w_fe,
+        w_fh=w_fh,
+        **hw,
+        state_out=state,
+        bin_out=x,
+        inj_out=inj,
+        scratch=scratch,
+        epoch=epoch,
+        slot=0,
+        w_qkv=w_qkv,
+        w_idx=w_idx,
+        qkv_out=qkv_out,
+        idx_out=idx_out,
+    )
+    torch.accelerator.synchronize()
+
+    # the HC front's own outputs are unaffected by F4 being on
+    assert _cos(state, want_state) > COS_MIN
+    assert _cos(x, want_x) > COS_MIN
+    torch.testing.assert_close(x, want_x, atol=2e-2, rtol=2e-2)
+    assert _cos(inj, want_inj) > COS_MIN
+
+    assert _cos(qkv_out, want_qkv) > COS_MIN
+    torch.testing.assert_close(qkv_out, want_qkv, atol=2e-2, rtol=2e-2)
+    assert _cos(idx_out, want_idx) > COS_MIN
+    torch.testing.assert_close(idx_out, want_idx, atol=2e-2, rtol=2e-2)
+
+
 # ---------------------------------------------------------------- K1
 def _gdn_inputs(s: int, n_real: int, slots: int = 16):
     from vllm.models.qwen4_exp.amd.mono.layout import HD, HH, HIDDEN, Layout

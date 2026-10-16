@@ -335,12 +335,23 @@ class MonoDecode(B.QwenMonoDecode):
         return out, msq
 
 
-def _qsa_core(attn, x, positions) -> tuple[torch.Tensor, torch.Tensor | None]:
+def _qsa_core(
+    attn, x, positions, *, qkv=None, idx_qk=None
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     """``Qwen4ExpQSAAttention.forward`` up to the output gate (K2 applies it to
-    o_proj's input) -> (attention output [S, heads HD], gate or None)."""
+    o_proj's input) -> (attention output [S, heads HD], gate or None).
+
+    ``qkv`` / ``idx_qk`` (idea #7): a caller that already ran ``qkv_proj`` /
+    ``indexer.index_qk_proj`` (e.g. the draft front's F4) passes their
+    outputs here instead of letting this function call the projections
+    itself; None (the default) is the stock path, bit-identical to before.
+    ``idx_qk`` only reaches the indexer when ``attn.use_fused_qsa_prepare``
+    (the only path with a precomputed-projection short-circuit); it is
+    otherwise unused -- the rest of the QSA core stays stock either way."""
     from vllm.models.qwen4_exp.amd import qsa
 
-    qkv, _ = attn.qkv_proj(x)
+    if qkv is None:
+        qkv, _ = attn.qkv_proj(x)
     n = x.shape[0]
     name = qsa._encode_layer_name(attn.layer_name)
     if attn.use_fused_qsa_prepare:
@@ -348,10 +359,12 @@ def _qsa_core(attn, x, positions) -> tuple[torch.Tensor, torch.Tensor | None]:
         gate = torch.empty_like(out)
         if current_platform.opaque_attention_op():
             torch.ops.vllm.qwen4_exp_qsa_prepare_with_output(
-                x, positions, qkv, out, gate, name
+                x, positions, qkv, out, gate, name, idx_qk
             )
         else:
-            qsa.qwen4_exp_qsa_prepare_with_output(x, positions, qkv, out, gate, name)
+            qsa.qwen4_exp_qsa_prepare_with_output(
+                x, positions, qkv, out, gate, name, idx_qk
+            )
         return out.view(n, -1), gate.view(n, -1)
     q, k, v, gate = attn._project_qkv_gate(qkv, positions)
     query = q.view(n, attn.num_heads, attn.head_dim)

@@ -350,6 +350,30 @@ class DraftMonoDecode(B.QwenMonoDecode):
             )
         return None
 
+    def _qkv_error(self, attn) -> str | None:
+        """Why ``attn``'s ``qkv_proj`` / ``indexer.index_qk_proj`` are
+        unreadable as F4's GEMV weights (idea #7), else None: a plain bf16
+        linear with no bias, this rank's ``qkv_proj`` shard ``[lay.QKV, H]``
+        (already TP-sharded the way the kernel wants it, no all-gather) and
+        the replicated ``index_qk_proj`` ``[L.IDXQK, H]``."""
+        from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+        lay = self.lay
+        for name, lin, want in (
+            ("qkv_proj", attn.qkv_proj, (lay.QKV, L.HIDDEN)),
+            ("indexer.index_qk_proj", attn.indexer.index_qk_proj, (L.IDXQK, L.HIDDEN)),
+        ):
+            if not isinstance(lin.quant_method, UnquantizedLinearMethod):
+                return f"{name}: quantized ({type(lin.quant_method).__name__})"
+            if lin.weight.shape != want or lin.weight.dtype != torch.bfloat16:
+                return (
+                    f"{name}: {tuple(lin.weight.shape)} {lin.weight.dtype}, "
+                    f"want bf16 {want}"
+                )
+            if getattr(lin, "bias", None) is not None:
+                return f"{name}: has a bias, F4's GEMV applies none"
+        return None
+
     def weights_unsupported(self) -> str | None:
         lay = self.lay
         fp4s = (torch.uint8, torch.float4_e2m1fn_x2)
@@ -408,6 +432,12 @@ class DraftMonoDecode(B.QwenMonoDecode):
                     return why
             if any(w.shape != (L.HIDDEN, L.HIDDEN) for w in fc):
                 return f"fused front gathered weights: {[tuple(w.shape) for w in fc]}"
+        # F4 (idea #7) is optional too, same as the fused front itself: only
+        # check it when prepare_weights actually engaged it
+        if getattr(self, "_qkv", None) is not None:
+            why = self._qkv_error(layer.self_attn)
+            if why is not None:
+                return why
         return None
 
     def prepare_weights(self) -> None:
@@ -448,6 +478,17 @@ class DraftMonoDecode(B.QwenMonoDecode):
                     self._emb = tensor_model_parallel_all_gather(
                         model.embed_tokens.weight.data, dim=0
                     ).contiguous()
+                self._qkv = None
+                if envs.VLLM_ROCM_MONO_DRAFT_QKV:
+                    attn = model.layers[0].self_attn
+                    if self._qkv_error(attn) is None:
+                        # both already this rank's own shape: qkv_proj
+                        # TP-sharded the way F4 wants, index_qk_proj
+                        # replicated -- neither needs an all-gather
+                        self._qkv = (
+                            attn.qkv_proj.weight,
+                            attn.indexer.index_qk_proj.weight,
+                        )
                 self.front_scratch = {
                     n: torch.zeros(
                         (_front_bytes(n, self.tp) + 255) // 256 * 256,
@@ -522,8 +563,11 @@ class DraftMonoDecode(B.QwenMonoDecode):
             s, L.HIDDEN, dtype=hidden_states.dtype, device=self.epoch.device
         )
         inj = torch.empty(s, L.HC, dtype=x.dtype, device=x.device)
+        qkv_out = idx_out = None
         if getattr(self, "_fc", None) is not None:
-            state = self._fused_front(input_ids, hidden_states, inputs_embeds, x, inj)
+            state, qkv_out, idx_out = self._fused_front(
+                input_ids, hidden_states, inputs_embeds, x, inj
+            )
         else:
             state = self._front(input_ids, hidden_states, inputs_embeds)
             k1.hc_front(
@@ -545,7 +589,14 @@ class DraftMonoDecode(B.QwenMonoDecode):
                 epoch=self.epoch,
                 layer=layer.layer_idx,
             )
-        core, gate = _qsa_core(layer.self_attn, x, positions)
+        # qkv=None (the common, feature-off case) calls _qsa_core the same
+        # 3-positional-arg way as before idea #7, so a caller patching
+        # _qsa_core with a narrower signature (e.g. a test double) still works
+        core, gate = (
+            _qsa_core(layer.self_attn, x, positions)
+            if qkv_out is None
+            else _qsa_core(layer.self_attn, x, positions, qkv=qkv_out, idx_qk=idx_out)
+        )
 
         if self._use_back():
             return self._back_step(layer, state, inj, core, gate)
@@ -681,7 +732,10 @@ class DraftMonoDecode(B.QwenMonoDecode):
 
     def _fused_front(self, input_ids, hidden_states, inputs_embeds, x, inj):
         """``mono.front``: the fc projections and the attention HC front in one
-        launch -> ``state`` [S, 4H]; ``x`` / ``inj`` written."""
+        launch -> ``state`` [S, 4H]; ``x`` / ``inj`` written. Returns
+        ``(state, qkv_out, idx_out)``; the last two are the F4 GEMV outputs
+        (idea #7, ``qkv_proj`` / ``index_qk_proj`` folded in) when engaged
+        (``self._qkv``), else ``(state, None, None)``."""
         from vllm.models.qwen4_exp.amd.mono import front
 
         model = self.model
@@ -695,6 +749,12 @@ class DraftMonoDecode(B.QwenMonoDecode):
         elif inputs_embeds is None:
             inputs_embeds = model.embed_input_ids(input_ids)
         state = torch.empty(s, L.HH, dtype=x.dtype, device=x.device)
+        qkv = getattr(self, "_qkv", None)
+        w_qkv, w_idx, qkv_out, idx_out = None, None, None, None
+        if qkv is not None:
+            w_qkv, w_idx = qkv
+            qkv_out = torch.empty(s, self.lay.QKV, dtype=x.dtype, device=x.device)
+            idx_out = torch.empty(s, L.IDXQK, dtype=x.dtype, device=x.device)
         front.draft_front(
             front.FrontBuild(
                 tokens=s,
@@ -704,6 +764,7 @@ class DraftMonoDecode(B.QwenMonoDecode):
                 eps=attn_hc.config.rms_norm_eps,
                 ne_eps=model.pre_fc_norm_embedding.variance_epsilon,
                 nh_eps=model.pre_fc_norm_hidden.variance_epsilon,
+                qkv=qkv is not None,
             ),
             emb=inputs_embeds.contiguous(),
             prev=hidden_states.contiguous(),
@@ -721,8 +782,12 @@ class DraftMonoDecode(B.QwenMonoDecode):
             epoch=self.epoch,
             slot=layer.layer_idx,
             ids=ids,
+            w_qkv=w_qkv,
+            w_idx=w_idx,
+            qkv_out=qkv_out,
+            idx_out=idx_out,
         )
-        return state
+        return state, qkv_out, idx_out
 
     def _front(self, input_ids, hidden_states, inputs_embeds) -> torch.Tensor:
         """``Qwen4ExpMultiTokenPredictor.forward``'s embedding branch, eager:

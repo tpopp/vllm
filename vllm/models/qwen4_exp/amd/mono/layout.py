@@ -33,6 +33,11 @@ TOPK = 10
 MOE_I = 640  # moe_intermediate_size
 QSA_HEADS = 24
 QSA_HD = 256
+QSA_KV_HEADS = 2  # num_key_value_heads
+IDX_HEADS = 4  # indexer_n_heads
+IDX_KV_HEADS = 1  # indexer_kv_heads
+IDX_HD = 128  # indexer_head_dim
+IDXQK = (IDX_HEADS + IDX_KV_HEADS) * IDX_HD  # index_qk_proj rows, replicated
 
 
 def need(ok: bool, what: str) -> None:
@@ -92,6 +97,13 @@ class Layout:
         """out_proj / o_proj K a rank holds (GDN: NV HD; QSA: heads HD)."""
         assert QSA_HEADS // self.tp * QSA_HD == self.NV * HD
         return self.NV * HD
+
+    @property
+    def QKV(self) -> int:
+        """qkv_proj rows a rank: (heads (1 + gate) + 2 kv_heads) head_dim."""
+        heads = QSA_HEADS // self.tp
+        kv_heads = max(1, QSA_KV_HEADS // self.tp)
+        return (heads * 2 + 2 * kv_heads) * QSA_HD
 
     # MoE: experts TP-sharded (not EP); the router replicated
     @property

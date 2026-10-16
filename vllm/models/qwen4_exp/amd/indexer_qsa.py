@@ -153,12 +153,9 @@ class QSAIndexer(nn.Module):
     def output_width(self) -> int:
         return self.token_topk + self.compress_ratio - 1
 
-    def project(
-        self,
-        hidden_states: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Project replicated Q/K and split, leaving both operands unrotated."""
-        qk, _ = self.index_qk_proj(hidden_states)
+    def _split_qk(self, qk: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """``qk`` [*, (index_n_heads + index_kv_heads) index_head_dim] -> the
+        unrotated Q / K operands ``project`` itself also splits out."""
         return qk.split(
             (
                 self.index_n_heads * self.index_head_dim,
@@ -166,6 +163,14 @@ class QSAIndexer(nn.Module):
             ),
             dim=-1,
         )
+
+    def project(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project replicated Q/K and split, leaving both operands unrotated."""
+        qk, _ = self.index_qk_proj(hidden_states)
+        return self._split_qk(qk)
 
     def project_qk(
         self,
@@ -447,6 +452,7 @@ class QSAIndexer(nn.Module):
         slot_mapping: torch.Tensor | None = None,
         gate_out: torch.Tensor | None = None,
         kept_tail_rows: torch.Tensor | None = None,
+        idx_qk: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
         """Return fixed-width request-relative token indices padded with ``-1``.
 
@@ -459,6 +465,12 @@ class QSAIndexer(nn.Module):
         its Q and gate from ``qkv``, returned as the second element (None
         otherwise). The gate is written into ``gate_out`` when given. ``qkv``,
         ``slot_mapping`` and ``gate_out`` are only read in that mode.
+
+        ``idx_qk`` (idea #7): a caller that already ran ``index_qk_proj``
+        (e.g. the draft front's F4) passes its output here, the same width
+        ``self.index_qk_proj`` itself produces; this skips that GEMM instead
+        of calling ``self.project``. Only read alongside
+        ``attn.use_fused_qsa_prepare``; None (the default) is the stock path.
         """
         metadata = self._metadata()
         if metadata is None:
@@ -483,7 +495,10 @@ class QSAIndexer(nn.Module):
         if attn.use_fused_qsa_prepare:
             if qkv is None or slot_mapping is None:
                 raise ValueError("fused QSA prepare requires qkv and slot_mapping")
-            projected_q, raw_keys = self.project(hidden_states)
+            if idx_qk is None:
+                projected_q, raw_keys = self.project(hidden_states)
+            else:
+                projected_q, raw_keys = self._split_qk(idx_qk[:num_tokens])
             q, main_outputs = self._fused_prepare(
                 projected_q,
                 raw_keys,

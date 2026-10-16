@@ -217,6 +217,84 @@ def test_eligible_rejects(monkeypatch: pytest.MonkeyPatch, setup: str) -> None:
     assert mono.checked == 0
 
 
+# ------------------------------------------------- (b2) idea #7, CPU-only
+def _fake_linear(shape, dtype=bf, bias=None):
+    """A bare object exposing just what ``_qkv_error`` reads: ``weight``,
+    ``quant_method`` (a real ``UnquantizedLinearMethod``, ``__init__`` skipped
+    -- ``_qkv_error`` only ``isinstance``-checks it) and ``bias``."""
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    lin = types.SimpleNamespace()
+    lin.weight = torch.empty(*shape, dtype=dtype)
+    lin.quant_method = object.__new__(UnquantizedLinearMethod)
+    lin.bias = bias
+    return lin
+
+
+@pytest.mark.parametrize(
+    "setup",
+    ["ok", "qkv_quantized", "qkv_shape", "qkv_bias", "idx_dtype", "idx_shape"],
+)
+def test_qkv_error_rejects(setup: str) -> None:
+    """``DraftMonoDecode._qkv_error`` (idea #7): refuses a quantized, wrong
+    shape/dtype, or biased ``qkv_proj`` / ``indexer.index_qk_proj``, else
+    None -- the gate ``weights_unsupported`` / ``prepare_weights`` use to
+    fall back to the stock two skinny GEMMs instead of F4."""
+    from vllm.models.qwen4_exp.amd import mono_draft
+    from vllm.models.qwen4_exp.amd.mono.layout import HIDDEN, IDXQK, Layout
+
+    lay = Layout(TP)
+    mono = object.__new__(mono_draft.DraftMonoDecode)
+    mono.tp = TP
+    attn = types.SimpleNamespace()
+    attn.qkv_proj = _fake_linear((lay.QKV, HIDDEN))
+    attn.indexer = types.SimpleNamespace()
+    attn.indexer.index_qk_proj = _fake_linear((IDXQK, HIDDEN))
+
+    if setup == "qkv_quantized":
+        attn.qkv_proj.quant_method = object()
+    elif setup == "qkv_shape":
+        attn.qkv_proj.weight = torch.empty(lay.QKV - 16, HIDDEN, dtype=bf)
+    elif setup == "qkv_bias":
+        attn.qkv_proj.bias = torch.zeros(lay.QKV, dtype=bf)
+    elif setup == "idx_dtype":
+        attn.indexer.index_qk_proj.weight = torch.empty(IDXQK, HIDDEN)
+    elif setup == "idx_shape":
+        attn.indexer.index_qk_proj.weight = torch.empty(
+            IDXQK, HIDDEN - 16, dtype=bf
+        )
+
+    why = mono._qkv_error(attn)
+    if setup == "ok":
+        assert why is None, why
+    else:
+        assert why is not None, setup
+
+
+def test_indexer_split_qk_matches_project() -> None:
+    """``QSAIndexer._split_qk`` (idea #7, factored out of ``project`` so F4's
+    precomputed ``index_qk_proj`` output can reuse the same split): fed the
+    exact tensor ``self.index_qk_proj`` would have produced, it must split
+    the same way ``project`` itself does."""
+    import torch.nn as nn
+
+    from vllm.models.qwen4_exp.amd.indexer_qsa import QSAIndexer
+
+    idx = object.__new__(QSAIndexer)
+    nn.Module.__init__(idx)
+    idx.index_n_heads = 4
+    idx.index_kv_heads = 1
+    idx.index_head_dim = 128
+    idx.index_qk_proj = lambda hidden_states: (qk, None)
+
+    hidden_states = torch.empty(5, 1)  # unread by the fake index_qk_proj
+    qk = torch.randn(5, (4 + 1) * 128)
+    want_q, want_k = idx.project(hidden_states)
+    got_q, got_k = idx._split_qk(qk)
+    torch.testing.assert_close(got_q, want_q, atol=0, rtol=0)
+    torch.testing.assert_close(got_k, want_k, atol=0, rtol=0)
+
+
 # ---------------------------------------------------------------- (c) GPU
 @pytest.mark.skipif(
     not _on_gfx950(), reason="the Flash-Next mono kernels need gfx950 (MI355X)"

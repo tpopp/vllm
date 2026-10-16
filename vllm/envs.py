@@ -159,6 +159,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_MONO_DRAFT: bool = False
     VLLM_ROCM_MONO_DRAFT_FRONT: bool = False
     VLLM_ROCM_MONO_DRAFT_EMB: bool = False
+    VLLM_ROCM_MONO_DRAFT_QKV: bool = False
     VLLM_ROCM_MONO_DRAFT_HEAD: bool = True
     VLLM_ROCM_MONO_DRAFT_POS0: bool = False
     VLLM_ROCM_MONO_DRAFT_LAYER: bool = True
@@ -1425,6 +1426,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_ROCM_MONO_DRAFT_FRONT": lambda: (
         os.getenv("VLLM_ROCM_MONO_DRAFT_FRONT", "0").lower() in ("true", "1")
+    ),
+    # Fold the MTP draft layer's QSA qkv_proj / indexer index_qk_proj GEMVs
+    # into the fused draft front (mono/front.py), needs
+    # VLLM_ROCM_MONO_DRAFT_FRONT. Not yet validated on GPU: default off.
+    "VLLM_ROCM_MONO_DRAFT_QKV": lambda: (
+        os.getenv("VLLM_ROCM_MONO_DRAFT_QKV", "0").lower() in ("true", "1")
     ),
     # Greedy MTP draft tokens from one launch on an MXFP4 draft lm_head
     "VLLM_ROCM_MONO_DRAFT_HEAD": lambda: (

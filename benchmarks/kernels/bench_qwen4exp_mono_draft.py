@@ -12,13 +12,15 @@ Usage:
 Per S, rank 0 prints eager and CUDA-graph-replayed median-of-5 per-launch
 microseconds for: (1) ``draft_head``'s MXFP4 lm_head GEMV + TP argmax vs a
 bf16 and an MXFP4 stock greedy pick; (2) ``draft_front`` vs the stock norms +
-column-parallel GEMMs + ``k1.hc_front``; (3) the final mixer's ``hc_front``
-(zero-padded down) vs the unfused ``ops/hc.py`` sequence; (4) K2's
-``layer_post`` for the draft layer, its own time; (5) ``back.draft_back``
-(K2 + the mixer's ``hc_front`` + ``draft_head``, one launch) vs the three
-separate launches it replaces, the real 124160-row vocab shard a rank. Needs
-MI355X (gfx950), AITER, and the mono kernels; this file is authored CPU-only
-and not run here.
+column-parallel GEMMs + ``k1.hc_front``; (2b) idea #7, ``draft_front(qkv=
+True)`` (the QSA layer's ``qkv_proj`` / indexer ``index_qk_proj`` GEMVs
+folded into the same launch, F4) vs the plain front + the two stock skinny
+GEMMs it replaces; (3) the final mixer's ``hc_front`` (zero-padded down) vs
+the unfused ``ops/hc.py`` sequence; (4) K2's ``layer_post`` for the draft
+layer, its own time; (5) ``back.draft_back`` (K2 + the mixer's ``hc_front`` +
+``draft_head``, one launch) vs the three separate launches it replaces, the
+real 124160-row vocab shard a rank. Needs MI355X (gfx950), AITER, and the
+mono kernels; this file is authored CPU-only and not run here.
 """
 
 import argparse
@@ -219,6 +221,77 @@ def bench_draft_front(s, device, rank, world_size, epoch, iters):
     cases = (
         ("stock: 2 norms + 2 col-parallel GEMMs + all_gather + hc_front", _stock),
         ("draft_front (fused)", _fused),
+    )
+    return [
+        (name, _time_eager(fn, iters), _time_graph(fn, iters)) for name, fn in cases
+    ]
+
+
+# --------------------------------------------- 2b. draft_front(qkv=True), idea #7
+def bench_draft_front_qkv(s, device, rank, world_size, epoch, iters):
+    """Idea #7: ``draft_front(qkv=True)`` (F4 folds the QSA layer's
+    ``qkv_proj`` and the indexer's ``index_qk_proj`` GEMVs into the same
+    launch, after the HC front) against the plain front (``qkv=False``)
+    followed by the two stock BF16 skinny GEMMs it replaces. The real ops are
+    AITER's ``wvSplitK`` family (``attn.qkv_proj`` / ``indexer.index_qk_proj``
+    -- see ``gather/qsa_front.md``); ``F.linear`` here isolates this launch's
+    own fixed cost (weight-read floor + one fewer pair of kernel launches),
+    not an apples-to-apples GEMM backend comparison."""
+    from tests.models.qwen3_5.test_amd_mono import _randn
+    from tests.models.qwen4_exp.test_amd_mono import _hc_weights
+    from vllm.models.qwen4_exp.amd.mono import front
+    from vllm.models.qwen4_exp.amd.mono.layout import HC, HH, HIDDEN, IDXQK, Layout
+
+    lay = Layout(TP)
+    gc = torch.Generator(device=device).manual_seed(61)
+    emb = _randn(gc, s, HIDDEN, scale=2.0)
+    prev = _randn(gc, s, HH, scale=2.0)
+    w_ne = _randn(gc, HIDDEN, scale=0.1)
+    w_nh = _randn(gc, HH, scale=0.1)
+    w_fe = _randn(gc, HIDDEN, HIDDEN, scale=0.05)
+    w_fh = _randn(gc, HIDDEN, HIDDEN, scale=0.05)
+    hw = _hc_weights(gc)
+    w_qkv = _randn(gc, lay.QKV, HIDDEN, scale=0.05)
+    w_idx = _randn(gc, IDXQK, HIDDEN, scale=0.05)
+    ne_eps, nh_eps = 1e-5, 3e-6
+
+    state = torch.empty(s, HH, dtype=bf, device=device)
+    inj = torch.empty(s, HC, dtype=bf, device=device)
+    x = torch.empty(s, HIDDEN, dtype=bf, device=device)
+    off_key = front.FrontBuild(tokens=s, tp=TP, ne_eps=ne_eps, nh_eps=nh_eps)
+    off_scratch = torch.zeros(
+        front.scratch_bytes(off_key), dtype=torch.uint8, device=device
+    )
+
+    def _stock():
+        epoch.add_(1)
+        front.draft_front(
+            off_key, emb=emb, prev=prev, w_ne=w_ne, w_nh=w_nh, w_fe=w_fe, w_fh=w_fh,
+            **hw, state_out=state, bin_out=x, inj_out=inj, scratch=off_scratch,
+            epoch=epoch, slot=0,
+        )
+        F.linear(x, w_qkv)
+        F.linear(x, w_idx)
+
+    qkv_out = torch.empty(s, lay.QKV, dtype=bf, device=device)
+    idx_out = torch.empty(s, IDXQK, dtype=bf, device=device)
+    on_key = front.FrontBuild(tokens=s, tp=TP, ne_eps=ne_eps, nh_eps=nh_eps, qkv=True)
+    on_scratch = torch.zeros(
+        front.scratch_bytes(on_key), dtype=torch.uint8, device=device
+    )
+
+    def _fused():
+        epoch.add_(1)
+        front.draft_front(
+            on_key, emb=emb, prev=prev, w_ne=w_ne, w_nh=w_nh, w_fe=w_fe, w_fh=w_fh,
+            **hw, state_out=state, bin_out=x, inj_out=inj, scratch=on_scratch,
+            epoch=epoch, slot=0, w_qkv=w_qkv, w_idx=w_idx, qkv_out=qkv_out,
+            idx_out=idx_out,
+        )
+
+    cases = (
+        ("stock: draft_front(qkv=False) + 2 skinny GEMMs", _stock),
+        ("draft_front(qkv=True) (fused F4)", _fused),
     )
     return [
         (name, _time_eager(fn, iters), _time_graph(fn, iters)) for name, fn in cases
@@ -476,6 +549,7 @@ def main() -> None:
     sections = (
         ("1. draft_head", bench_draft_head, {"peers": head_peers}),
         ("2. draft_front", bench_draft_front, {}),
+        ("2b. draft_front(qkv=True), idea #7", bench_draft_front_qkv, {}),
         ("3. final mixer (hc_front)", bench_mixer, {}),
         ("4. K2 layer_post (draft layer)", bench_k2_layer_post, {"peers": k2_peers}),
         (
