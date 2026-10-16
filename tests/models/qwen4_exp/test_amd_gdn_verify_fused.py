@@ -123,10 +123,11 @@ CASES = {
 }
 
 
+@pytest.mark.parametrize("bv", [128, 32, 16])
 @pytest.mark.parametrize("case", list(CASES))
 @pytest.mark.parametrize("norm_activation", ["sigmoid", "silu"])
 @torch.inference_mode()
-def test_fused_gdn_verify_core_matches_stock_chain(case, norm_activation):
+def test_fused_gdn_verify_core_matches_stock_chain(case, norm_activation, bv):
     q_lens, accepted, add_padding_row = CASES[case]
     torch.manual_seed(0)
 
@@ -218,6 +219,7 @@ def test_fused_gdn_verify_core_matches_stock_chain(case, norm_activation):
         num_v_heads=NV,
         head_k_dim=HD,
         head_v_dim=HD,
+        bv=bv,
     )
 
     if add_padding_row:

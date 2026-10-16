@@ -239,7 +239,7 @@ def _bench_generic(fx, iters: int):
     return _time_eager(_fn, iters), _time_graph(_fn, iters)
 
 
-def _bench_fused(fx, iters: int):
+def _bench_fused(fx, iters: int, bv=None, nw=None):
     from vllm.model_executor.layers.mamba.ops.gdn_spec_decode_mono_fused import (
         fused_gdn_verify_core,
     )
@@ -257,7 +257,7 @@ def _bench_fused(fx, iters: int):
             norm_activation=NORM_ACTIVATION, ssm_state=ssm_state,
             spec_query_start_loc=fx["qsl"], spec_state_indices=fx["idx"],
             num_accepted_tokens=fx["nacc"], num_k_heads=NK, num_v_heads=NV,
-            head_k_dim=HD, head_v_dim=HD,
+            head_k_dim=HD, head_v_dim=HD, bv=bv, num_warps=nw,
         )
 
     try:
@@ -279,6 +279,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--n-req", type=str, default="1,2,4,8")
     p.add_argument("--iters", type=int, default=200)
+    p.add_argument("--sweep", type=str, default="32:4", help="BV:num_warps,...")
     return p.parse_args()
 
 
@@ -291,7 +292,10 @@ def main() -> None:
         cases = (
             ("stock: AITER GDR fast path (gdn_spec_decode_packed_aiter)", _bench_aiter),
             ("stock: in-tree-only chain (causal_conv1d_update + FLA GDR)", _bench_generic),
-            ("fused_gdn_verify_core", _bench_fused),
+        ) + tuple(
+            (f"fused_gdn_verify_core BV={bv} warps={nw}",
+             lambda fx, it, bv=bv, nw=nw: _bench_fused(fx, it, bv, nw))
+            for bv, nw in (tuple(map(int, c.split(":"))) for c in args.sweep.split(","))
         )
         for name, fn in cases:
             eager, graph = fn(fx, args.iters)

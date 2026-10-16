@@ -62,6 +62,8 @@ delta rule's own checkpoint-read bound, mirrored from
 ``fused_gdn_decode_post_conv_mtp_triton``/``fused_sigmoid_gating_delta_rule_update``).
 """
 
+import os
+
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -82,6 +84,8 @@ def _fused_gdn_verify_core_kernel(
     state_indices_ptr,
     num_accepted_ptr,
     out_ptr,
+    part_ptr,
+    count_ptr,
     stride_qkvz_row,
     stride_ba_row,
     stride_out_row,
@@ -104,10 +108,14 @@ def _fused_gdn_verify_core_kernel(
     CONV_W: tl.constexpr,
     HAS_CONV_BIAS: tl.constexpr,
     SIGMOID_GATE: tl.constexpr,
+    BV: tl.constexpr,  # value rows per program (V // BV programs per head)
+    T_MAX: tl.constexpr,  # scratch tokens per request
+    T_W: tl.constexpr,  # max tokens per request (spec_state_indices columns), unrolled
 ):
-    i_n, i_hv = tl.program_id(0), tl.program_id(1)
+    i_n, i_hv, i_vb = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    NVB: tl.constexpr = V // BV
     i_h = i_hv // RATIO
-    is_qk_owner = i_hv % RATIO == 0
+    is_qk_owner = (i_hv % RATIO == 0) & (i_vb == 0)
 
     bos = tl.load(cu_seqlens_ptr + i_n).to(tl.int64)
     num_tokens = tl.load(cu_seqlens_ptr + i_n + 1).to(tl.int64) - bos
@@ -115,14 +123,14 @@ def _fused_gdn_verify_core_kernel(
         return
 
     o_k = tl.arange(0, K)
-    o_v = tl.arange(0, V)
+    o_v = i_vb * BV + tl.arange(0, BV)
     p_out = out_ptr + bos * stride_out_row + i_hv * V + o_v
 
     conv_slot = tl.load(state_indices_ptr + i_n * stride_indices_row).to(tl.int64)
     accepted = tl.load(num_accepted_ptr + i_n).to(tl.int64)
     bad = (conv_slot <= 0) | (accepted <= 0) | (accepted > num_indices_per_row)
     if bad:
-        zero_v = tl.zeros([V], dtype=out_ptr.dtype.element_ty)
+        zero_v = tl.zeros([BV], dtype=out_ptr.dtype.element_ty)
         for t in range(num_tokens):
             tl.store(p_out + t * stride_out_row, zero_v)
         return
@@ -131,7 +139,7 @@ def _fused_gdn_verify_core_kernel(
         tl.int64
     )
     if ssm_src <= 0:
-        zero_v = tl.zeros([V], dtype=out_ptr.dtype.element_ty)
+        zero_v = tl.zeros([BV], dtype=out_ptr.dtype.element_ty)
         for t in range(num_tokens):
             tl.store(p_out + t * stride_out_row, zero_v)
         return
@@ -185,22 +193,23 @@ def _fused_gdn_verify_core_kernel(
     else:
         q_bias = tl.zeros([K], dtype=tl.float32)
         k_bias = tl.zeros([K], dtype=tl.float32)
-        v_bias = tl.zeros([V], dtype=tl.float32)
+        v_bias = tl.zeros([BV], dtype=tl.float32)
 
     neg_A = -tl.exp(tl.load(A_log_ptr + i_hv).to(tl.float32))
     dt_bias = tl.load(dt_bias_ptr + i_hv).to(tl.float32)
     norm_w = tl.load(norm_weight_ptr + o_v).to(tl.float32)
 
-    b_h = tl.zeros([V, K], dtype=tl.float32)
+    b_h = tl.zeros([BV, K], dtype=tl.float32)
     p_ssm = ssm_state_ptr + ssm_src * stride_ssm_slot + i_hv * V * K
     b_h += tl.load(p_ssm + o_v[:, None] * K + o_k[None, :]).to(tl.float32)
 
-    for t in range(num_tokens):
+    for t in tl.static_range(T_W):
+        valid = t < num_tokens
         row = bos + t
         p_qkvz = qkvz_ptr + row * stride_qkvz_row
-        x_q = tl.load(p_qkvz + i_h * K + o_k)
-        x_k = tl.load(p_qkvz + KEY + i_h * K + o_k)
-        x_v = tl.load(p_qkvz + 2 * KEY + i_hv * V + o_v)
+        x_q = tl.load(p_qkvz + i_h * K + o_k, mask=valid, other=0.0)
+        x_k = tl.load(p_qkvz + KEY + i_h * K + o_k, mask=valid, other=0.0)
+        x_v = tl.load(p_qkvz + 2 * KEY + i_hv * V + o_v, mask=valid, other=0.0)
 
         # Width-4 causal conv: per-tap products stay in the loaded (bf16)
         # dtype before the fp32 accumulate, matching
@@ -225,9 +234,9 @@ def _fused_gdn_verify_core_kernel(
         b_k = conv_k.to(tl.float32)
         b_v = conv_v.to(tl.float32)
 
-        x = tl.load(ba_ptr + row * stride_ba_row + HV + i_hv).to(tl.float32) + dt_bias
+        x = tl.load(ba_ptr + row * stride_ba_row + HV + i_hv, mask=valid, other=0.0).to(tl.float32) + dt_bias
         decay = tl.exp(neg_A * tl.where(x <= 20.0, tl.log(1 + tl.exp(x)), x))
-        beta = tl.sigmoid(tl.load(ba_ptr + row * stride_ba_row + i_hv).to(tl.float32))
+        beta = tl.sigmoid(tl.load(ba_ptr + row * stride_ba_row + i_hv, mask=valid, other=0.0).to(tl.float32))
 
         b_q = b_q * tl.rsqrt(tl.sum(b_q * b_q) + 1e-6) * scale
         b_k = b_k * tl.rsqrt(tl.sum(b_k * b_k) + 1e-6)
@@ -236,16 +245,26 @@ def _fused_gdn_verify_core_kernel(
         b_h += b_v[:, None] * b_k[None, :]
         b_o = tl.sum(b_h * b_q[None, :], 1).to(out_ptr.dtype.element_ty).to(tl.float32)
 
-        z = tl.load(p_qkvz + 2 * KEY + VAL + i_hv * V + o_v).to(tl.float32)
-        gate = tl.sigmoid(z) if SIGMOID_GATE else z * tl.sigmoid(z)
-        rstd = tl.rsqrt(tl.sum(b_o * b_o) / V + norm_eps)
-        y = b_o * rstd * norm_w * gate
-        tl.store(p_out + t * stride_out_row, y.to(out_ptr.dtype.element_ty))
+        if NVB == 1:
+            z = tl.load(p_qkvz + 2 * KEY + VAL + i_hv * V + o_v, mask=valid, other=0.0).to(tl.float32)
+            gate = tl.sigmoid(z) if SIGMOID_GATE else z * tl.sigmoid(z)
+            rstd = tl.rsqrt(tl.sum(b_o * b_o) / V + norm_eps)
+            y = b_o * rstd * norm_w * gate
+            tl.store(p_out + t * stride_out_row, y.to(out_ptr.dtype.element_ty), mask=valid)
+        else:
+            # The head's RMSNorm spans all NVB programs: park the bf16 core
+            # row in `out` and this block's sum of squares in `part`; the
+            # last program of the (request, head) to finish normalizes.
+            tl.store(p_out + t * stride_out_row, b_o.to(out_ptr.dtype.element_ty), mask=valid)
+            tl.store(
+                part_ptr + ((i_n * HV + i_hv) * T_MAX + t) * NVB + i_vb,
+                tl.sum(b_o * b_o),
+                mask=valid,
+            )
 
-        dst = tl.load(state_indices_ptr + i_n * stride_indices_row + t).to(tl.int64)
-        if dst > 0:
-            p_dst = ssm_state_ptr + dst * stride_ssm_slot + i_hv * V * K
-            tl.store(p_dst + o_v[:, None] * K + o_k[None, :], b_h.to(ssm_state_ptr.dtype.element_ty))
+        dst = tl.load(state_indices_ptr + i_n * stride_indices_row + t, mask=valid, other=0).to(tl.int64)
+        p_dst = ssm_state_ptr + dst * stride_ssm_slot + i_hv * V * K
+        tl.store(p_dst + o_v[:, None] * K + o_k[None, :], b_h.to(ssm_state_ptr.dtype.element_ty), mask=(dst > 0) & valid)
 
     # Write-back window: the first CONV_W - 2 = 2 positions are the dropped-
     # oldest-tap history (a fixed, model-constant count -- independent of
@@ -263,17 +282,50 @@ def _fused_gdn_verify_core_kernel(
     tl.store(v_base + 0 * stride_conv_tok, v_hist1)
     tl.store(v_base + 1 * stride_conv_tok, v_hist2)
 
-    for t in range(num_tokens):
+    for t in tl.static_range(T_W):
+        valid = t < num_tokens
         row = bos + t
         p_qkvz = qkvz_ptr + row * stride_qkvz_row
         pos = (CONV_W - 2) + t
         if is_qk_owner:
-            q_val = tl.load(p_qkvz + i_h * K + o_k)
-            k_val = tl.load(p_qkvz + KEY + i_h * K + o_k)
-            tl.store(q_base + pos * stride_conv_tok, q_val)
-            tl.store(k_base + pos * stride_conv_tok, k_val)
-        v_val = tl.load(p_qkvz + 2 * KEY + i_hv * V + o_v)
-        tl.store(v_base + pos * stride_conv_tok, v_val)
+            q_val = tl.load(p_qkvz + i_h * K + o_k, mask=valid, other=0.0)
+            k_val = tl.load(p_qkvz + KEY + i_h * K + o_k, mask=valid, other=0.0)
+            tl.store(q_base + pos * stride_conv_tok, q_val, mask=valid)
+            tl.store(k_base + pos * stride_conv_tok, k_val, mask=valid)
+        v_val = tl.load(p_qkvz + 2 * KEY + i_hv * V + o_v, mask=valid, other=0.0)
+        tl.store(v_base + pos * stride_conv_tok, v_val, mask=valid)
+
+    if NVB > 1:
+        # Release this program's core rows / partial sums; the last arriver of
+        # the (request, head) acquires them all, normalizes the whole head,
+        # and re-arms the counter for the next launch (graph-replay safe).
+        p_cnt = count_ptr + i_n * HV + i_hv
+        prev = tl.atomic_add(p_cnt, 1, sem="acq_rel", scope="gpu")
+        if prev == NVB - 1:
+            o_all = tl.arange(0, V)
+            o_b = tl.arange(0, NVB)
+            nw = tl.load(norm_weight_ptr + o_all).to(tl.float32)
+            p_row = out_ptr + bos * stride_out_row + i_hv * V + o_all
+            for t in tl.static_range(T_W):
+                valid = t < num_tokens
+                ssq = tl.sum(
+                    tl.load(
+                        part_ptr + ((i_n * HV + i_hv) * T_MAX + t) * NVB + o_b,
+                        mask=valid,
+                        other=0.0,
+                    )
+                )
+                r_row = tl.rsqrt(ssq / V + norm_eps)
+                o_row = tl.load(p_row + t * stride_out_row, mask=valid, other=0.0).to(tl.float32)
+                z_row = tl.load(
+                    qkvz_ptr + (bos + t) * stride_qkvz_row + 2 * KEY + VAL + i_hv * V + o_all,
+                    mask=valid,
+                    other=0.0,
+                ).to(tl.float32)
+                g_row = tl.sigmoid(z_row) if SIGMOID_GATE else z_row * tl.sigmoid(z_row)
+                y = o_row * r_row * nw * g_row
+                tl.store(p_row + t * stride_out_row, y.to(out_ptr.dtype.element_ty), mask=valid)
+            tl.atomic_xchg(p_cnt, 0, sem="relaxed", scope="gpu")
 
 
 # This kernel's register-level FIR is hand-unrolled for a width-4 conv (three
@@ -285,6 +337,27 @@ _CONV_W = 4
 # reuse that as this kernel's own eligibility cap too, since nothing about the
 # kernel itself needs a tighter limit.
 MAX_FUSED_GDN_VERIFY_ROWS = 8
+# Value rows per program: a (request, value head) is split over V // _BV
+# programs (more CUs on the latency-bound recurrence); the gated RMSNorm then
+# needs the whole head, done by the head's last program to finish.
+_BV = int(os.environ.get("VLLM_GDN_VERIFY_FUSED_BV", "32"))
+_NUM_WARPS = int(os.environ.get("VLLM_GDN_VERIFY_FUSED_WARPS", "4"))
+_MAX_REQ = MAX_FUSED_GDN_VERIFY_ROWS
+_T_MAX = MAX_FUSED_GDN_VERIFY_ROWS
+_SCRATCH: dict = {}
+
+
+def _scratch(device, num_v_heads: int, nvb: int):
+    """Per-(request, head, token, V-block) partial sums of squares and the
+    per-(request, head) arrival counters (zeroed once; the kernel re-arms
+    them), allocated for the row cap so CUDA graphs capture fixed pointers."""
+    key = (device, num_v_heads, nvb)
+    if key not in _SCRATCH:
+        _SCRATCH[key] = (
+            torch.empty(_MAX_REQ * num_v_heads * _T_MAX * nvb, dtype=torch.float32, device=device),
+            torch.zeros(_MAX_REQ * num_v_heads, dtype=torch.int32, device=device),
+        )
+    return _SCRATCH[key]
 
 
 def fused_gdn_verify_core(
@@ -308,6 +381,8 @@ def fused_gdn_verify_core(
     num_v_heads: int,
     head_k_dim: int,
     head_v_dim: int,
+    bv: int | None = None,
+    num_warps: int | None = None,
 ) -> None:
     """Fused spec-decode GDN verify core: writes ``core_attn_out`` (the
     out_proj input) directly from the packed in_proj outputs.
@@ -345,7 +420,11 @@ def fused_gdn_verify_core(
     key_dim = num_k_heads * head_k_dim
     value_dim = num_v_heads * head_v_dim
 
-    grid = (n_req, num_v_heads)
+    bv = bv or _BV
+    nvb = head_v_dim // bv
+    part, count = _scratch(core_attn_out.device, num_v_heads, nvb)
+    assert n_req <= _MAX_REQ
+    grid = (n_req, num_v_heads, nvb)
     _fused_gdn_verify_core_kernel[grid](
         qkvz,
         ba,
@@ -360,6 +439,8 @@ def fused_gdn_verify_core(
         spec_state_indices,
         num_accepted_tokens,
         core_attn_out,
+        part,
+        count,
         qkvz.stride(0),
         ba.stride(0),
         core_attn_out.stride(0),
@@ -382,7 +463,10 @@ def fused_gdn_verify_core(
         CONV_W=_CONV_W,
         HAS_CONV_BIAS=conv_bias is not None,
         SIGMOID_GATE=norm_activation == "sigmoid",
-        num_warps=4,
+        BV=bv,
+        T_MAX=_T_MAX,
+        T_W=spec_state_indices.shape[1],
+        num_warps=num_warps or _NUM_WARPS,
     )
 
 
