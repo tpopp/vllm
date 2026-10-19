@@ -1341,6 +1341,7 @@ def _k2_trace_worker(
                     w_o=w_o,
                     w_os=w_os,
                     **hw,
+                    **{k: v for k, v in mw.items() if k != "raw"},
                     out=out,
                     msq_out=msq,
                     scratch=scratch,

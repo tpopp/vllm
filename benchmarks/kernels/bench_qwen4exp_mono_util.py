@@ -144,7 +144,7 @@ def make_k1_front_runner(key, s, device, dbg):
     gc = torch.Generator(device=device).manual_seed(4200)
     state = _randn(gc, s, k1.HH, scale=2.0)
     hw = _hc_weights(gc)
-    msq_in = _msq(state)
+    msq_in = None if key.self_msq else _msq(state)
     x = torch.empty(s, HIDDEN, dtype=bf, device=device)
     inj = torch.empty(s, HC, dtype=bf, device=device)
     scratch = torch.zeros(k1.scratch_bytes(key), dtype=torch.uint8, device=device)
