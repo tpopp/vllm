@@ -102,10 +102,10 @@ def dense_error(i: int, dense: dict[str, torch.Tensor]) -> str | None:
     return None
 
 
-def gdn_core(attn, x) -> torch.Tensor:
-    """``QwenGatedDeltaNetAttention.forward_hip`` up to out_proj's input: the
-    input projections, AITER's conv + gated delta rule (vLLM's spec-decode
-    path on verify steps) and the gated norm -> [S, heads HD]."""
+def _gdn_core_raw(attn, x) -> tuple[torch.Tensor, torch.Tensor]:
+    """``QwenGatedDeltaNetAttention.forward_hip`` up to (not including) the
+    gated norm: the input projections and AITER's conv + gated delta rule
+    (vLLM's spec-decode path on verify steps) -> (core, z), [S, heads, HD]."""
     from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
         _encode_layer_name,
     )
@@ -124,8 +124,23 @@ def gdn_core(attn, x) -> torch.Tensor:
         layer_name=_encode_layer_name(attn.prefix),
         use_aiter=True,
     )
+    return core, z
+
+
+def gdn_core(attn, x) -> torch.Tensor:
+    """``_gdn_core_raw`` then the gated norm -> out_proj's input, [S, heads HD]."""
+    core, z = _gdn_core_raw(attn, x)
     norm = attn.norm
     return _gated_rms_norm(core, z, norm.weight, norm.eps, norm.activation).flatten(-2)
+
+
+def gdn_core_ungated(attn, x) -> tuple[torch.Tensor, torch.Tensor]:
+    """Like ``gdn_core`` but stops short of the gated norm
+    (``VLLM_ROCM_MONO_K2_GATED_NORM``): K2's ``gn`` variant applies
+    ``RMSNormGated`` while staging o_proj's input instead, folding this
+    launch into K2 -> (core, z), both [S, heads HD]."""
+    core, z = _gdn_core_raw(attn, x)
+    return core.flatten(-2), z.flatten(-2)
 
 
 @torch.compile(dynamic=True, backend=current_platform.simple_compile_backend)

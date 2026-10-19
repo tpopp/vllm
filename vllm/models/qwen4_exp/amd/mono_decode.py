@@ -35,6 +35,7 @@ from functools import cached_property
 
 import torch
 
+from vllm import envs
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.models.qwen3_5.amd import mono_base as B
@@ -205,6 +206,9 @@ class MonoDecode(B.QwenMonoDecode):
                 msq = None
             inj = torch.empty(s, L.HC, dtype=state.dtype, device=state.device)
             gate = None
+            gn_z = None
+            gn_norm_w = None
+            gn_eps = 1e-6
             if layer.layer_type == "linear_attention" and not self.spec:
                 core = torch.empty(
                     s, self.lay.CORE, dtype=state.dtype, device=state.device
@@ -214,10 +218,17 @@ class MonoDecode(B.QwenMonoDecode):
                 x = torch.empty(s, L.HIDDEN, dtype=state.dtype, device=state.device)
                 self._front(layer, state, msq, inj, x)
                 if layer.layer_type == "linear_attention":
-                    core = B.gdn_core(layer.linear_attn, x)
+                    if envs.VLLM_ROCM_MONO_K2_GATED_NORM:
+                        core, gn_z = B.gdn_core_ungated(layer.linear_attn, x)
+                        norm = layer.linear_attn.norm
+                        gn_norm_w, gn_eps = norm.weight, norm.eps
+                    else:
+                        core = B.gdn_core(layer.linear_attn, x)
                 else:
                     core, gate = _qsa_core(layer.self_attn, x, positions)
-            state, msq = self._k2(layer, core, gate, state, inj)
+            state, msq = self._k2(
+                layer, core, gate, state, inj, gn_z, gn_norm_w, gn_eps
+            )
         if model._mtp_hidden_buffer is not None:
             # the drafter's input: the multi-stream state before the final mixer
             model._mtp_hidden_buffer[:s].copy_(state)
@@ -289,7 +300,17 @@ class MonoDecode(B.QwenMonoDecode):
             layer=layer.layer_idx,
         )
 
-    def _k2(self, layer, core, gate, state, inj) -> tuple[torch.Tensor, torch.Tensor]:
+    def _k2(
+        self,
+        layer,
+        core,
+        gate,
+        state,
+        inj,
+        gn_z=None,
+        gn_norm_w=None,
+        gn_eps=1e-6,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         from vllm.models.qwen4_exp.amd.mono import hc as mhc
         from vllm.models.qwen4_exp.amd.mono import k2
 
@@ -308,9 +329,13 @@ class MonoDecode(B.QwenMonoDecode):
                 eps=hc.config.rms_norm_eps,
                 oq=oq,
                 og=gate is not None,
+                gn=gn_z is not None,
+                gn_eps=gn_eps,
             ),
             core=core,
             gate=gate,
+            gn_z=gn_z,
+            gn_norm_w=gn_norm_w,
             state=state,
             inj_a=inj,
             w_o=o.weight,
