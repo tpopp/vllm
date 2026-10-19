@@ -31,6 +31,22 @@ from vllm.models.kimi_k3.amd.mono.common.ops import memrealtime, rsrc, traced
 NSLOT = 16  # the default stride (head.py / front.py); K1 / K2 may use more
 
 
+def _store_t0(c, slot):
+    """Thread 0 stores the clock. Everything the branch needs is pulled out
+    of ``c`` first: a dynamic ``if`` that reads ``c`` inside makes the AST
+    rewriter carry the whole dict (lambdas and all) as branch state."""
+    tid = c["tid"]
+    res = rsrc(c["dbg"])
+    off = c["bid"] * c.get("nslot", NSLOT) + slot
+    _store_if0(tid, res, off)
+
+
+@traced
+def _store_if0(tid, res, off):
+    if tid == 0:
+        bo.buffer_store(fx.Int32(memrealtime() & 0x7FFFFFFF), res, off)
+
+
 @traced
 def stamp(c, slot):
     """CTA-wide point: barrier, then thread 0 stores the 100 MHz realtime's
@@ -42,12 +58,7 @@ def stamp(c, slot):
     at all."""
     if const_expr(c.get("dbg") is not None):
         gpu.barrier()
-        if c["tid"] == 0:
-            bo.buffer_store(
-                fx.Int32(memrealtime() & 0x7FFFFFFF),
-                rsrc(c["dbg"]),
-                c["bid"] * c.get("nslot", NSLOT) + slot,
-            )
+        _store_t0(c, slot)
 
 
 @traced
@@ -66,12 +77,7 @@ def stamp_point(c, slot):
     mailbox) simply leaves that (CTA, slot) at 0, exactly as an unvisited
     ``stamp`` slot does (see ``decode`` / ``phase_report``)."""
     if const_expr(c.get("dbg") is not None and slot is not None):
-        if c["tid"] == 0:
-            bo.buffer_store(
-                fx.Int32(memrealtime() & 0x7FFFFFFF),
-                rsrc(c["dbg"]),
-                c["bid"] * c.get("nslot", NSLOT) + slot,
-            )
+        _store_t0(c, slot)
 
 
 def wait_slots(c, name):
