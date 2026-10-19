@@ -6,8 +6,12 @@ UTILIZATION_DESIGN.md #1): graph-replayed timing of K1's full decode build
 ``front_only`` build the spec verify path already runs (``k1.hc_front``), at
 the production TP=2 shapes, plus the stock op chain that build would replace
 (in_proj_qkvz's quant + ASM FP4 GEMM, in_proj_ba's bf16 GEMM, the unpack
-Triton kernel, the gated RMSNorm) and K2's ``gn`` variant (P1a) against K2 +
-the separate gated-norm launch it replaces.
+Triton kernel, the gated RMSNorm), K2's ``gn`` variant (P1a) against K2 +
+the separate gated-norm launch it replaces, and K1's ``proj_only`` build
+(P1b, shipped: the HC front + in_proj_qkvz/ba, no GDN tasks) against
+``hc_front`` + the stock quant+GEMM / bf16 GEMM / unpack chain it folds in
+(the GDN verify core's conv + gated delta rule are untouched either way,
+left to AITER -- §1 of gather/gdn_verify.md).
 
 Usage:
     torchrun --nproc-per-node 2 benchmarks/kernels/bench_qwen4exp_k1_gate.py \
@@ -335,6 +339,88 @@ def bench_k2_gn(s, device, rank, world_size, epoch, iters, peers):
     ]
 
 
+# ------------------------------------------------------ 4. K1 proj_only (P1b)
+def bench_k1_proj_gate(s, device, rank, world_size, epoch, iters):
+    """P1b: K1's ``proj_only`` build (the HC front + in_proj_qkvz/ba, no GDN
+    tasks) against ``hc_front`` + the stock in_proj chain a verify step runs
+    today in its place (fp4 quant + ASM FP4 GEMM, bf16 in_proj_ba,
+    ``gdn_unpack_z_ba``) -- section 2's pieces chained into one realistic
+    replacement, ``hc_front``'s own x feeding the stock in_proj."""
+    from tests.models.qwen3_5.test_amd_mono import _mxfp4_linear_stock
+    from tests.models.qwen4_exp.test_amd_mono import _gdn_inputs
+    from vllm.model_executor.layers.mamba.ops.gdn_spec_decode_rocm import (
+        gdn_unpack_z_ba,
+    )
+    from vllm.models.qwen4_exp.amd.mono import k1
+    from vllm.models.qwen4_exp.amd.mono.layout import HC, HIDDEN, Layout
+
+    lay = Layout(TP)
+    w = _gdn_inputs(s, s)
+    inj = torch.empty(s, HC, dtype=bf, device=device)
+    x_bin = torch.empty(s, HIDDEN, dtype=bf, device=device)
+    z_out = torch.empty(s, lay.VAL, dtype=bf, device=device)
+
+    key_proj = k1.K1Build(tokens=s, tp=TP, self_msq=True, proj_only=True)
+    scr_proj = torch.zeros(
+        k1.scratch_bytes(key_proj), dtype=torch.uint8, device=device
+    )
+    qkvz_out = torch.empty(s, lay.QKVZ, dtype=bf, device=device)
+    ba_out = torch.empty(s, lay.BA, dtype=bf, device=device)
+
+    def _k1_proj():
+        epoch.add_(1)
+        k1.proj_pre(
+            key_proj,
+            state=w["state"],
+            msq_in=None,
+            hc_w=w["hc_w"],
+            w_down=w["w_down"],
+            w_up=w["w_up"],
+            inj_out=inj,
+            bin_out=x_bin,
+            w_qkvz=w["w_qkvz"],
+            w_qkvzs=w["w_qkvzs"],
+            w_ba=w["w_ba"],
+            qkvz_out=qkvz_out,
+            ba_out=ba_out,
+            scratch=scr_proj,
+            epoch=epoch,
+            layer=2,
+        )
+
+    key_front = k1.K1Build(tokens=s, tp=TP, self_msq=True, front_only=True)
+    scr_front = torch.zeros(
+        k1.scratch_bytes(key_front), dtype=torch.uint8, device=device
+    )
+
+    def _front_plus_stock():
+        epoch.add_(1)
+        k1.hc_front(
+            key_front,
+            state=w["state"],
+            msq_in=None,
+            hc_w=w["hc_w"],
+            w_down=w["w_down"],
+            w_up=w["w_up"],
+            inj_out=inj,
+            bin_out=x_bin,
+            scratch=scr_front,
+            epoch=epoch,
+            layer=3,
+        )
+        stock_qkvz = _mxfp4_linear_stock(x_bin, w["w_qkvz"], w["w_qkvzs"])
+        stock_ba = F.linear(x_bin, w["w_ba"])
+        gdn_unpack_z_ba(stock_qkvz, stock_ba, z_out, lay.CONV, lay.NV)
+
+    cases = (
+        ("k1.proj_pre (P1b: HC front + in_proj_qkvz/ba, no GDN tasks)", _k1_proj),
+        ("hc_front + stock quant+gemm + in_proj_ba + unpack", _front_plus_stock),
+    )
+    return [
+        (name, _time_eager(fn, iters), _time_graph(fn, iters)) for name, fn in cases
+    ]
+
+
 # ---------------------------------------------------------------- plumbing
 def setup_distributed():
     if not {"RANK", "WORLD_SIZE", "LOCAL_RANK"} <= os.environ.keys():
@@ -404,6 +490,11 @@ def main() -> None:
         ("1. K1 gate: gdn_pre vs hc_front", bench_k1_gate, {}),
         ("2. the stock chain the bracket would remove", bench_stock_pieces, {}),
         ("3. K2 gn (P1a) vs gated norm + K2", bench_k2_gn, {"peers": k2_peers}),
+        (
+            "4. K1 proj_only (P1b) vs hc_front + stock in_proj",
+            bench_k1_proj_gate,
+            {},
+        ),
     )
     for s in s_list:
         if rank == 0:

@@ -372,12 +372,16 @@ def stage_up(c, u, ops):
                 xn = bf16_round(gemma(xs[e], r, ws[e]))
                 y[e] = y[e] + sigmoid(gate) * xn
         q = fx.Float32(1.0 / HC)
+        packed = bf16_pair(y[0] * q, y[1] * q).bitcast(fx.Int32)
         bo.buffer_store(
-            bf16_pair(y[0] * q, y[1] * q).bitcast(fx.Int32),
-            rsrc(h["bin"]),
-            (tt * H + col) // 2,
-            cache_modifier=CM_DEV,
+            packed, rsrc(h["bin"]), (tt * H + col) // 2, cache_modifier=CM_DEV
         )
+        if const_expr(h["bin_out"] is not None):
+            # K1Build.proj_only: BIN also goes to the external ``bin_out``
+            # (hc_front's output), past ``h["bin"]``'s scratch copy (read by
+            # this launch's ``bin_to_lds``, below); nothing else in this
+            # launch reads it, so a plain store serves it.
+            bo.buffer_store(packed, rsrc(h["bin_out"]), (tt * H + col) // 2)
     if const_expr(h["binf"] is not None):
         rocdl.s_waitcnt(vmcnt=0)
         gpu.barrier()

@@ -472,6 +472,7 @@ def build(key: K2Build):
             "lora": sreg(scratch, scr["lora"][0], "lora"),
             "binf": sreg(scratch, scr["binf"][0], "binf"),
             "bin": scratch + fx.Int64(scr["bin"][0]),
+            "bin_out": None,
             "inj_out": lambda t, r, vs: _put_inj(c, t, r, vs),
         }
         is_r = (bid >= R0) & (bid < RT0)

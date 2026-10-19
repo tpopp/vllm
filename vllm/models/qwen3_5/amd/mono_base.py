@@ -102,20 +102,29 @@ def dense_error(i: int, dense: dict[str, torch.Tensor]) -> str | None:
     return None
 
 
-def _gdn_core_raw(attn, x) -> tuple[torch.Tensor, torch.Tensor]:
+def _gdn_core_raw(
+    attn, x=None, *, qkvz=None, ba=None
+) -> tuple[torch.Tensor, torch.Tensor]:
     """``QwenGatedDeltaNetAttention.forward_hip`` up to (not including) the
     gated norm: the input projections and AITER's conv + gated delta rule
-    (vLLM's spec-decode path on verify steps) -> (core, z), [S, heads, HD]."""
+    (vLLM's spec-decode path on verify steps) -> (core, z), [S, heads, HD].
+
+    ``qkvz`` / ``ba`` (``VLLM_ROCM_MONO_K1_PROJ``): K1's ``proj_only`` build
+    already produced in_proj_qkvz's / in_proj_ba's bf16 output; skip
+    ``attn.in_proj_qkvz(x)`` / ``attn.in_proj_ba(x)`` and hand them to the
+    same custom op the stock projections would feed."""
     from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
         _encode_layer_name,
     )
 
-    n = x.size(0)
-    qkvz, _ = attn.in_proj_qkvz(x)
-    ba, _ = attn.in_proj_ba(x)
+    if qkvz is None:
+        qkvz, _ = attn.in_proj_qkvz(x)
+    if ba is None:
+        ba, _ = attn.in_proj_ba(x)
+    n = qkvz.size(0)
     shape = (n, attn.num_v_heads // attn.tp_size, attn.head_v_dim)
-    core = torch.empty(shape, dtype=x.dtype, device=x.device)
-    z = torch.empty(shape, dtype=qkvz.dtype, device=x.device)
+    core = torch.empty(shape, dtype=qkvz.dtype, device=qkvz.device)
+    z = torch.empty(shape, dtype=qkvz.dtype, device=qkvz.device)
     torch.ops.vllm.qwen_gdn_attention_core(
         qkvz.view(n, -1),
         ba.view(n, -1),
@@ -127,19 +136,21 @@ def _gdn_core_raw(attn, x) -> tuple[torch.Tensor, torch.Tensor]:
     return core, z
 
 
-def gdn_core(attn, x) -> torch.Tensor:
+def gdn_core(attn, x=None, *, qkvz=None, ba=None) -> torch.Tensor:
     """``_gdn_core_raw`` then the gated norm -> out_proj's input, [S, heads HD]."""
-    core, z = _gdn_core_raw(attn, x)
+    core, z = _gdn_core_raw(attn, x, qkvz=qkvz, ba=ba)
     norm = attn.norm
     return _gated_rms_norm(core, z, norm.weight, norm.eps, norm.activation).flatten(-2)
 
 
-def gdn_core_ungated(attn, x) -> tuple[torch.Tensor, torch.Tensor]:
+def gdn_core_ungated(
+    attn, x=None, *, qkvz=None, ba=None
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Like ``gdn_core`` but stops short of the gated norm
     (``VLLM_ROCM_MONO_K2_GATED_NORM``): K2's ``gn`` variant applies
     ``RMSNormGated`` while staging o_proj's input instead, folding this
     launch into K2 -> (core, z), both [S, heads HD]."""
-    core, z = _gdn_core_raw(attn, x)
+    core, z = _gdn_core_raw(attn, x, qkvz=qkvz, ba=ba)
     return core.flatten(-2), z.flatten(-2)
 
 

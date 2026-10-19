@@ -26,6 +26,13 @@ Every CTA runs its GDN tasks phase by phase (conv, gates, recurrence, norm) and
 a phase polls only work of an earlier phase, so the task placement needs no
 round structure. A row whose state index is <= 0 writes no state and a zero
 core row, as stock.
+
+``proj_only`` (P1b, ``VLLM_ROCM_MONO_K1_PROJ``): a GDN verify step's K1,
+in_proj only -- the HC front, in_proj_qkvz and in_proj_ba as the decode build
+above runs them, their bf16 rows going straight to ``qkvz_out`` / ``ba_out``
+instead of the GDN tasks (not run here: a verify step still needs the stock
+AITER conv + gated delta rule for the per-draft-token state rollback K1's
+decode recurrence does not do, ``gather/gdn_verify.md`` §2.4).
 """
 
 from dataclasses import dataclass
@@ -87,6 +94,7 @@ class K1Build:
     tp: int = 2
     self_msq: bool = False  # the state's sums of squares computed here
     front_only: bool = False  # the HC front alone (a QSA layer)
+    proj_only: bool = False  # the HC front + in_proj_qkvz/ba, no GDN tasks
     eps: float = 1e-6  # the HC norm
     norm_eps: float = 1e-6  # the GDN gated norm
 
@@ -118,6 +126,8 @@ ABI = KernelAbi(
         "scratch",
         "epoch",
         "layer",
+        "qkvz_out",
+        "ba_out",
     )
 )
 
@@ -136,12 +146,15 @@ def scratch_layout(key: K1Build) -> dict:
     lay = L.Layout(key.tp)
     pairs = hc.regions(s)
     if not key.front_only:
-        pairs = pairs | {
-            "proj": s * lay.QKVZ,
-            "qk": s * lay.NK * 2 * HD,
-            "onrm": s * lay.NV * NVCH,
-            "bapart": ba_tasks(lay) * s * ROWS,
-        }
+        pairs = pairs | {"bapart": ba_tasks(lay) * s * ROWS}
+        if not key.proj_only:
+            # proj_only stores in_proj_qkvz straight to ``qkvz_out``: no GDN
+            # tasks poll a mailbox copy of it, so there is none.
+            pairs = pairs | {
+                "proj": s * lay.QKVZ,
+                "qk": s * lay.NK * 2 * HD,
+                "onrm": s * lay.NV * NVCH,
+            }
     out = pair_layout(pairs.items())
     if not key.front_only:
         end = (max(o + n for o, n in out.values()) + 15) // 16 * 16
@@ -171,7 +184,9 @@ def qkvz_loads(c, rg):
 
 @traced
 def stage_qkvz(c, rg, ops):
-    """in_proj_qkvz rows 16 rg .. on the MXFP4-exact x rows -> bf16 PROJ."""
+    """in_proj_qkvz rows 16 rg .. on the MXFP4-exact x rows -> bf16 PROJ (or,
+    ``K1Build.proj_only``, straight to ``qkvz_out``: no GDN task of this
+    launch polls the row there, so a plain store serves it)."""
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
     acc = fp4_gemv(lane, wave, c["xl"], XROW, H, s, rg, ops)
     fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
@@ -180,7 +195,11 @@ def stage_qkvz(c, rg, ops):
         r = tid % ROWS
         t = tid // ROWS
         v = bf16_round(row_sum(red, r, t))
-        c["put"](c["proj"], t * c["lay"].QKVZ + rg * ROWS + r, v)
+        at = t * c["lay"].QKVZ + rg * ROWS + r
+        if const_expr(c["qkvz_out"] is not None):
+            bo.buffer_store(v.to(fx.BFloat16), rsrc(c["qkvz_out"]), at)
+        else:
+            c["put"](c["proj"], at, v)
     gpu.barrier()
 
 
@@ -188,6 +207,21 @@ def stage_qkvz(c, rg, ops):
 def _ba_of(c, t, h):
     """Head h's b and a of token t: the sums of in_proj_ba's K halves (bf16)."""
     return G.ba_sums(c, t, h, BA_PARTS)
+
+
+@traced
+def store_ba_out(c):
+    """``K1Build.proj_only``: one task a (token, value head), S NV of them --
+    always <= BLOCKS (NV <= 24, S <= 8), so one CTA each, no rounds. Finalizes
+    ``ba_tasks``'s K-split partials the way ``_ba_of`` already does for the
+    decode build's gates stage (a poll of ``bapart``, same hand-off), storing
+    to ``ba_out`` [S, BA] (``[b | a]``) instead of reading them in place."""
+    lay, s, bid = c["lay"], c["S"], c["bid"]
+    if bid < s * lay.NV:
+        t, h = bid // lay.NV, bid % lay.NV
+        b, a = c["ba_of"](c, t, h)
+        bo.buffer_store(b.to(fx.BFloat16), rsrc(c["ba_out"]), t * lay.BA + h)
+        bo.buffer_store(a.to(fx.BFloat16), rsrc(c["ba_out"]), t * lay.BA + lay.NV + h)
 
 
 # ---------------------------------------------------------------- kernel
@@ -208,6 +242,7 @@ def build(key: K1Build):
         return _BUILDS[key]
     s = key.tokens
     need(1 <= s <= L.MAX_TOKENS, f"{s} rows, the kernels take 1..{L.MAX_TOKENS}")
+    need(not (key.front_only and key.proj_only), "front_only and proj_only")
     lay = L.Layout(key.tp)
     scr = scratch_layout(key)
     gt = gdn_tasks_of(lay)
@@ -243,6 +278,7 @@ def build(key: K1Build):
     keyed = key_tuple(key, digest())
     name = (
         f"flashnext_mono_k1_s{s}_t{key.tp}_m{int(key.self_msq)}_f{int(key.front_only)}"
+        f"_p{int(key.proj_only)}"
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -272,6 +308,8 @@ def build(key: K1Build):
         scratch: Int64,
         epoch: Int64,
         layer: Int32,
+        qkvz_out: Int64,
+        ba_out: Int64,
     ):
         _ = keyed
         tid = fx.thread_idx.x
@@ -325,8 +363,11 @@ def build(key: K1Build):
             },
         }
         if const_expr(not key.front_only):
-            for region in ("proj", "qk", "onrm", "bapart"):
+            regions = ("bapart",) if key.proj_only else ("proj", "qk", "onrm", "bapart")
+            for region in regions:
                 c[region] = sreg(scratch, scr[region][0], region)
+            c["qkvz_out"] = qkvz_out if key.proj_only else None
+            c["ba_out"] = ba_out if key.proj_only else None
         c["hc"] = {
             "state": state,
             "state_cm": 0,
@@ -339,6 +380,7 @@ def build(key: K1Build):
             "lora": sreg(scratch, scr["lora"][0], "lora"),
             "binf": None if key.front_only else sreg(scratch, scr["binf"][0], "binf"),
             "bin": bin_out if key.front_only else scratch + fx.Int64(scr["bin"][0]),
+            "bin_out": bin_out if key.proj_only else None,
             "inj_out": lambda t, r, vs: _put_inj(c, t, r, vs),
         }
         # ---- the HC front: a CTA's whole sequence in one branch, its weights
@@ -376,13 +418,18 @@ def build(key: K1Build):
                 dops = hc.down_loads(c, bid - D0)
                 hc.load_rrms(c)
                 hc.stage_down(c, bid - D0, dops)
-            # ---- in_proj on the block input, then the GDN tasks
+            # ---- in_proj on the block input, then the GDN tasks (proj_only:
+            # just the projections, finalizing in_proj_ba's K-split partials
+            # to ``ba_out`` in place of reading them)
             if ~is_ba:
                 hc.bin_to_lds(c, XROW)
             quant_x(c, H)
             for j in range_constexpr(2):
                 stage_qkvz(c, bid + BLOCKS * j, qops[j])
-            gdn_tasks(c, nr)
+            if const_expr(key.proj_only):
+                store_ba_out(c)
+            else:
+                gdn_tasks(c, nr)
 
     @flyc.jit
     def launch(
@@ -411,6 +458,8 @@ def build(key: K1Build):
         scratch: Int64,
         epoch: Int64,
         layer: Int32,
+        qkvz_out: Int64,
+        ba_out: Int64,
         stream: fx.Stream = _STREAM,
     ):
         _ = keyed
@@ -440,6 +489,8 @@ def build(key: K1Build):
             scratch,
             epoch,
             layer,
+            qkvz_out,
+            ba_out,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     ABI.check(k1, launch)
@@ -602,6 +653,90 @@ def gdn_pre(
         "rs_seq": rstate.stride(0),
         "st_idx": st_idx.data_ptr(),
         "core": core.data_ptr(),
+        "scratch": scratch.data_ptr(),
+        "epoch": epoch.data_ptr(),
+        "layer": layer,
+        "qkvz_out": 0,
+        "ba_out": 0,
+    }
+    build(key)(*ABI.pack(vals), stream=torch.cuda.current_stream())
+
+
+def proj_pre(
+    key: K1Build,
+    *,
+    state,
+    msq_in,
+    hc_w,
+    w_down,
+    w_up,
+    inj_out,
+    bin_out,
+    w_qkvz,
+    w_qkvzs,
+    w_ba,
+    qkvz_out,
+    ba_out,
+    scratch,
+    epoch,
+    layer,
+):
+    """Host launcher of a GDN layer's K1 ``proj_only`` build (P1b,
+    ``VLLM_ROCM_MONO_K1_PROJ``): ``hc_front``'s ``bin_out`` [S, H] / ``inj_out``
+    [S, 4], plus in_proj_qkvz's bf16 output -> ``qkvz_out`` [S, QKVZ] and
+    in_proj_ba's -> ``ba_out`` [S, BA] (``[b | a]``), the same values/rounding
+    ``attn.in_proj_qkvz(x)`` / ``attn.in_proj_ba(x)`` produce. No GDN task
+    runs here: the conv update, gated delta rule and gated norm are the stock
+    AITER verify core's, called on these two tensors directly
+    (``B._gdn_core_raw(qkvz=..., ba=...)``)."""
+    s = key.tokens
+    lay = L.Layout(key.tp)
+    bf = torch.bfloat16
+    need(key.proj_only, "proj_pre takes a proj_only build")
+    _hc_checks(key, s, state, msq_in, hc_w, w_down, w_up, inj_out)
+    need(
+        bin_out.shape == (s, H)
+        and bin_out.dtype == bf
+        and bin_out.is_contiguous(),
+        "bin_out: bf16 [S, H]",
+    )
+    need(
+        w_qkvz.shape == (lay.QKVZ, H // 2)
+        and w_qkvz.dtype in (torch.uint8, torch.float4_e2m1fn_x2),
+        f"in_proj_qkvz: fp4x2 [{lay.QKVZ}, {H // 2}]",
+    )
+    need(
+        w_qkvzs.numel() == lay.QKVZ * H // 32 and w_qkvzs.element_size() == 1,
+        "in_proj_qkvz scales: e8m0, one a 32-block",
+    )
+    need(
+        w_ba.shape == (lay.BA, H) and w_ba.dtype == bf,
+        f"in_proj_ba: bf16 [{lay.BA}, {H}]",
+    )
+    need(
+        qkvz_out.shape == (s, lay.QKVZ) and qkvz_out.dtype == bf,
+        f"qkvz_out: bf16 [S, {lay.QKVZ}]",
+    )
+    need(
+        ba_out.shape == (s, lay.BA) and ba_out.dtype == bf,
+        f"ba_out: bf16 [S, {lay.BA}]",
+    )
+    dense = (w_qkvz, w_qkvzs, w_ba, qkvz_out, ba_out)
+    need(all(t.is_contiguous() for t in dense), "a non-contiguous GDN input")
+    vals = dict.fromkeys(ABI.names, 0)
+    vals |= {
+        "state": state.data_ptr(),
+        "msq_in": 0 if msq_in is None else msq_in.data_ptr(),
+        "hc_w": hc_w.data_ptr(),
+        "w_down": w_down.data_ptr(),
+        "w_up": w_up.data_ptr(),
+        "inj_out": inj_out.data_ptr(),
+        "bin_out": bin_out.data_ptr(),
+        "w_qkvz": w_qkvz.data_ptr(),
+        "w_qkvzs": w_qkvzs.data_ptr(),
+        "w_ba": w_ba.data_ptr(),
+        "qkvz_out": qkvz_out.data_ptr(),
+        "ba_out": ba_out.data_ptr(),
         "scratch": scratch.data_ptr(),
         "epoch": epoch.data_ptr(),
         "layer": layer,
