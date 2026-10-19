@@ -1166,3 +1166,210 @@ def test_draft_head_matches_vllm_ops_full_vocab(
     summation order can differ between the kernel's MFMA tree and torch's
     enough to flip an exact near-tie."""
     multi_process_parallel(monkeypatch, 2, 1, _head_worker_full_vocab)
+
+
+# ---------------------------------------------------------------- Stage 0a trace
+#
+# The in-kernel utilization timeline (K1 / K2's ``trace=True`` + ``dbg``
+# stamps, ``vllm.models.qwen4_exp.amd.mono.stamps``) must be a pure
+# observer: an off build's device code is unchanged (``const_expr``-gated),
+# and an on build's extra stores all land in ``dbg``, never in a tensor the
+# model reads. These tests check that bitwise -- not just numerically close
+# (``_cos`` / ``assert_close``, what the matches_vllm_ops tests above use).
+@pytest.mark.parametrize("s", [1, 8])
+@torch.inference_mode()
+def test_hc_front_trace_bitwise_identical(s: int) -> None:
+    """K1's ``hc_front`` (front_only): the same inputs through ``trace=False``
+    and ``trace=True`` builds produce bitwise-identical ``bin_out`` /
+    ``inj_out``, and tracing visits every wait site this build actually
+    reaches (a handful of ``k1.SLOTS`` entries, decoded nonzero)."""
+    from vllm.models.qwen4_exp.amd.mono import k1, stamps
+    from vllm.models.qwen4_exp.amd.mono.layout import HC, HIDDEN
+
+    g = torch.Generator(device="cuda").manual_seed(900 + s)
+    state = _randn(g, s, k1.HH, scale=2.0)
+    hw = _hc_weights(g)
+    msq_in = _msq(state)
+
+    def run(trace: bool):
+        key = k1.K1Build(tokens=s, tp=TP, self_msq=False, front_only=True, trace=trace)
+        x = torch.full((s, HIDDEN), float("nan"), dtype=bf, device="cuda")
+        inj = torch.full((s, HC), float("nan"), dtype=bf, device="cuda")
+        scratch = torch.zeros(k1.scratch_bytes(key), dtype=torch.uint8, device="cuda")
+        dbg = stamps.dbg_buffer("cuda", nslot=k1.NSLOT) if trace else None
+        k1.hc_front(
+            key,
+            state=state,
+            msq_in=msq_in,
+            **hw,
+            inj_out=inj,
+            bin_out=x,
+            scratch=scratch,
+            epoch=torch.ones(1, dtype=torch.int32, device="cuda"),
+            layer=0,
+            dbg=dbg,
+        )
+        torch.accelerator.synchronize()
+        return x, inj, dbg
+
+    x_off, inj_off, _ = run(False)
+    x_on, inj_on, dbg = run(True)
+    assert torch.equal(x_off, x_on), "trace=True changed bin_out"
+    assert torch.equal(inj_off, inj_on), "trace=True changed inj_out"
+    us = stamps.decode(dbg, nslot=k1.NSLOT)
+    for name in ("entry", "hc_down_loads", "hc_down_done", "lora_wait_hi", "exit"):
+        slot = k1.SLOTS[name]
+        assert (us[:, slot] != 0).any(), f"slot {name} ({slot}) never stamped"
+
+
+@pytest.mark.parametrize("s,n_real", [(1, 1), (8, 7)])
+@torch.inference_mode()
+def test_k1_gdn_pre_trace_bitwise_identical(s: int, n_real: int) -> None:
+    """K1's ``gdn_pre`` (a GDN layer): ``trace=False`` vs ``trace=True`` leave
+    ``core``, the conv state and the recurrent state bitwise unchanged."""
+    from vllm.models.qwen4_exp.amd.mono import k1, stamps
+    from vllm.models.qwen4_exp.amd.mono.layout import Layout
+
+    lay = Layout(TP)
+    w = _gdn_inputs(s, n_real)
+
+    def run(trace: bool):
+        key = k1.K1Build(tokens=s, tp=TP, self_msq=False, trace=trace)
+        conv_state, rstate = w["conv_state"].clone(), w["rstate"].clone()
+        core = torch.full((s, lay.CORE), float("nan"), dtype=bf, device="cuda")
+        inj = torch.full((s, k1.HC), float("nan"), dtype=bf, device="cuda")
+        scratch = torch.zeros(k1.scratch_bytes(key), dtype=torch.uint8, device="cuda")
+        dbg = stamps.dbg_buffer("cuda", nslot=k1.NSLOT) if trace else None
+        k1.gdn_pre(
+            key,
+            state=w["state"],
+            msq_in=_msq(w["state"]),
+            hc_w=w["hc_w"],
+            w_down=w["w_down"],
+            w_up=w["w_up"],
+            inj_out=inj,
+            w_qkvz=w["w_qkvz"],
+            w_qkvzs=w["w_qkvzs"],
+            w_ba=w["w_ba"],
+            conv_w=w["conv_w"],
+            conv_state=conv_state,
+            a_log=w["a_log"],
+            dt_bias=w["dt_bias"],
+            norm_w=w["norm_w"],
+            rstate=rstate,
+            st_idx=w["st_idx"],
+            core=core,
+            scratch=scratch,
+            epoch=torch.ones(1, dtype=torch.int32, device="cuda"),
+            layer=0,
+            dbg=dbg,
+        )
+        torch.accelerator.synchronize()
+        return core, inj, conv_state, rstate, dbg
+
+    core_off, inj_off, conv_off, rst_off, _ = run(False)
+    core_on, inj_on, conv_on, rst_on, dbg = run(True)
+    assert torch.equal(core_off, core_on), "trace=True changed core"
+    assert torch.equal(inj_off, inj_on), "trace=True changed inj_out"
+    assert torch.equal(conv_off, conv_on), "trace=True changed the conv state"
+    assert torch.equal(rst_off, rst_on), "trace=True changed the recurrent state"
+    us = stamps.decode(dbg, nslot=k1.NSLOT)
+    for name in ("entry", "qkvz_loads", "qkvz_done", "quantx_done", "exit"):
+        slot = k1.SLOTS[name]
+        assert (us[:, slot] != 0).any(), f"slot {name} ({slot}) never stamped"
+
+
+@ray.remote(num_gpus=1, max_calls=1)
+def _k2_trace_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    tp_size: int,
+    pp_size: int,
+    rank: int,
+    distributed_init_port: str,
+) -> None:
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    device = torch.device(f"cuda:{rank}")
+    torch.accelerator.set_device_index(device)
+    init_test_distributed_environment(tp_size, pp_size, rank, distributed_init_port)
+
+    from vllm.distributed import get_tp_group
+    from vllm.models.kimi_k3.amd.mono.common.peer_memory import PeerBuffer
+    from vllm.models.qwen4_exp.amd.mono import k2, stamps
+    from vllm.models.qwen4_exp.amd.mono.layout import HC, HH, HIDDEN, MAX_TOKENS, Layout
+
+    lay = Layout(TP)
+    tp = get_tp_group()
+    peers = PeerBuffer(
+        k2.peer_bytes(MAX_TOKENS, TP), tp.cpu_group, rank, tp_size, device
+    )
+    peers.bytes.zero_()
+    epoch = torch.zeros(1, dtype=torch.int32, device=device)
+    mw = _moe_weights(rank, device)
+    gc = torch.Generator(device=device).manual_seed(500)
+    hw = _hc_weights(gc)
+    step = 0
+    for flags in K2_MODES:  # ({"oq": True}, {"og": True}): GDN then QSA layers
+        gr = torch.Generator(device=device).manual_seed(5200 + rank)
+        oq = flags.get("oq", False)
+        if oq:
+            _, _, w_o, w_os = _mxfp4_linear(gr, HIDDEN, lay.CORE)
+        else:
+            w_o, w_os = _randn(gr, HIDDEN, lay.CORE, scale=0.02), None
+        for s in (1, 4, 8):
+            gate = _randn(gr, s, lay.CORE, scale=2.0) if flags.get("og") else None
+            core = _randn(gr, s, lay.CORE)
+            state = _randn(gc, s, HH, scale=2.0)
+            inj_a = _randn(gc, s, HC)
+
+            def run(trace: bool, core=core, gate=gate, state=state, inj_a=inj_a):
+                nonlocal step
+                step += 1
+                epoch.add_(1)
+                key = k2.K2Build(tokens=s, tp=TP, trace=trace, **flags)
+                scratch = torch.zeros(
+                    k2.scratch_bytes(key), dtype=torch.uint8, device=device
+                )
+                out = torch.full((s, HH), float("nan"), dtype=bf, device=device)
+                msq = torch.full((20, s, HC), float("nan"), device=device)
+                dbg = stamps.dbg_buffer(device, nslot=k2.NSLOT) if trace else None
+                k2.layer_post(
+                    key,
+                    core=core,
+                    gate=gate,
+                    state=state,
+                    inj_a=inj_a,
+                    w_o=w_o,
+                    w_os=w_os,
+                    **hw,
+                    out=out,
+                    msq_out=msq,
+                    scratch=scratch,
+                    peers=peers.addresses,
+                    rank=rank,
+                    epoch=epoch,
+                    layer=step,
+                    dbg=dbg,
+                )
+                torch.accelerator.synchronize()
+                return out, msq, dbg
+
+            out_off, msq_off, _ = run(False)
+            out_on, msq_on, dbg = run(True)
+            mode = (str(flags), s)
+            assert torch.equal(out_off, out_on), f"trace=True changed out {mode}"
+            assert torch.equal(msq_off, msq_on), f"trace=True changed msq_out {mode}"
+            if rank == 0:
+                us = stamps.decode(dbg, nslot=k2.NSLOT)
+                for name in ("entry", "oproj_done", "msq_wait_hi", "exit"):
+                    slot = k2.SLOTS[name]
+                    msg = f"{mode}: slot {name} never stamped"
+                    assert (us[:, slot] != 0).any(), msg
+    peers.close()
+
+
+@multi_gpu_test(num_gpus=2)
+def test_k2_trace_bitwise_identical(monkeypatch: pytest.MonkeyPatch) -> None:
+    """K2's ``layer_post`` (a GDN layer's ``oq=True`` out_proj and a QSA
+    layer's ``og=True`` o_proj): ``trace=False`` vs ``trace=True`` leave
+    ``out`` and ``msq_out`` bitwise unchanged, every rank agreeing."""
+    multi_process_parallel(monkeypatch, 2, 1, _k2_trace_worker)

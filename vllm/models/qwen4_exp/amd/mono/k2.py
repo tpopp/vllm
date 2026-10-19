@@ -77,6 +77,7 @@ from vllm.models.qwen3_5.amd.mono import moe
 from vllm.models.qwen3_5.amd.mono.moe import MAX_U, PS_MIN, f32_of, sigmoid, step_tag
 from vllm.models.qwen4_exp.amd.mono import hc
 from vllm.models.qwen4_exp.amd.mono import layout as L
+from vllm.models.qwen4_exp.amd.mono import stamps
 from vllm.models.qwen4_exp.amd.mono.layout import need
 from vllm.models.qwen4_exp.amd.mono.sources import digest
 
@@ -106,6 +107,7 @@ class K2Build:
     eps: float = 1e-6  # the HC norms
     oq: bool = False  # out_proj MXFP4 (ASM FP4 GEMM layout)
     og: bool = False  # o_proj's input is core x sigmoid(gate)
+    trace: bool = False  # emit in-kernel timestamps to a `dbg` buffer (stamps.py)
 
     @property
     def u1(self) -> bool:
@@ -142,8 +144,104 @@ ABI = KernelAbi(
         "rank",
         "epoch",
         "layer",
+        "dbg",  # Stage 0a: stamps.py target, 256 * NSLOT int32; 0 when off
     )
 )
+
+# ----------------------------------------------------------- in-kernel trace
+#
+# Slot -> label of this kernel's utilization timeline (``K2Build(trace=True)``,
+# a ``dbg`` buffer of ``stamps.dbg_buffer(device, nslot=NSLOT)``). A "_LO" /
+# "_HI" pair brackets a mailbox wait (``stamps.stamp_point``, no barrier --
+# only thread 0 of whichever threads reach the wait stamps, so a CTA that
+# never takes that branch, or whose thread 0 is not among the polling
+# threads, simply leaves the pair at (0, 0)); a lone slot marks a phase
+# boundary (``stamps.stamp``, the full CTA barriers first -- safe here since
+# every site below sits inside a ``bid``-gated branch, not a ``tid`` /
+# ``lane`` / ``wave``-gated one, so all 512 threads of that CTA take it).
+#
+# ``gdn_*`` (none here; K1-only) and GDN rounds generally would overwrite a
+# per-round slot across rounds -- not applicable to K2 (no GDN tasks).
+NSLOT = 32
+ENTRY = 0
+OPROJ_LOADS = 2  # o_loads issued (o_proj's / hc up/down's weights in flight)
+OPROJ_DONE = 3  # run_oproj: GEMV + AR put done
+ATTN_AR_LO, ATTN_AR_HI = 4, 5  # hc.stage_combine (attention AR), via "ar_attn"
+MSQ_LO, MSQ_HI = 6, 7  # hc.load_rrms, via "msq" (last caller per CTA wins)
+HC_UP_LOADS = 8  # up_loads issued
+LORA_LO, LORA_HI = 9, 10  # hc.lora_to_lds, via "lora"
+HC_UP_DONE = 11  # hc.stage_up done
+HC_DOWN_LOADS = 12  # down_loads issued
+HC_DOWN_DONE = 13  # hc.stage_down done
+BIN_LO, BIN_HI = 14, 15  # hc.bin_to_lds, via "bin" (last caller per CTA wins)
+ROUTER_DONE = 16  # stage_router done (is_r CTAs)
+SGATE_DONE = 17  # stage_sgate done (is_g CTAs)
+ROUTE_LO, ROUTE_HI = 18, 19  # moe.local_route / route_token RLOG wait
+SGATE_WAIT_LO, SGATE_WAIT_HI = 20, 21  # moe.load_route's fused-shared SGATE wait
+UG_DONE = 23  # run_ug done (|U| known; its own weight-issue / compute / route
+# / ug-wait boundaries are inside moe.py, not separately stamped here)
+DOWN_LOADS = 24  # down_loads issued (stage_down's first batch)
+INTER_LO, INTER_HI = 25, 26  # moe.load_inter INTER wait
+DOWN_DONE = 27  # moe.stage_down done (final AR put done)
+FINAL_AR_LO, FINAL_AR_HI = 28, 29  # hc.stage_combine (final AR), via "ar_final"
+EXIT = 31
+
+SLOTS = {
+    "entry": ENTRY,
+    "oproj_loads": OPROJ_LOADS,
+    "oproj_done": OPROJ_DONE,
+    "attn_ar_wait_lo": ATTN_AR_LO,
+    "attn_ar_wait_hi": ATTN_AR_HI,
+    "msq_wait_lo": MSQ_LO,
+    "msq_wait_hi": MSQ_HI,
+    "hc_up_loads": HC_UP_LOADS,
+    "lora_wait_lo": LORA_LO,
+    "lora_wait_hi": LORA_HI,
+    "hc_up_done": HC_UP_DONE,
+    "hc_down_loads": HC_DOWN_LOADS,
+    "hc_down_done": HC_DOWN_DONE,
+    "bin_wait_lo": BIN_LO,
+    "bin_wait_hi": BIN_HI,
+    "router_done": ROUTER_DONE,
+    "sgate_done": SGATE_DONE,
+    "route_wait_lo": ROUTE_LO,
+    "route_wait_hi": ROUTE_HI,
+    "sgate_wait_lo": SGATE_WAIT_LO,
+    "sgate_wait_hi": SGATE_WAIT_HI,
+    "ug_done": UG_DONE,
+    "down_loads": DOWN_LOADS,
+    "inter_wait_lo": INTER_LO,
+    "inter_wait_hi": INTER_HI,
+    "down_done": DOWN_DONE,
+    "final_ar_wait_lo": FINAL_AR_LO,
+    "final_ar_wait_hi": FINAL_AR_HI,
+    "exit": EXIT,
+}
+
+# CTA role ranges (see the module docstring's phase table): used by the
+# benchmark to group CTAs for the per-role report.
+ROLES = {
+    "o_proj+combine+hc_up": (0, D0),  # bid < D0
+    "o_proj+hc_down+hc_up": (D0, OTASKS),  # D0 <= bid < OTASKS
+    "router+hc_down": (R0, RT0),  # is_r
+    "sgate+hc_down": (RT0, RT0 + L.MAX_TOKENS),  # is_g (first S of these live)
+    "hc_down_only": (RT0 + L.MAX_TOKENS, BLOCKS),  # bid >= RT0, not is_g
+}
+
+
+def _wslot(key: K2Build) -> dict:
+    """``c["wslot"]``: every named wait site -> its (before, after) slot pair,
+    built once a launch (only when ``key.trace``)."""
+    return {
+        "ar_attn": (ATTN_AR_LO, ATTN_AR_HI),
+        "msq": (MSQ_LO, MSQ_HI),
+        "lora": (LORA_LO, LORA_HI),
+        "bin": (BIN_LO, BIN_HI),
+        "route": (ROUTE_LO, ROUTE_HI),
+        "sgate": (SGATE_WAIT_LO, SGATE_WAIT_HI),
+        "inter": (INTER_LO, INTER_HI),
+        "ar_final": (FINAL_AR_LO, FINAL_AR_HI),
+    }
 
 
 def peer_pairs(s, tp):
@@ -218,6 +316,7 @@ def stage_attn_combine(c, j):
         c["state1"],
         CM_DEV,
         lambda jj, t, k, v: c["put"](c["hc"]["msq"], (jj * c["S"] + t) * HC + k, v),
+        wait="ar_attn",
     )
 
 
@@ -237,6 +336,7 @@ def stage_final(c, j):
         a["out"],
         0,
         msq_put,
+        wait="ar_final",
     )
 
 
@@ -365,6 +465,7 @@ def build(key: K2Build):
         rank: Int32,
         epoch: Int64,
         layer: Int32,
+        dbg: Int64,
     ):
         _ = keyed
         tid = fx.thread_idx.x
@@ -402,6 +503,9 @@ def build(key: K2Build):
             "og": key.og,
             "u1": key.u1,
             "KT": KT,
+            "dbg": dbg if key.trace else None,
+            "nslot": NSLOT,
+            "wslot": _wslot(key) if key.trace else {},
             "put": mb.put,
             "put_bf": mb.put_bf,
             "put_words": mb.put_words,
@@ -460,46 +564,67 @@ def build(key: K2Build):
         }
         is_r = (bid >= R0) & (bid < RT0)
         is_g = (bid >= RT0) & (bid < RT0 + s)
+        stamps.stamp(c, ENTRY)
         # ---- o_proj, the attention combine, the mlp HC mix, router / sgate:
         # a CTA's whole sequence in one branch, its weights in flight first
         if bid < D0:
             oops = moe.o_loads(c, bid, lay.CORE)
+            stamps.stamp(c, OPROJ_LOADS)
             moe.run_oproj(c, [oops], lay.CORE)
+            stamps.stamp(c, OPROJ_DONE)
             if bid < hc.NRED:
                 stage_attn_combine(c, bid)
             uops = hc.up_loads(c, bid)
+            stamps.stamp(c, HC_UP_LOADS)
             hc.load_rrms(c)
             hc.stage_up(c, bid, uops)
+            stamps.stamp(c, HC_UP_DONE)
         if (bid >= D0) & (bid < OTASKS):
             oops = moe.o_loads(c, bid, lay.CORE)
             dops = hc.down_loads(c, bid - D0)
+            stamps.stamp(c, OPROJ_LOADS)
             moe.run_oproj(c, [oops], lay.CORE)
+            stamps.stamp(c, OPROJ_DONE)
             uops = hc.up_loads(c, bid)
+            stamps.stamp(c, HC_UP_LOADS)
             hc.load_rrms(c)
+            stamps.stamp(c, HC_DOWN_LOADS)
             hc.stage_down(c, bid - D0, dops)
+            stamps.stamp(c, HC_DOWN_DONE)
             hc.stage_up(c, bid, uops)
+            stamps.stamp(c, HC_UP_DONE)
         if is_r:
             dops = hc.down_loads(c, bid - D0)
             rops = router_loads(c, bid - R0)
             hc.load_rrms(c)
+            stamps.stamp(c, HC_DOWN_LOADS)
             hc.stage_down(c, bid - D0, dops)
+            stamps.stamp(c, HC_DOWN_DONE)
             hc.bin_to_lds(c, XROW)
             stage_router(c, bid - R0, rops)
+            stamps.stamp(c, ROUTER_DONE)
         if bid >= RT0:
             dops = hc.down_loads(c, bid - D0)
             hc.load_rrms(c)
+            stamps.stamp(c, HC_DOWN_LOADS)
             hc.stage_down(c, bid - D0, dops)
+            stamps.stamp(c, HC_DOWN_DONE)
             if is_g:
                 hc.bin_to_lds(c, XROW)
                 stage_sgate(c, bid - RT0)
+                stamps.stamp(c, SGATE_DONE)
         # ---- the routed experts (x: the router / sgate CTAs' is in LDS)
         nu = moe.run_ug(c, key.ps, PS0, lambda: _bin_to_lds(c, ~(is_r | is_g)))
+        stamps.stamp(c, UG_DONE)
         if bid < OTASKS:
             dops = moe.down_loads(c, bid, nu, fx.min(c["wave"], nu - 1))
+            stamps.stamp(c, DOWN_LOADS)
             moe.load_inter(c)
             moe.stage_down(c, bid, nu, dops)
+            stamps.stamp(c, DOWN_DONE)
         if bid < hc.NRED:
             stage_final(c, bid)
+        stamps.stamp(c, EXIT)
 
     @flyc.jit
     def launch(
@@ -525,6 +650,7 @@ def build(key: K2Build):
         rank: Int32,
         epoch: Int64,
         layer: Int32,
+        dbg: Int64,
         stream: fx.Stream = _STREAM,
     ):
         _ = keyed
@@ -551,6 +677,7 @@ def build(key: K2Build):
             rank,
             epoch,
             layer,
+            dbg,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     ABI.check(k2, launch)
@@ -595,6 +722,7 @@ def layer_post(
     layer,
     w_os=None,
     gate=None,
+    dbg=None,
 ):
     """Host launcher; every weight as vLLM holds it after loading, the experts'
     shuffled (``layout``) with the shared expert fused as expert 512. ``state``
@@ -622,6 +750,7 @@ def layer_post(
         (gate is not None) == key.og and (gate is None or gate.shape == core.shape),
         "gate: core's shape, with og only",
     )
+    need(key.trace == (dbg is not None), "dbg: required iff key.trace")
     if key.oq:
         need(
             w_o.shape == (H, k // 2) and w_o.dtype in fp4s,
@@ -693,6 +822,7 @@ def layer_post(
                 "rank": rank,
                 "epoch": epoch.data_ptr(),
                 "layer": layer,
+                "dbg": ptr(dbg),
             }
         ),
         stream=torch.cuda.current_stream(),

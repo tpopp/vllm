@@ -87,6 +87,27 @@ from vllm.models.qwen3_5.amd.mono.moe import (
 )
 from vllm.models.qwen3_5.amd.mono.sources import digest
 
+try:
+    # Qwen3.8-Flash-Next's K1 (qwen4_exp.amd.mono.k1) reuses this module's GDN
+    # task phases; its ``stamps`` instrument stamps their mailbox waits when a
+    # build opts in (``c["wslot"]``, ``c["dbg"]``). Qwen3.5's own ``gdn_pre``
+    # never sets ``c["wslot"]`` and gets plain no-ops.
+    from vllm.models.qwen4_exp.amd.mono import stamps as _stamps
+
+    def _wait_slots(c, name):
+        return _stamps.wait_slots(c, name)
+
+    def _stamp_point(c, slot):
+        _stamps.stamp_point(c, slot)
+except ImportError:
+
+    def _wait_slots(c, name):
+        return None, None
+
+    def _stamp_point(c, slot):
+        pass
+
+
 HIDDEN, ROWS, HD = L.HIDDEN, L.ROWS, L.HD
 NK, NV, KEY = L.NK, L.NV, L.KEY
 NPROJ = L.QKVZ + L.BA  # 4640 PROJ entries a token: [q | k | v | z | b | a]
@@ -433,7 +454,10 @@ def gdn_conv(c, k, t, h, ch):
     a, g = c["args"], c["gdn"]
     part, owner = k["part"], k["owner"]
     if tid < 3 * VCH:
+        wlo, whi = _wait_slots(c, "gdn_conv")
+        _stamp_point(c, wlo)
         x = f32_of(c["poll"]([(c["proj"], t * g.proj + k["chan"], 1)])[0][0])
+        _stamp_point(c, whi)
         owned = (part == 2) | owner
         if (k["slot"] > 0) & owned:
             rs = rsrc(k["cs"])
@@ -464,7 +488,10 @@ def gdn_gates(c, k, t, h):
     tid, lane, wave, g = c["tid"], c["lane"], c["wave"], c["gdn"]
     kh = h // (g.nv // g.nk)
     if tid < 2 * HD:
+        wlo, whi = _wait_slots(c, "gdn_gates")
+        _stamp_point(c, wlo)
         v = c["poll"]([(c["qk"], (t * g.nk + kh) * 2 * HD + tid, 1)])[0][0]
+        _stamp_point(c, whi)
         fx.ptr_store(f32_of(v), c["qkl"] + tid)
     if tid == 2 * HD:
         b, a = c["ba_of"](c, t, h)
@@ -525,6 +552,7 @@ def gdn_recur(c, k, t, h, ch):
             ss = ss + x * x
         c["put"](c["onrm"], (t * c["gdn"].nv + h) * NVCH + ch, ss)
     gpu.barrier()
+    _stamp_point(c, _wait_slots(c, "gdn_recur")[1])
 
 
 @traced
@@ -536,10 +564,13 @@ def gdn_norm(c, k, t, h, ch):
     if tid < VCH:
         vr = ch * VCH + tid
         z0 = 2 * g.nk * HD + g.nv * HD
+        wlo, whi = _wait_slots(c, "gdn_norm")
+        _stamp_point(c, wlo)
         got = c["poll"](
             [(c["onrm"], (t * g.nv + h) * NVCH + q, 1) for q in range(NVCH)]
             + [(c["proj"], t * g.proj + z0 + h * HD + vr, 1)]
         )
+        _stamp_point(c, whi)
         ss = f32_of(got[0][0])
         for q in range_constexpr(1, NVCH):
             ss = ss + f32_of(got[q][0])

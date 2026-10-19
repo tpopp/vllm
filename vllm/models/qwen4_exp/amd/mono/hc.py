@@ -46,6 +46,7 @@ from vllm.models.kimi_k3.amd.mono.common.ranks import sum_partials
 from vllm.models.kimi_k3.amd.mono.stages import gemv
 from vllm.models.qwen3_5.amd.mono.moe import ksplit_rows, sigmoid
 from vllm.models.qwen4_exp.amd.mono import layout as L
+from vllm.models.qwen4_exp.amd.mono import stamps
 
 H, HH, HC, ROWS = L.HIDDEN, L.HH, L.HC, L.ROWS
 COLS = 128  # columns of each stream a msq / combine task
@@ -120,19 +121,25 @@ def stage_msq(c, j):
 
 # ---------------------------------------------------------------- combine
 @traced
-def stage_combine(c, j, own, inj, src_state, src_cm, dst, dst_cm, msq_put):
+def stage_combine(c, j, own, inj, src_state, src_cm, dst, dst_cm, msq_put, wait=None):
     """Columns 128 j ..: the TP ranks' bf16 partials of a block output at peer
     region ``own`` (rank order, fp32) -> bf16 block; state_k + block 2
     sigmoid(inj_k / 4) (fp32) -> bf16 -> ``dst``; their sums of squares ->
     ``msq_put(j, t, k, v)``, after ``dst``'s stores drained. ``inj(t)``: the
-    token's 4 injection logits (fp32 of bf16). Wave t token t."""
+    token's 4 injection logits (fp32 of bf16). Wave t token t. ``wait``:
+    ``c["wslot"]`` name for this AR wait (callers combining two distinct
+    regions through this one function, as K2's attention and mlp combines
+    do, pass distinct names so the timeline tells them apart)."""
     s, tid, lane = c["S"], c["tid"], c["lane"]
     mine = tid < s * 64
     t = fx.min(tid // 64, s - 1)
     col = j * COLS + 2 * (tid % 64)
+    wlo, whi = stamps.wait_slots(c, wait)
+    stamps.stamp_point(c, wlo)
     lo, hi = sum_partials(
         c["poll"], own, lambda src: ((src * s + t) * H + col) // 2, c["TP"]
     )
+    stamps.stamp_point(c, whi)
     b0, b1 = bf16_round(lo), bf16_round(hi)
     lg = inj(t)
     sqs = []
@@ -177,7 +184,10 @@ def load_rrms(c):
             )
             vals = [v[k] for k in range(HC)]
         else:
+            lo, hi = stamps.wait_slots(c, "msq")
+            stamps.stamp_point(c, lo)
             got = c["poll"]([(h["msq"], at, 2), (h["msq"], at + 2, 2)])
+            stamps.stamp_point(c, hi)
             vals = [f32_of(got[k // 2][k % 2]) for k in range(HC)]
         for k in range_constexpr(HC):
             x = (lane < NRED).select(vals[k], fx.Float32(0.0))
@@ -307,9 +317,12 @@ def lora_to_lds(c):
     h = c["hc"]
     n = s * L.LORA // 2
     per = (n + THREADS - 1) // THREADS
+    lo, hi = stamps.wait_slots(c, "lora")
+    stamps.stamp_point(c, lo)
     got = c["poll"](
         [(h["lora"], fx.min(tid + THREADS * i, n - 1), 1) for i in range(per)]
     )
+    stamps.stamp_point(c, hi)
     for i in range_constexpr(per):
         p = fx.min(tid + THREADS * i, n - 1)
         t = p // (L.LORA // 2)
@@ -390,7 +403,10 @@ def stage_up(c, u, ops):
 def bin_to_lds(c, xrow):
     """Every up task's flag in -> the block-input rows [S, H] into LDS ``xl``."""
     h = c["hc"]
+    lo, hi = stamps.wait_slots(c, "bin")
+    stamps.stamp_point(c, lo)
     if c["tid"] < UP_TASKS:
         c["poll"]([(h["binf"], c["tid"], 1)])
+    stamps.stamp_point(c, hi)
     gpu.barrier()
     gemv.dev_rows_to_lds(c["tid"], h["bin"], H, c["S"], c["xl"], xrow)

@@ -46,6 +46,28 @@ from vllm.models.kimi_k3.amd.mono.common.plan import BLOCKS, THREADS, WAVES
 from vllm.models.kimi_k3.amd.mono.stages import gemv
 from vllm.models.qwen3_5.amd.mono import layout as L
 
+try:
+    # Qwen3.8-Flash-Next's K1 / K2 (qwen4_exp.amd.mono) share this module's
+    # route / sgate / inter mailbox waits; its ``stamps`` instrument stamps
+    # them when a build opts in (``c["wslot"]``, ``c["dbg"]``). A deployment
+    # without that module (this file's other caller, Qwen3.5's own ``layer``,
+    # never sets ``c["wslot"]``) gets plain no-ops instead.
+    from vllm.models.qwen4_exp.amd.mono import stamps as _stamps
+
+    def _wait_slots(c, name):
+        return _stamps.wait_slots(c, name)
+
+    def _stamp_point(c, slot):
+        _stamps.stamp_point(c, slot)
+except ImportError:
+
+    def _wait_slots(c, name):
+        return None, None
+
+    def _stamp_point(c, slot):
+        pass
+
+
 E = 512
 TOPK = 10
 MAX_TOKENS = 8
@@ -532,11 +554,14 @@ def local_route(c):
     logits that land last first, so the full polls don't spin."""
     lane, wave, rt, kt, s = c["lane"], c["wave"], c["rt"], c["KT"], c["S"]
     n, last = c["rlog_last"]
+    wlo, whi = _wait_slots(c, "route")
+    _stamp_point(c, wlo)
     if c["tid"] < n:
         c["poll"]([last(c["tid"])])
     gpu.barrier()
     if wave < s:
         rank, e, w = route_token(c, wave)
+        _stamp_point(c, whi)
         if lane < TOPK:
             fx.ptr_store(e, rt["route"] + (wave * 2 * kt + rank))
             fx.ptr_store(w.bitcast(fx.Int32), rt["route"] + (wave * 2 * kt + kt + rank))
@@ -554,7 +579,10 @@ def load_route(c):
     rt, kt = c["rt"], c["KT"]
     if const_expr(c["fse"]):  # noqa: SIM102 (traced: `and` does not combine traced values)
         if tid < s:
+            wlo, whi = _wait_slots(c, "sgate")
+            _stamp_point(c, wlo)
             g = c["poll"]([(c["sgate"], tid, 1)])[0][0]
+            _stamp_point(c, whi)
             fx.ptr_store(fx.Int32(E), rt["route"] + (tid * 2 * kt + TOPK))
             fx.ptr_store(g, rt["route"] + (tid * 2 * kt + kt + TOPK))
     if const_expr(c["u1"]):
@@ -773,9 +801,12 @@ def load_inter(c):
     nb = rip // 32
     n = s * kt * ri // 2
     per = (n + THREADS - 1) // THREADS
+    wlo, whi = _wait_slots(c, "inter")
+    _stamp_point(c, wlo)
     got = c["poll"](
         [(c["inter"], 2 * fx.min(tid + THREADS * i, n - 1), 2) for i in range(per)]
     )
+    _stamp_point(c, whi)
     for i in range_constexpr(per):
         p = fx.min(tid + THREADS * i, n - 1)
         pick = p // (ri // 2)

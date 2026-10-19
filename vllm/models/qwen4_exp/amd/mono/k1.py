@@ -65,6 +65,7 @@ from vllm.models.qwen3_5.amd.mono.moe import (
 )
 from vllm.models.qwen4_exp.amd.mono import hc
 from vllm.models.qwen4_exp.amd.mono import layout as L
+from vllm.models.qwen4_exp.amd.mono import stamps
 from vllm.models.qwen4_exp.amd.mono.layout import need
 from vllm.models.qwen4_exp.amd.mono.sources import digest
 
@@ -89,6 +90,7 @@ class K1Build:
     front_only: bool = False  # the HC front alone (a QSA layer)
     eps: float = 1e-6  # the HC norm
     norm_eps: float = 1e-6  # the GDN gated norm
+    trace: bool = False  # emit in-kernel timestamps to a `dbg` buffer (stamps.py)
 
 
 ABI = KernelAbi(
@@ -118,8 +120,78 @@ ABI = KernelAbi(
         "scratch",
         "epoch",
         "layer",
+        "dbg",  # Stage 0a: stamps.py target, 256 * NSLOT int32; 0 when off
     )
 )
+
+# ----------------------------------------------------------- in-kernel trace
+#
+# Slot -> label of this kernel's utilization timeline (``K1Build(trace=True)``,
+# a ``dbg`` buffer of ``stamps.dbg_buffer(device, nslot=NSLOT)``). Same
+# conventions as K2's (see ``k2.py``): a "_LO" / "_HI" pair brackets a mailbox
+# wait (``stamps.stamp_point``, no barrier); a lone slot marks a phase
+# boundary (``stamps.stamp``, full-CTA barrier -- every site below is inside
+# a ``bid``-gated branch, so it is safe). The four GDN phases run once a
+# round (``gdn_tasks``'s ``nr`` rounds on CTAs past a single round's worth of
+# tasks); a multi-round CTA's slot holds only its LAST round's timing.
+NSLOT = 32
+ENTRY = 0
+MSQ_SELF_DONE = 2  # stage_msq done (self_msq path, bid < hc.NRED)
+MSQ_LO, MSQ_HI = 4, 5  # hc.load_rrms, via "msq" (non-self_msq path)
+HC_DOWN_LOADS = 6  # down_loads issued
+HC_DOWN_DONE = 7  # hc.stage_down done
+LORA_LO, LORA_HI = 8, 9  # hc.lora_to_lds, via "lora"
+HC_UP_DONE = 10  # hc.stage_up done
+BIN_LO, BIN_HI = 12, 13  # hc.bin_to_lds, via "bin" (non-front_only only)
+QKVZ_LOADS = 14  # in_proj_qkvz weights issued (non-front_only only)
+QKVZ_DONE = 15  # both stage_qkvz(j) row groups done
+BA_DONE = 16  # G.stage_ba done (in_proj_ba CTAs)
+QUANTX_DONE = 18  # quant_x(c, H) done, before gdn_tasks
+GDN_CONV_LO, GDN_CONV_HI = 20, 21  # gdn.gdn_conv, via "gdn_conv"
+GDN_GATES_LO, GDN_GATES_HI = 22, 23  # gdn.gdn_gates, via "gdn_gates"
+GDN_RECUR_DONE = 24  # gdn.gdn_recur done, via "gdn_recur" (lo unused, None)
+GDN_NORM_LO, GDN_NORM_HI = 26, 27  # gdn.gdn_norm, via "gdn_norm"
+EXIT = 31
+
+SLOTS = {
+    "entry": ENTRY,
+    "msq_self_done": MSQ_SELF_DONE,
+    "msq_wait_lo": MSQ_LO,
+    "msq_wait_hi": MSQ_HI,
+    "hc_down_loads": HC_DOWN_LOADS,
+    "hc_down_done": HC_DOWN_DONE,
+    "lora_wait_lo": LORA_LO,
+    "lora_wait_hi": LORA_HI,
+    "hc_up_done": HC_UP_DONE,
+    "bin_wait_lo": BIN_LO,
+    "bin_wait_hi": BIN_HI,
+    "qkvz_loads": QKVZ_LOADS,
+    "qkvz_done": QKVZ_DONE,
+    "ba_done": BA_DONE,
+    "quantx_done": QUANTX_DONE,
+    "gdn_conv_wait_lo": GDN_CONV_LO,
+    "gdn_conv_wait_hi": GDN_CONV_HI,
+    "gdn_gates_wait_lo": GDN_GATES_LO,
+    "gdn_gates_wait_hi": GDN_GATES_HI,
+    "gdn_recur_done": GDN_RECUR_DONE,
+    "gdn_norm_wait_lo": GDN_NORM_LO,
+    "gdn_norm_wait_hi": GDN_NORM_HI,
+    "exit": EXIT,
+}
+
+
+def _wslot(key: K1Build) -> dict:
+    """``c["wslot"]``: every named wait site -> its (before, after) slot pair,
+    built once a launch (only when ``key.trace``)."""
+    return {
+        "msq": (MSQ_LO, MSQ_HI),
+        "lora": (LORA_LO, LORA_HI),
+        "bin": (BIN_LO, BIN_HI),
+        "gdn_conv": (GDN_CONV_LO, GDN_CONV_HI),
+        "gdn_gates": (GDN_GATES_LO, GDN_GATES_HI),
+        "gdn_recur": (None, GDN_RECUR_DONE),
+        "gdn_norm": (GDN_NORM_LO, GDN_NORM_HI),
+    }
 
 
 def ba_tasks(lay):
@@ -272,6 +344,7 @@ def build(key: K1Build):
         scratch: Int64,
         epoch: Int64,
         layer: Int32,
+        dbg: Int64,
     ):
         _ = keyed
         tid = fx.thread_idx.x
@@ -294,6 +367,9 @@ def build(key: K1Build):
             "wave": tid // 64,
             "eps": key.eps,
             "norm_eps": key.norm_eps,
+            "dbg": dbg if key.trace else None,
+            "nslot": NSLOT,
+            "wslot": _wslot(key) if key.trace else {},
             "put": mb.put,
             "put_bf": mb.put_bf,
             "poll": mb.poll,
@@ -341,48 +417,65 @@ def build(key: K1Build):
             "bin": bin_out if key.front_only else scratch + fx.Int64(scr["bin"][0]),
             "inj_out": lambda t, r, vs: _put_inj(c, t, r, vs),
         }
+        stamps.stamp(c, ENTRY)
         # ---- the HC front: a CTA's whole sequence in one branch, its weights
         # (and its in_proj_qkvz ones) in flight first
         if const_expr(not key.front_only):
             qops = [qkvz_loads(c, bid + BLOCKS * j) for j in range(2)]
+            stamps.stamp(c, QKVZ_LOADS)
         if const_expr(key.self_msq):  # noqa: SIM102 (traced: `and` does not combine traced values)
             if bid < hc.NRED:
                 hc.stage_msq(c, bid)
+                stamps.stamp(c, MSQ_SELF_DONE)
         if bid < D0:
             uops = hc.up_loads(c, bid)
             hc.load_rrms(c)
             hc.stage_up(c, bid, uops)
+            stamps.stamp(c, HC_UP_DONE)
         if (bid >= D0) & (bid < hc.UP_TASKS):
             dops = hc.down_loads(c, bid - D0)
             uops = hc.up_loads(c, bid)
             hc.load_rrms(c)
+            stamps.stamp(c, HC_DOWN_LOADS)
             hc.stage_down(c, bid - D0, dops)
+            stamps.stamp(c, HC_DOWN_DONE)
             hc.stage_up(c, bid, uops)
+            stamps.stamp(c, HC_UP_DONE)
         if const_expr(key.front_only):
             if bid >= hc.UP_TASKS:
                 dops = hc.down_loads(c, bid - D0)
                 hc.load_rrms(c)
+                stamps.stamp(c, HC_DOWN_LOADS)
                 hc.stage_down(c, bid - D0, dops)
+                stamps.stamp(c, HC_DOWN_DONE)
         else:
             is_ba = (bid >= BA0) & (bid < BA0 + nba)
             if is_ba:
                 dops = hc.down_loads(c, bid - D0)
                 bops = G.ba_loads(c, bid - BA0, BA_PARTS, BA_K)
                 hc.load_rrms(c)
+                stamps.stamp(c, HC_DOWN_LOADS)
                 hc.stage_down(c, bid - D0, dops)
+                stamps.stamp(c, HC_DOWN_DONE)
                 hc.bin_to_lds(c, XROW)
                 G.stage_ba(c, bid - BA0, bops, BA_PARTS, BA_K)
+                stamps.stamp(c, BA_DONE)
             if bid >= BA0 + nba:
                 dops = hc.down_loads(c, bid - D0)
                 hc.load_rrms(c)
+                stamps.stamp(c, HC_DOWN_LOADS)
                 hc.stage_down(c, bid - D0, dops)
+                stamps.stamp(c, HC_DOWN_DONE)
             # ---- in_proj on the block input, then the GDN tasks
             if ~is_ba:
                 hc.bin_to_lds(c, XROW)
             quant_x(c, H)
+            stamps.stamp(c, QUANTX_DONE)
             for j in range_constexpr(2):
                 stage_qkvz(c, bid + BLOCKS * j, qops[j])
+            stamps.stamp(c, QKVZ_DONE)
             gdn_tasks(c, nr)
+        stamps.stamp(c, EXIT)
 
     @flyc.jit
     def launch(
@@ -411,6 +504,7 @@ def build(key: K1Build):
         scratch: Int64,
         epoch: Int64,
         layer: Int32,
+        dbg: Int64,
         stream: fx.Stream = _STREAM,
     ):
         _ = keyed
@@ -440,6 +534,7 @@ def build(key: K1Build):
             scratch,
             epoch,
             layer,
+            dbg,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     ABI.check(k1, launch)
@@ -482,11 +577,15 @@ def hc_front(
     scratch,
     epoch,
     layer,
+    dbg=None,
 ):
     """Host launcher of the HC front alone (``key.front_only``, a QSA layer):
     the attention HC's norm and mix of ``state`` [S, 4 H] -> ``bin_out`` [S, H]
     bf16 (the attention's input) and ``inj_out`` [S, 4] bf16. ``msq_in``:
-    ``state``'s sums of squares as K2 wrote them, None with ``key.self_msq``."""
+    ``state``'s sums of squares as K2 wrote them, None with ``key.self_msq``.
+    ``dbg``: Stage 0a's stamp buffer (``stamps.dbg_buffer(device, nslot=
+    k1.NSLOT)``), required iff ``key.trace``; ignored (and may be omitted)
+    otherwise."""
     s = key.tokens
     need(key.front_only, "hc_front takes a front_only build")
     _hc_checks(key, s, state, msq_in, hc_w, w_down, w_up, inj_out)
@@ -496,6 +595,7 @@ def hc_front(
         and bin_out.is_contiguous(),
         "bin_out: bf16 [S, H]",
     )
+    need(key.trace == (dbg is not None), "dbg: required iff key.trace")
     vals = dict.fromkeys(ABI.names, 0)
     vals |= {
         "state": state.data_ptr(),
@@ -508,6 +608,7 @@ def hc_front(
         "scratch": scratch.data_ptr(),
         "epoch": epoch.data_ptr(),
         "layer": layer,
+        "dbg": 0 if dbg is None else dbg.data_ptr(),
     }
     build(key)(*ABI.pack(vals), stream=torch.cuda.current_stream())
 
@@ -535,6 +636,7 @@ def gdn_pre(
     scratch,
     epoch,
     layer,
+    dbg=None,
 ):
     """Host launcher of a GDN layer's K1; every weight as vLLM holds it after
     loading (in_proj_qkvz online MXFP4: the ASM FP4 GEMM's shuffled weight and
@@ -542,11 +644,14 @@ def gdn_pre(
     [slots, 3, CONV] (strides read); ``rstate`` [slots, NV, 128, 128] fp32, a
     slot dense, slots strided; ``st_idx`` [>= S] int32, <= 0 a pad row;
     ``epoch`` a device int32 bumped once a step, ``layer`` this launch's tag
-    slot."""
+    slot. ``dbg``: Stage 0a's stamp buffer (``stamps.dbg_buffer(device,
+    nslot=k1.NSLOT)``), required iff ``key.trace``; ignored (and may be
+    omitted) otherwise."""
     s = key.tokens
     lay = L.Layout(key.tp)
     bf = torch.bfloat16
     need(not key.front_only, "gdn_pre takes a GDN build")
+    need(key.trace == (dbg is not None), "dbg: required iff key.trace")
     _hc_checks(key, s, state, msq_in, hc_w, w_down, w_up, inj_out)
     need(
         core.shape == (s, lay.CORE) and core.dtype == bf, f"core: bf16 [S, {lay.CORE}]"
@@ -605,5 +710,6 @@ def gdn_pre(
         "scratch": scratch.data_ptr(),
         "epoch": epoch.data_ptr(),
         "layer": layer,
+        "dbg": 0 if dbg is None else dbg.data_ptr(),
     }
     build(key)(*ABI.pack(vals), stream=torch.cuda.current_stream())
