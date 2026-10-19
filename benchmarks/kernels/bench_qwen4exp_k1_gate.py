@@ -365,7 +365,7 @@ def bench_k1_proj_gate(s, device, rank, world_size, epoch, iters):
         k1.scratch_bytes(key_proj), dtype=torch.uint8, device=device
     )
     qkvz_out = torch.empty(s, lay.QKVZ, dtype=bf, device=device)
-    ba_out = torch.empty(s, lay.BA, dtype=bf, device=device)
+    ba_out = torch.empty(2, s, lay.NV, dtype=bf, device=device)
 
     def _k1_proj():
         epoch.add_(1)

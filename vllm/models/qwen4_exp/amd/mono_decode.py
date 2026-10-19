@@ -228,11 +228,11 @@ class MonoDecode(B.QwenMonoDecode):
                 x = torch.empty(s, L.HIDDEN, dtype=state.dtype, device=state.device)
                 qkvz, ba = self._front_proj(layer, state, msq, inj, x)
                 if envs.VLLM_ROCM_MONO_K2_GATED_NORM:
-                    core, gn_z = B.gdn_core_ungated(a, qkvz=qkvz, ba=ba)
+                    core, gn_z = B.gdn_core_ungated(a, qkvz=qkvz, ba2=ba)
                     norm = a.norm
                     gn_norm_w, gn_eps = norm.weight, norm.eps
                 else:
-                    core = B.gdn_core(a, qkvz=qkvz, ba=ba)
+                    core = B.gdn_core(a, qkvz=qkvz, ba2=ba)
             else:
                 x = torch.empty(s, L.HIDDEN, dtype=state.dtype, device=state.device)
                 self._front(layer, state, msq, inj, x)
@@ -297,7 +297,7 @@ class MonoDecode(B.QwenMonoDecode):
         s = state.size(0)
         lay = self.lay
         qkvz = torch.empty(s, lay.QKVZ, dtype=state.dtype, device=state.device)
-        ba = torch.empty(s, lay.BA, dtype=state.dtype, device=state.device)
+        ba = torch.empty(2, s, lay.NV, dtype=state.dtype, device=state.device)
         k1.proj_pre(
             k1.K1Build(
                 tokens=s,

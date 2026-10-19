@@ -215,13 +215,15 @@ def store_ba_out(c):
     always <= BLOCKS (NV <= 24, S <= 8), so one CTA each, no rounds. Finalizes
     ``ba_tasks``'s K-split partials the way ``_ba_of`` already does for the
     decode build's gates stage (a poll of ``bapart``, same hand-off), storing
-    to ``ba_out`` [S, BA] (``[b | a]``) instead of reading them in place."""
+    to ``ba_out`` [2, S, NV] (b plane, then a plane: the contiguous b / a the
+    stock conv + gated delta rule call takes, so no unpack launch is needed)
+    instead of reading them in place."""
     lay, s, bid = c["lay"], c["S"], c["bid"]
     if bid < s * lay.NV:
         t, h = bid // lay.NV, bid % lay.NV
         b, a = c["ba_of"](c, t, h)
-        bo.buffer_store(b.to(fx.BFloat16), rsrc(c["ba_out"]), t * lay.BA + h)
-        bo.buffer_store(a.to(fx.BFloat16), rsrc(c["ba_out"]), t * lay.BA + lay.NV + h)
+        bo.buffer_store(b.to(fx.BFloat16), rsrc(c["ba_out"]), t * lay.NV + h)
+        bo.buffer_store(a.to(fx.BFloat16), rsrc(c["ba_out"]), (s + t) * lay.NV + h)
 
 
 # ---------------------------------------------------------------- kernel
@@ -684,7 +686,7 @@ def proj_pre(
     """Host launcher of a GDN layer's K1 ``proj_only`` build (P1b,
     ``VLLM_ROCM_MONO_K1_PROJ``): ``hc_front``'s ``bin_out`` [S, H] / ``inj_out``
     [S, 4], plus in_proj_qkvz's bf16 output -> ``qkvz_out`` [S, QKVZ] and
-    in_proj_ba's -> ``ba_out`` [S, BA] (``[b | a]``), the same values/rounding
+    in_proj_ba's -> ``ba_out`` [2, S, NV] (b, a planes), the same values/rounding
     ``attn.in_proj_qkvz(x)`` / ``attn.in_proj_ba(x)`` produce. No GDN task
     runs here: the conv update, gated delta rule and gated norm are the stock
     AITER verify core's, called on these two tensors directly
@@ -718,8 +720,8 @@ def proj_pre(
         f"qkvz_out: bf16 [S, {lay.QKVZ}]",
     )
     need(
-        ba_out.shape == (s, lay.BA) and ba_out.dtype == bf,
-        f"ba_out: bf16 [S, {lay.BA}]",
+        ba_out.shape == (2, s, lay.NV) and ba_out.dtype == bf,
+        f"ba_out: bf16 [2, S, {lay.NV}] (b, a planes)",
     )
     dense = (w_qkvz, w_qkvzs, w_ba, qkvz_out, ba_out)
     need(all(t.is_contiguous() for t in dense), "a non-contiguous GDN input")

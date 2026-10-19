@@ -443,7 +443,7 @@ def test_k1_proj_only_matches_hc_front_and_stock_in_proj(s: int) -> None:
     x_proj = torch.full((s, HIDDEN), float("nan"), dtype=bf, device="cuda")
     inj_proj = torch.full((s, HC), float("nan"), dtype=bf, device="cuda")
     qkvz_out = torch.full((s, lay.QKVZ), float("nan"), dtype=bf, device="cuda")
-    ba_out = torch.full((s, lay.BA), float("nan"), dtype=bf, device="cuda")
+    ba_out = torch.full((2, s, lay.NV), float("nan"), dtype=bf, device="cuda")
     scr_proj = torch.zeros(k1.scratch_bytes(key_proj), dtype=torch.uint8, device="cuda")
     k1.proj_pre(
         key_proj,
@@ -484,6 +484,7 @@ def test_k1_proj_only_matches_hc_front_and_stock_in_proj(s: int) -> None:
     # ba_out: the stock bf16 F.linear (loose, as the decode build's own
     # in_proj_ba check is: a K-split summed in a different order)
     want_ba = F.linear(x_proj, w["w_ba"])
+    want_ba = torch.stack((want_ba[:, : lay.NV], want_ba[:, lay.NV :]))
     assert _cos(ba_out, want_ba) > COS_MIN
     ba_ulp = (
         (ba_out.float() - want_ba.float()).abs() / _bf16_ulp(want_ba).clamp_min(1e-30)
