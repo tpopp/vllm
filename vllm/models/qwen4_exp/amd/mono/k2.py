@@ -35,10 +35,8 @@ sigmoid(bf16(x . w_sg)) in fp32. Peer regions are double-buffered by the step
 epoch's parity.
 
 Variants: ``oq`` (an online-MXFP4 out_proj on the ASM FP4 GEMM: the core rows
-through MXFP4, as ``per_1x32_f4_quant_hip`` quantizes the GEMM's input), ``og``
-(o_proj's input is core x sigmoid(gate), the QSA output gate) and ``gn`` (a
-GDN layer: o_proj's input is RMSNormGated(core, z), folding the verify step's
-separate ``_gated_rms_norm`` launch into the o_proj staging).
+through MXFP4, as ``per_1x32_f4_quant_hip`` quantizes the GEMM's input) and
+``og`` (o_proj's input is core x sigmoid(gate), the QSA output gate).
 """
 
 from dataclasses import dataclass
@@ -108,8 +106,6 @@ class K2Build:
     eps: float = 1e-6  # the HC norms
     oq: bool = False  # out_proj MXFP4 (ASM FP4 GEMM layout)
     og: bool = False  # o_proj's input is core x sigmoid(gate)
-    gn: bool = False  # o_proj's input is RMSNormGated(core, gn_z) (a GDN layer)
-    gn_eps: float = 1e-6  # the GDN gated norm, with ``gn``
 
     @property
     def u1(self) -> bool:
@@ -126,9 +122,6 @@ ABI = KernelAbi(
     (
         "core",
         "gate",
-        "gn_z",
-        "gn_z_stride",
-        "gn_norm_w",
         "state",
         "inj_a",
         "w_o",
@@ -352,9 +345,6 @@ def build(key: K2Build):
     def k2(
         core: Int64,
         gate: Int64,
-        gn_z: Int64,
-        gn_z_stride: Int32,
-        gn_norm_w: Int64,
         state: Int64,
         inj_a: Int64,
         w_o: Int64,
@@ -410,9 +400,6 @@ def build(key: K2Build):
             "fse": True,
             "oq": key.oq,
             "og": key.og,
-            "gn": key.gn,
-            "gn_eps": key.gn_eps,
-            "gn_hd": L.HD,
             "u1": key.u1,
             "KT": KT,
             "put": mb.put,
@@ -437,9 +424,6 @@ def build(key: K2Build):
             "args": {
                 "core": core,
                 "gate": gate,
-                "gn_z": gn_z,
-                "gn_z_stride": gn_z_stride,
-                "gn_norm_w": gn_norm_w,
                 "state": state,
                 "inj_a": inj_a,
                 "w_o": w_o,
@@ -522,9 +506,6 @@ def build(key: K2Build):
     def launch(
         core: Int64,
         gate: Int64,
-        gn_z: Int64,
-        gn_z_stride: Int32,
-        gn_norm_w: Int64,
         state: Int64,
         inj_a: Int64,
         w_o: Int64,
@@ -551,9 +532,6 @@ def build(key: K2Build):
         k2(
             core,
             gate,
-            gn_z,
-            gn_z_stride,
-            gn_norm_w,
             state,
             inj_a,
             w_o,
@@ -618,8 +596,6 @@ def layer_post(
     layer,
     w_os=None,
     gate=None,
-    gn_z=None,
-    gn_norm_w=None,
 ):
     """Host launcher; every weight as vLLM holds it after loading, the experts'
     shuffled (``layout``) with the shared expert fused as expert 512. ``state``
@@ -628,11 +604,7 @@ def layer_post(
     HC's injection logits; ``msq_out`` [20, S, 4] fp32: ``out``'s sums of
     squares for the next layer's front. ``w_os``: an fp4 o_proj's scales
     (``key.oq``); ``gate``: the attention output gate (``key.og``), core's
-    shape. ``gn_z``: the GDN gate (``key.gn``), core's shape, a strided view
-    (e.g. of a packed qkvz buffer) allowed -- only its last dim need be dense;
-    ``gn_norm_w``: the GDN gated norm's weight (``key.gn``), bf16 [HD]. ``og``
-    and ``gn`` are mutually exclusive (one o_proj-input gate a layer).
-    ``peers``: the int64 table of every rank's peer buffer (at least
+    shape. ``peers``: the int64 table of every rank's peer buffer (at least
     ``peer_bytes(MAX_TOKENS, tp)`` each)."""
     s = key.tokens
     lay = L.Layout(key.tp)
@@ -647,26 +619,9 @@ def layer_post(
         msq_out.numel() == hc.NRED * s * HC and msq_out.dtype == torch.float32,
         "msq_out: fp32 [20, S, 4]",
     )
-    need(not (key.og and key.gn), "og and gn are mutually exclusive")
     need(
         (gate is not None) == key.og and (gate is None or gate.shape == core.shape),
         "gate: core's shape, with og only",
-    )
-    need(
-        (gn_z is not None) == key.gn and (gn_z is None or gn_z.shape == core.shape),
-        "gn_z: core's shape, with gn only",
-    )
-    need(
-        gn_z is None or (gn_z.dtype == bf and gn_z.stride(-1) == 1),
-        "gn_z: bf16, its last dim contiguous",
-    )
-    need(
-        (gn_norm_w is not None) == key.gn
-        and (
-            gn_norm_w is None
-            or (gn_norm_w.numel() == L.HD and gn_norm_w.dtype == bf)
-        ),
-        f"gn_norm_w: bf16 [{L.HD}], with gn only",
     )
     if key.oq:
         need(
@@ -702,13 +657,12 @@ def layer_post(
         w2s.numel() == ne * H * QL.scale_cols(lay.RIP) and w2s.element_size() == 1,
         "w2 scales: e8m0, one a 32-block, shuffled (K blocks padded to 8)",
     )
-    used = [w_o, w_os, w_gate, w_sg, w13, w13s, w2, w2s, gate, gn_norm_w]
+    used = [w_o, w_os, w_gate, w_sg, w13, w13s, w2, w2s, gate]
     tensors = [core, state, inj_a, out, msq_out, hc_w, w_down, w_up]
     tensors += [w for w in used if w is not None]
     need(all(t.is_contiguous() for t in tensors), "a non-contiguous input")
     dense = [core, state, out, hc_w, w_down, w_up, w_gate, w_sg]
     dense += [gate] if gate is not None else []
-    dense += [gn_z, gn_norm_w] if gn_z is not None else []
     need(all(t.dtype == bf for t in dense), "activations and dense weights: bf16")
 
     def ptr(t):
@@ -720,9 +674,6 @@ def layer_post(
             {
                 "core": core.data_ptr(),
                 "gate": ptr(gate),
-                "gn_z": ptr(gn_z),
-                "gn_z_stride": gn_z.stride(0) if gn_z is not None else 0,
-                "gn_norm_w": ptr(gn_norm_w),
                 "state": state.data_ptr(),
                 "inj_a": inj_a.data_ptr(),
                 "w_o": w_o.data_ptr(),

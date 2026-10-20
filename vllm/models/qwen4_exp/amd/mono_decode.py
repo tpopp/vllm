@@ -35,7 +35,6 @@ from functools import cached_property
 
 import torch
 
-from vllm import envs
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.models.qwen3_5.amd import mono_base as B
@@ -211,9 +210,6 @@ class MonoDecode(B.QwenMonoDecode):
                 msq = None
             inj = torch.empty(s, L.HC, dtype=state.dtype, device=state.device)
             gate = None
-            gn_z = None
-            gn_norm_w = None
-            gn_eps = 1e-6
             if layer.layer_type == "linear_attention" and not self.spec:
                 core = torch.empty(
                     s, self.lay.CORE, dtype=state.dtype, device=state.device
@@ -227,27 +223,15 @@ class MonoDecode(B.QwenMonoDecode):
                 a = layer.linear_attn
                 x = torch.empty(s, L.HIDDEN, dtype=state.dtype, device=state.device)
                 qkvz, ba = self._front_proj(layer, state, msq, inj, x)
-                if envs.VLLM_ROCM_MONO_K2_GATED_NORM:
-                    core, gn_z = B.gdn_core_ungated(a, qkvz=qkvz, ba2=ba)
-                    norm = a.norm
-                    gn_norm_w, gn_eps = norm.weight, norm.eps
-                else:
-                    core = B.gdn_core(a, qkvz=qkvz, ba2=ba)
+                core = B.gdn_core(a, qkvz=qkvz, ba2=ba)
             else:
                 x = torch.empty(s, L.HIDDEN, dtype=state.dtype, device=state.device)
                 self._front(layer, state, msq, inj, x)
                 if layer.layer_type == "linear_attention":
-                    if envs.VLLM_ROCM_MONO_K2_GATED_NORM:
-                        core, gn_z = B.gdn_core_ungated(layer.linear_attn, x)
-                        norm = layer.linear_attn.norm
-                        gn_norm_w, gn_eps = norm.weight, norm.eps
-                    else:
-                        core = B.gdn_core(layer.linear_attn, x)
+                    core = B.gdn_core(layer.linear_attn, x)
                 else:
                     core, gate = _qsa_core(layer.self_attn, x, positions)
-            state, msq = self._k2(
-                layer, core, gate, state, inj, gn_z, gn_norm_w, gn_eps
-            )
+            state, msq = self._k2(layer, core, gate, state, inj)
         if model._mtp_hidden_buffer is not None:
             # the drafter's input: the multi-stream state before the final mixer
             model._mtp_hidden_buffer[:s].copy_(state)
@@ -289,7 +273,7 @@ class MonoDecode(B.QwenMonoDecode):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """P1b (``VLLM_ROCM_MONO_K1_PROJ``): K1's ``proj_only`` build -> (x
         in-place, as ``_front``) plus in_proj_qkvz's / in_proj_ba's bf16
-        output, for ``B.gdn_core``/``gdn_core_ungated``'s ``qkvz``/``ba``."""
+        output, for ``B.gdn_core``'s ``qkvz``/``ba2``."""
         from vllm.models.qwen4_exp.amd.mono import k1
 
         a = layer.linear_attn
@@ -354,17 +338,7 @@ class MonoDecode(B.QwenMonoDecode):
             layer=layer.layer_idx,
         )
 
-    def _k2(
-        self,
-        layer,
-        core,
-        gate,
-        state,
-        inj,
-        gn_z=None,
-        gn_norm_w=None,
-        gn_eps=1e-6,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def _k2(self, layer, core, gate, state, inj) -> tuple[torch.Tensor, torch.Tensor]:
         from vllm.models.qwen4_exp.amd.mono import hc as mhc
         from vllm.models.qwen4_exp.amd.mono import k2
 
@@ -383,13 +357,9 @@ class MonoDecode(B.QwenMonoDecode):
                 eps=hc.config.rms_norm_eps,
                 oq=oq,
                 og=gate is not None,
-                gn=gn_z is not None,
-                gn_eps=gn_eps,
             ),
             core=core,
             gate=gate,
-            gn_z=gn_z,
-            gn_norm_w=gn_norm_w,
             state=state,
             inj_a=inj,
             w_o=o.weight,

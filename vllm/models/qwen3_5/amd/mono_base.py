@@ -205,20 +205,6 @@ def gdn_core(attn, x=None, *, qkvz=None, ba=None, ba2=None) -> torch.Tensor:
     return _gated_rms_norm(core, z, norm.weight, norm.eps, norm.activation).flatten(-2)
 
 
-def gdn_core_ungated(
-    attn, x=None, *, qkvz=None, ba=None, ba2=None
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Like ``gdn_core`` but stops short of the gated norm
-    (``VLLM_ROCM_MONO_K2_GATED_NORM``): K2's ``gn`` variant applies
-    ``RMSNormGated`` while staging o_proj's input instead, folding this
-    launch into K2 -> (core, z), both [S, heads HD]."""
-    if ba2 is not None:
-        core, z = _gdn_core_planar(attn, qkvz, ba2)
-    else:
-        core, z = _gdn_core_raw(attn, x, qkvz=qkvz, ba=ba)
-    return core.flatten(-2), z.flatten(-2)
-
-
 @torch.compile(dynamic=True, backend=current_platform.simple_compile_backend)
 def _gated_rms_norm(
     x: torch.Tensor, z: torch.Tensor, weight: torch.Tensor, eps: float, act: str

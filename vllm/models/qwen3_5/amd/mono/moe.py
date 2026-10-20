@@ -33,7 +33,6 @@ from vllm.models.kimi_k3.amd.mono.common.ops import (
     block_excl_scan,
     div_rn,
     hw_exp2,
-    hw_rsq,
     ld_i32,
     mfma_bf16,
     row_sum,
@@ -41,7 +40,6 @@ from vllm.models.kimi_k3.amd.mono.common.ops import (
     traced,
     uniform,
     wave_max,
-    wave_sum,
     xred,
 )
 from vllm.models.kimi_k3.amd.mono.common.plan import BLOCKS, THREADS, WAVES
@@ -436,80 +434,12 @@ def gated_rows_to_lds(c, k):
 
 
 @traced
-def gated_norm_rows_to_lds(c, k):
-    """``gn``: a GDN layer's gated RMSNorm (``RMSNormGated.forward_static``,
-    norm before the gate, one bf16-wide head a group) fused into the o_proj
-    input staging, on the un-normed core and its gate ``z`` -- the launch
-    ``gn`` lets K1 skip (``_gated_rms_norm``, run separately on verify steps
-    today). ``hd``-wide heads (``k / hd`` a token); math in fp32 throughout,
-    one bf16 rounding at the end, as ``forward_static`` does on a 3-D [.., hd]
-    view with ``group_size=None``.
-
-    Pass 1: one wave a (token, head) -- a head is exactly 2 waves' lanes wide
-    -- sums its squares (``wave_sum``) into ``red`` (reused, not the o_proj
-    GEMV's: this runs, and barriers, before any GEMV touches it). Pass 2: the
-    elementwise gate (``gated_rows_to_lds``'s loop), additionally scaled by
-    the head's rstd and the norm weight before its single bf16 rounding."""
-    tid, s, lane, wave, xl, red = (
-        c["tid"], c["S"], c["lane"], c["wave"], c["xl"], c["red"],
-    )  # fmt: skip
-    a = c["args"]
-    hd = c["gn_hd"]
-    assert hd == 2 * 64, "one wave a head: hd must be 128"
-    nh = k // hd
-    nwork = s * nh
-    for i in range_constexpr((nwork + WAVES - 1) // WAVES):
-        hidx = fx.min(wave + WAVES * i, nwork - 1)
-        t = hidx // nh
-        h = hidx % nh
-        at = (t * k + h * hd) // 2 + lane
-        v = fx.Int32(bo.buffer_load(rsrc(a["core"]), at, vec_width=1, dtype=T.i32))
-        x0, x1 = bf_lo(v), bf_hi(v)
-        ss = wave_sum(x0 * x0 + x1 * x1)
-        if (lane == 0) & (wave + WAVES * i < nwork):
-            r = hw_rsq(ss * fx.Float32(1.0 / hd) + fx.Float32(c["gn_eps"]))
-            fx.ptr_store(r, red + hidx)
-    gpu.barrier()
-    z_stride = a["gn_z_stride"]
-    words = s * k // 8
-    for i in range_constexpr((words + THREADS - 1) // THREADS):
-        e = fx.min(tid + THREADS * i, words - 1)
-        t = e // (k // 8)
-        kk = e % (k // 8) * 8
-        r = fx.ptr_load(red + t * nh + kk // hd)
-        at = (t * k + kk) // 2
-        at_z = (t * z_stride + kk) // 2
-        v = fx.Vector(bo.buffer_load(rsrc(a["core"]), at, vec_width=4, dtype=T.i32))
-        g = fx.Vector(bo.buffer_load(rsrc(a["gn_z"]), at_z, vec_width=4, dtype=T.i32))
-        nw = fx.Vector(
-            bo.buffer_load(
-                rsrc(a["gn_norm_w"]), (kk % hd) // 2, vec_width=4, dtype=T.i32
-            )
-        )
-        y = fx.Vector.from_elements(
-            [
-                bf16_pair(
-                    bf_lo(v[d]) * r * bf_lo(nw[d]) * sigmoid(bf_lo(g[d])),
-                    bf_hi(v[d]) * r * bf_hi(nw[d]) * sigmoid(bf_hi(g[d])),
-                ).bitcast(fx.Int32)
-                for d in range(4)
-            ],
-            fx.Int32,
-        )
-        if tid + THREADS * i < words:
-            fx.ptr_store(y, xl + (t * (k + gemv.LDS_PAD) + kk) // 2)
-    gpu.barrier()
-
-
-@traced
 def run_oproj(c, oops, k):
     """This CTA's o_proj tasks (rows 16 (bid + 256 j) .., K ``k``) on the core
     rows (plain loads: the previous launch wrote them), their weights ``oops``
     already in flight."""
     core = c["args"]["core"]
-    if const_expr(c.get("gn", False)):
-        gated_norm_rows_to_lds(c, k)
-    elif const_expr(c["og"]):
+    if const_expr(c["og"]):
         gated_rows_to_lds(c, k)
     else:
         gemv.rows_to_lds(c["tid"], core, k, c["S"], c["xl"], k + gemv.LDS_PAD)

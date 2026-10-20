@@ -6,8 +6,7 @@ UTILIZATION_DESIGN.md #1): graph-replayed timing of K1's full decode build
 ``front_only`` build the spec verify path already runs (``k1.hc_front``), at
 the production TP=2 shapes, plus the stock op chain that build would replace
 (in_proj_qkvz's quant + ASM FP4 GEMM, in_proj_ba's bf16 GEMM, the unpack
-Triton kernel, the gated RMSNorm), K2's ``gn`` variant (P1a) against K2 +
-the separate gated-norm launch it replaces, and K1's ``proj_only`` build
+Triton kernel, the gated RMSNorm), K1's ``proj_only`` build
 (P1b, shipped: the HC front + in_proj_qkvz/ba, no GDN tasks) against
 ``hc_front`` + the stock quant+GEMM / bf16 GEMM / unpack chain it folds in
 (the GDN verify core's conv + gated delta rule are untouched either way,
@@ -234,111 +233,6 @@ def bench_stock_pieces(s, device, rank, world_size, epoch, iters):
     ]
 
 
-# -------------------------------------------------------------- 3. K2's gn
-def bench_k2_gn(s, device, rank, world_size, epoch, iters, peers):
-    """P1a: K2's ``gn`` variant (the GDN gated norm folded into o_proj's input
-    staging) against plain K2 fed the separate ``_gated_rms_norm`` launch's
-    output -- the two kernels an equal-footing comparison must include
-    ``_gated_rms_norm``'s own cost against the plain-K2 baseline."""
-    from tests.models.qwen3_5.test_amd_mono import _randn
-    from tests.models.qwen4_exp.test_amd_mono import _hc_weights, _moe_weights
-    from vllm.models.qwen3_5.amd.mono_base import _gated_rms_norm
-    from vllm.models.qwen4_exp.amd.mono import k2
-    from vllm.models.qwen4_exp.amd.mono.layout import HC, HD, HH, HIDDEN, Layout
-
-    lay = Layout(TP)
-    gc = torch.Generator(device=device).manual_seed(51)
-    gr = torch.Generator(device=device).manual_seed(510 + rank)
-    core_raw = _randn(gr, s, lay.CORE)
-    z = _randn(gr, s, lay.CORE, scale=2.0)
-    norm_w = (1 + _randn(gr, HD, scale=0.1)).to(bf)
-    state = _randn(gc, s, HH, scale=2.0)
-    inj_a = _randn(gc, s, HC)
-    w_o = _randn(gr, HIDDEN, lay.CORE, scale=0.02)
-    hw = _hc_weights(gc)
-    mw = _moe_weights(rank, device)
-    out = torch.empty(s, HH, dtype=bf, device=device)
-    msq_out = torch.empty(20, s, HC, dtype=torch.float32, device=device)
-
-    key_gn = k2.K2Build(tokens=s, tp=TP, gn=True)
-    scr_gn = torch.zeros(k2.scratch_bytes(key_gn), dtype=torch.uint8, device=device)
-
-    def _k2_gn():
-        epoch.add_(1)
-        k2.layer_post(
-            key_gn,
-            core=core_raw,
-            gate=None,
-            gn_z=z,
-            gn_norm_w=norm_w,
-            state=state,
-            inj_a=inj_a,
-            w_o=w_o,
-            **hw,
-            w_gate=mw["w_gate"],
-            w_sg=mw["w_sg"],
-            w13=mw["w13"],
-            w13s=mw["w13s"],
-            w2=mw["w2"],
-            w2s=mw["w2s"],
-            out=out,
-            msq_out=msq_out,
-            scratch=scr_gn,
-            peers=peers.addresses,
-            rank=rank,
-            epoch=epoch,
-            layer=k2.TAG_SLOTS // 2 + 40,
-        )
-
-    key_plain = k2.K2Build(tokens=s, tp=TP)
-    scr_plain = torch.zeros(
-        k2.scratch_bytes(key_plain), dtype=torch.uint8, device=device
-    )
-    core_normed = torch.empty(s, lay.CORE, dtype=bf, device=device)
-
-    def _gated_norm_then_k2():
-        epoch.add_(1)
-        core_normed.copy_(
-            _gated_rms_norm(
-                core_raw.view(s, lay.NV, HD),
-                z.view(s, lay.NV, HD),
-                norm_w,
-                1e-6,
-                "sigmoid",
-            ).view(s, lay.CORE)
-        )
-        k2.layer_post(
-            key_plain,
-            core=core_normed,
-            gate=None,
-            state=state,
-            inj_a=inj_a,
-            w_o=w_o,
-            **hw,
-            w_gate=mw["w_gate"],
-            w_sg=mw["w_sg"],
-            w13=mw["w13"],
-            w13s=mw["w13s"],
-            w2=mw["w2"],
-            w2s=mw["w2s"],
-            out=out,
-            msq_out=msq_out,
-            scratch=scr_plain,
-            peers=peers.addresses,
-            rank=rank,
-            epoch=epoch,
-            layer=k2.TAG_SLOTS // 2 + 41,
-        )
-
-    cases = (
-        ("K2(gn=True)", _k2_gn),
-        ("_gated_rms_norm + K2(gn=False)", _gated_norm_then_k2),
-    )
-    return [
-        (name, _time_eager(fn, iters), _time_graph(fn, iters)) for name, fn in cases
-    ]
-
-
 # ------------------------------------------------------ 4. K1 proj_only (P1b)
 def bench_k1_proj_gate(s, device, rank, world_size, epoch, iters):
     """P1b: K1's ``proj_only`` build (the HC front + in_proj_qkvz/ba, no GDN
@@ -489,7 +383,6 @@ def main() -> None:
     sections = (
         ("1. K1 gate: gdn_pre vs hc_front", bench_k1_gate, {}),
         ("2. the stock chain the bracket would remove", bench_stock_pieces, {}),
-        ("3. K2 gn (P1a) vs gated norm + K2", bench_k2_gn, {"peers": k2_peers}),
         (
             "4. K1 proj_only (P1b) vs hc_front + stock in_proj",
             bench_k1_proj_gate,
