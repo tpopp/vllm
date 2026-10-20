@@ -35,6 +35,7 @@ from functools import cached_property
 
 import torch
 
+from vllm import envs
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.models.qwen3_5.amd import mono_base as B
