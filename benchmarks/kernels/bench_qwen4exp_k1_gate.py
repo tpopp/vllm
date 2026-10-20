@@ -10,15 +10,21 @@ Triton kernel, the gated RMSNorm), K1's ``proj_only`` build
 (P1b, shipped: the HC front + in_proj_qkvz/ba, no GDN tasks) against
 ``hc_front`` + the stock quant+GEMM / bf16 GEMM / unpack chain it folds in
 (the GDN verify core's conv + gated delta rule are untouched either way,
-left to AITER -- §1 of gather/gdn_verify.md).
+left to AITER -- §1 of gather/gdn_verify.md), and (P3) K1's ``verify``
+build (the GDN verify core -- conv, gated delta rule, gated norm -- also
+in-kernel) against ``proj_only`` chained into the stock calls it still
+needs (``gdn_spec_decode_conv_gdr_aiter`` + ``_gated_rms_norm``): only
+meaningful at S a multiple of ``k1.VERIFY_WINDOW`` (4), i.e. ``--s 4,8``.
 
 Usage:
     torchrun --nproc-per-node 2 benchmarks/kernels/bench_qwen4exp_k1_gate.py \
         [--s 1,2,4,8] [--iters 200]
 
 Decision rule (UTILIZATION_DESIGN.md #1): Delta(gdn_pre - hc_front) at S=4
-<= 8 us builds the full P1b verify variant; >= 20 us kills it. This file is
-authored CPU-only and not run here.
+<= 8 us builds the full P1b verify variant; >= 20 us kills it. Section 5
+(P3) has no such threshold yet; report the eager and graph-replayed
+deltas at S=4 and S=8 for the first real decision. This file is authored
+CPU-only and not run here.
 """
 
 import argparse
@@ -315,6 +321,137 @@ def bench_k1_proj_gate(s, device, rank, world_size, epoch, iters):
     ]
 
 
+# ------------------------------------------------------------- 5. K1 verify
+def bench_k1_verify_gate(s, device, rank, world_size, epoch, iters):
+    """P3: K1's ``verify`` build (the HC front + in_proj + the GDN verify
+    core -- conv, gated delta rule, gated norm -- all in-kernel) against
+    P1b's ``proj_pre`` (the HC front + in_proj alone) chained into the stock
+    verify-core calls it still needs (``gdn_spec_decode_conv_gdr_aiter`` +
+    ``_gated_rms_norm``) -- the pair the task asks to gate P3 by, at this
+    deployment's only verify width (``k1.VERIFY_WINDOW`` tokens/request,
+    ``n_req = s // k1.VERIFY_WINDOW`` live requests, no padding row-group:
+    every request's state read/written, the stock chain's worst case).
+    Only meaningful at ``s`` a multiple of ``k1.VERIFY_WINDOW`` (4): the
+    production verify widths, S=4 (one request) and S=8 (two)."""
+    from tests.models.qwen4_exp.test_amd_mono import _verify_inputs
+    from vllm.model_executor.layers.mamba.ops.gdn_spec_decode_rocm import (
+        gdn_spec_decode_conv_gdr_aiter,
+    )
+    from vllm.models.qwen3_5.amd.mono_base import _gated_rms_norm
+    from vllm.models.qwen4_exp.amd.mono import k1
+    from vllm.models.qwen4_exp.amd.mono.layout import HC, HD, HIDDEN, Layout
+
+    lay = Layout(TP)
+    assert s % k1.VERIFY_WINDOW == 0, "P3 needs a multiple of k1.VERIFY_WINDOW rows"
+    n_req = s // k1.VERIFY_WINDOW
+    w, _, _, _ = _verify_inputs([k1.VERIFY_WINDOW] * n_req, pad_last=False)
+    inj = torch.empty(s, HC, dtype=bf, device=device)
+    qsl = torch.arange(0, s + 1, k1.VERIFY_WINDOW, dtype=torch.int32, device=device)
+
+    key_verify = k1.K1Build(tokens=s, tp=TP, self_msq=True, verify=True)
+    scr_verify = torch.zeros(
+        k1.scratch_bytes(key_verify), dtype=torch.uint8, device=device
+    )
+    v_conv_state, v_rstate = w["conv_state"].clone(), w["rstate"].clone()
+    v_core = torch.empty(s, lay.CORE, dtype=bf, device=device)
+
+    def _k1_verify():
+        epoch.add_(1)
+        k1.verify_pre(
+            key_verify,
+            state=w["state"],
+            msq_in=None,
+            hc_w=w["hc_w"],
+            w_down=w["w_down"],
+            w_up=w["w_up"],
+            inj_out=inj,
+            w_qkvz=w["w_qkvz"],
+            w_qkvzs=w["w_qkvzs"],
+            w_ba=w["w_ba"],
+            conv_w=w["conv_w"],
+            conv_state=v_conv_state,
+            a_log=w["a_log"],
+            dt_bias=w["dt_bias"],
+            norm_w=w["norm_w"],
+            rstate=v_rstate,
+            spec_state_indices=w["spec_state_indices"],
+            num_accepted_tokens=w["num_accepted_tokens"],
+            core=v_core,
+            scratch=scr_verify,
+            epoch=epoch,
+            layer=6,
+        )
+
+    x_bin = torch.empty(s, HIDDEN, dtype=bf, device=device)
+    key_proj = k1.K1Build(tokens=s, tp=TP, self_msq=True, proj_only=True)
+    scr_proj = torch.zeros(
+        k1.scratch_bytes(key_proj), dtype=torch.uint8, device=device
+    )
+    qkvz_out = torch.empty(s, lay.QKVZ, dtype=bf, device=device)
+    ba_out = torch.empty(2, s, lay.NV, dtype=bf, device=device)
+    p_conv_state, p_rstate = w["conv_state"].clone(), w["rstate"].clone()
+    p_core = torch.empty(s, lay.NV, HD, dtype=bf, device=device)
+    qkv_size = 2 * lay.KEY + lay.VAL
+
+    def _proj_plus_stock():
+        epoch.add_(1)
+        k1.proj_pre(
+            key_proj,
+            state=w["state"],
+            msq_in=None,
+            hc_w=w["hc_w"],
+            w_down=w["w_down"],
+            w_up=w["w_up"],
+            inj_out=inj,
+            bin_out=x_bin,
+            w_qkvz=w["w_qkvz"],
+            w_qkvzs=w["w_qkvzs"],
+            w_ba=w["w_ba"],
+            qkvz_out=qkvz_out,
+            ba_out=ba_out,
+            scratch=scr_proj,
+            epoch=epoch,
+            layer=7,
+        )
+        gdn_spec_decode_conv_gdr_aiter(
+            qkv=qkvz_out[:, :qkv_size],
+            b=ba_out[0],
+            a=ba_out[1],
+            core_attn_out=p_core,
+            conv_state=p_conv_state,
+            conv_weights=w["conv_w"].view(lay.CONV, -1),
+            conv_bias=None,
+            activation="silu",
+            A_log=w["a_log"],
+            dt_bias=w["dt_bias"],
+            ssm_state=p_rstate,
+            spec_query_start_loc=qsl,
+            spec_state_indices=w["spec_state_indices"],
+            num_accepted_tokens=w["num_accepted_tokens"],
+            num_spec_decodes=n_req,
+            key_dim=lay.KEY,
+            value_dim=lay.VAL,
+            head_k_dim=HD,
+            head_v_dim=HD,
+            draft_window=k1.VERIFY_WINDOW,
+        )
+        _gated_rms_norm(
+            p_core,
+            qkvz_out[:, qkv_size:].view(s, lay.NV, HD),
+            w["norm_w"],
+            1e-6,
+            "sigmoid",
+        )
+
+    cases = (
+        ("k1.verify_pre (P3: HC front + in_proj + GDN verify core)", _k1_verify),
+        ("proj_pre (P1b) + stock conv_gdr + _gated_rms_norm", _proj_plus_stock),
+    )
+    return [
+        (name, _time_eager(fn, iters), _time_graph(fn, iters)) for name, fn in cases
+    ]
+
+
 # ---------------------------------------------------------------- plumbing
 def setup_distributed():
     if not {"RANK", "WORLD_SIZE", "LOCAL_RANK"} <= os.environ.keys():
@@ -386,6 +523,11 @@ def main() -> None:
         (
             "4. K1 proj_only (P1b) vs hc_front + stock in_proj",
             bench_k1_proj_gate,
+            {},
+        ),
+        (
+            "5. K1 verify (P3) vs proj_only + stock conv_gdr + gated norm",
+            bench_k1_verify_gate,
             {},
         ),
     )
