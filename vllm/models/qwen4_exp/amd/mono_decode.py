@@ -321,7 +321,9 @@ class MonoDecode(B.QwenMonoDecode):
         fixed ``VERIFY_WINDOW``) falls back to P1b's stock-core path."""
         from vllm.models.qwen4_exp.amd.mono import k1
 
-        if not envs.VLLM_ROCM_MONO_K1_VERIFY or s % k1.VERIFY_WINDOW != 0:
+        # one request only: at two (S=8) each CTA runs two task rounds and
+        # the in-kernel core is slower than the stock one (46.6 vs 41.0 us)
+        if not envs.VLLM_ROCM_MONO_K1_VERIFY or s != k1.VERIFY_WINDOW:
             return False
         a = layer.linear_attn
         m = md.get(a.prefix)
