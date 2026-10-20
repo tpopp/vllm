@@ -132,7 +132,8 @@ class K1Build:
     front_only: bool = False  # the HC front alone (a QSA layer)
     proj_only: bool = False  # the HC front + in_proj_qkvz/ba, no GDN tasks
     verify: bool = False  # the HC front + in_proj + the GDN verify core (P3)
-    verify_head: bool = True  # ``verify``'s task layout: one a (request, head)
+    verify_head: bool = False  # ``verify``'s task layout: one a (request, head)
+    verify_pm: bool = True  # chunked verify: phase-major (one hand-off a phase a cycle)
     # (default, no "qk" / "onrm" cross-CTA hand-off), else the original one a
     # (request, head, chunk) layout (``gdn_tasks_verify``), kept selectable
     # for A/B (ignored unless ``verify``).
@@ -321,6 +322,9 @@ def build(key: K1Build):
     nr = -(-task_units(key) * gt // BLOCKS)
     # verify_head's tasks own the whole head (HD wide), not a VCH chunk
     vo_width = HD if (key.verify and key.verify_head) else VCH
+    # phase-major verify: one LDS slot a (round, token)
+    pm = key.verify and not key.verify_head and key.verify_pm
+    nr_lds = nr * (VERIFY_WINDOW if pm else 1)
     nba = ba_tasks(lay)
     need(BA0 + nba <= BLOCKS, "in_proj_ba's CTAs")
     need(lay.QKVZ // ROWS == 2 * BLOCKS, "in_proj_qkvz: two row groups a CTA")
@@ -333,10 +337,10 @@ def build(key: K1Build):
 
     @fx.struct
     class GdnLds:
-        qkl: fx.Array[fx.Float32, nr * 2 * HD, 16]
-        vloc: fx.Array[fx.Float32, nr * vo_width, 16]
-        ol: fx.Array[fx.Float32, nr * vo_width, 16]
-        scal: fx.Array[fx.Float32, nr * 4, 16]
+        qkl: fx.Array[fx.Float32, nr_lds * 2 * HD, 16]
+        vloc: fx.Array[fx.Float32, nr_lds * vo_width, 16]
+        ol: fx.Array[fx.Float32, nr_lds * vo_width, 16]
+        scal: fx.Array[fx.Float32, nr_lds * 4, 16]
 
     @fx.union
     class StageLds:
@@ -353,6 +357,7 @@ def build(key: K1Build):
     name = (
         f"flashnext_mono_k1_s{s}_t{key.tp}_m{int(key.self_msq)}_f{int(key.front_only)}"
         f"_p{int(key.proj_only)}_v{int(key.verify)}_vh{int(key.verify_head)}"
+        f"_pm{int(key.verify_pm)}"
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -415,6 +420,7 @@ def build(key: K1Build):
             "rs": lds.rs.ptr,
             "ll": lds.ll.ptr,
             "xl": xl.xl.ptr,
+            "phase_major": pm,
             "qkl": gl.qkl.ptr,
             "vloc": gl.vloc.ptr,
             "ol": gl.ol.ptr,

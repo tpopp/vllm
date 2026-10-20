@@ -644,10 +644,12 @@ def _verify_reference(w, lay, live_n_req: int, qkvz=None, ba=None):
         ([3, 1], True),
     ],
 )
-@pytest.mark.parametrize("verify_head", [True, False])
+@pytest.mark.parametrize(
+    "verify_head,verify_pm", [(True, False), (False, False), (False, True)]
+)
 @torch.inference_mode()
 def test_k1_verify_matches_stock_spec_decode_chain(
-    accepted: list, pad_last: bool, verify_head: bool
+    accepted: list, pad_last: bool, verify_head: bool, verify_pm: bool
 ) -> None:
     """P3: K1's ``verify`` build against the stock spec-decode chain
     (``causal_conv1d_update`` + FLA's non-AITER
@@ -666,7 +668,8 @@ def test_k1_verify_matches_stock_spec_decode_chain(
     ref = _verify_reference(w, lay, live_n_req)
 
     key = k1.K1Build(
-        tokens=s, tp=TP, self_msq=True, verify=True, verify_head=verify_head
+        tokens=s, tp=TP, self_msq=True, verify=True, verify_head=verify_head,
+        verify_pm=verify_pm,
     )
     conv_state, rstate = w["conv_state"].clone(), w["rstate"].clone()
     core = torch.full((s, lay.CORE), float("nan"), dtype=bf, device="cuda")

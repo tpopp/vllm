@@ -350,7 +350,9 @@ def bench_k1_verify_gate(s, device, rank, world_size, epoch, iters):
 
     # verify_head=True (default): one task a (request, value head), the
     # whole head in one CTA, no "qk" / "onrm" cross-CTA hand-off.
-    key_verify = k1.K1Build(tokens=s, tp=TP, self_msq=True, verify=True)
+    key_verify = k1.K1Build(
+        tokens=s, tp=TP, self_msq=True, verify=True, verify_head=False, verify_pm=False
+    )
     scr_verify = torch.zeros(
         k1.scratch_bytes(key_verify), dtype=torch.uint8, device=device
     )
@@ -448,7 +450,7 @@ def bench_k1_verify_gate(s, device, rank, world_size, epoch, iters):
     # verify_head=False: the original one task a (request, value head,
     # chunk) layout, kept for the A/B this bracket's task asks for.
     key_verify_chunked = k1.K1Build(
-        tokens=s, tp=TP, self_msq=True, verify=True, verify_head=False
+        tokens=s, tp=TP, self_msq=True, verify=True, verify_head=False, verify_pm=True
     )
     scr_verify_chunked = torch.zeros(
         k1.scratch_bytes(key_verify_chunked), dtype=torch.uint8, device=device
@@ -484,9 +486,9 @@ def bench_k1_verify_gate(s, device, rank, world_size, epoch, iters):
         )
 
     cases = (
-        ("k1.verify_pre (P3, verify_head=True: one a (req, head))", _k1_verify),
+        ("k1.verify_pre (P3, chunked, token-major)", _k1_verify),
         (
-            "k1.verify_pre (P3, verify_head=False: one a (req, head, chunk))",
+            "k1.verify_pre (P3, chunked, phase-major)",
             _k1_verify_chunked,
         ),
         ("proj_pre (P1b) + stock conv_gdr + _gated_rms_norm", _proj_plus_stock),

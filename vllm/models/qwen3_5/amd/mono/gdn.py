@@ -840,10 +840,28 @@ def gdn_tasks_verify(c, rounds, n_req, t_tokens):
         lambda cr, k, req, row, h, ch, tok: gdn_recur_verify(cr, k, row, h, ch, tok),
         lambda cr, k, req, row, h, ch, tok: gdn_norm_verify(cr, k, row, h, ch),
     )
-    for tok in range_constexpr(t_tokens):
+    if const_expr(c.get("phase_major", False)):
+        # Phase-major: conv for every token, then gates, then the recurrence,
+        # then the gated norm. Only the recurrence carries state token to
+        # token; conv's outputs (and the norm's sums of squares) cross CTAs
+        # through mailboxes, so ordering by phase pays each hand-off once per
+        # cycle instead of once per token. Each (round, token) has its own LDS
+        # slot (K1 sizes GdnLds for rounds x t_tokens).
+        def tok_cr(cr, r, tok):
+            ct = dict(cr)
+            for name, m in (("qkl", 2 * HD), ("vloc", VCH), ("ol", VCH), ("scal", 4)):
+                ct[name] = c[name] + (r * t_tokens + tok) * m
+            return ct
+
         for phase in phases:
-            for (cr, _, req, h, ch), k in zip(tasks, ks):
-                phase(cr, k, req, req * t_tokens + tok, h, ch, tok)
+            for tok in range_constexpr(t_tokens):
+                for r, ((cr, _, req, h, ch), k) in enumerate(zip(tasks, ks)):
+                    phase(tok_cr(cr, r, tok), k, req, req * t_tokens + tok, h, ch, tok)
+    else:
+        for tok in range_constexpr(t_tokens):
+            for phase in phases:
+                for (cr, _, req, h, ch), k in zip(tasks, ks):
+                    phase(cr, k, req, req * t_tokens + tok, h, ch, tok)
     for (cr, _, req, h, ch), k in zip(tasks, ks):
         gdn_conv_writeback_verify(cr, k)
 
