@@ -35,6 +35,7 @@ from functools import cached_property
 
 import torch
 
+from vllm import envs
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.models.qwen3_5.amd import mono_base as B
@@ -215,6 +216,13 @@ class MonoDecode(B.QwenMonoDecode):
                     s, self.lay.CORE, dtype=state.dtype, device=state.device
                 )
                 self._k1(layer, md, state, msq, inj, core)
+            elif layer.layer_type == "linear_attention" and self._verify_eligible(
+                layer, md, s
+            ):
+                # P3: K1's ``verify`` build, the GDN verify core (conv,
+                # gated delta rule, gated norm) in-kernel -- in place of
+                # P1b's stock AITER conv + gated delta rule call below.
+                core = self._k1_verify(layer, md, state, msq, inj)
             elif layer.layer_type == "linear_attention" and envs.VLLM_ROCM_MONO_K1_PROJ:
                 # P1b: K1's front + in_proj_qkvz/ba in one launch (no GDN
                 # tasks), the stock AITER conv + gated delta rule on their
@@ -302,6 +310,79 @@ class MonoDecode(B.QwenMonoDecode):
             layer=layer.layer_idx,
         )
         return qkvz, ba
+
+    def _verify_eligible(self, layer, md, s: int) -> bool:
+        """P3 (``VLLM_ROCM_MONO_K1_VERIFY``): whether this GDN layer's verify
+        step is a pure, *uniform* spec-decode batch (every live request
+        exactly ``k1.VERIFY_WINDOW`` draft tokens, request-major row order --
+        physical row ``req * VERIFY_WINDOW + t``) K1's ``verify`` build can
+        run end to end. Anything else (mixed prefill/decode/spec rows, a
+        non-uniform draft window, a draft window other than this deployment's
+        fixed ``VERIFY_WINDOW``) falls back to P1b's stock-core path."""
+        from vllm.models.qwen4_exp.amd.mono import k1
+
+        if not envs.VLLM_ROCM_MONO_K1_VERIFY or s % k1.VERIFY_WINDOW != 0:
+            return False
+        a = layer.linear_attn
+        m = md.get(a.prefix)
+        if m is None or not getattr(a, "enable_rocm_spec_fast_path", False):
+            return False
+        if not a._is_pure_spec_decode(m):
+            return False
+        window = a.num_spec + 1
+        n_req = s // k1.VERIFY_WINDOW
+        return (
+            window == k1.VERIFY_WINDOW
+            and getattr(m, "uniform_spec_sequence_length", None) == window
+            and m.num_spec_decodes == n_req
+            and m.spec_state_indices_tensor is not None
+            and m.spec_state_indices_tensor.shape[1] == k1.VERIFY_WINDOW
+            and m.num_accepted_tokens is not None
+        )
+
+    def _k1_verify(self, layer, md, state, msq, inj) -> torch.Tensor:
+        """P3: K1's ``verify`` build -- the GDN verify core in-kernel, in
+        place of P1b's ``_front_proj`` + ``B.gdn_core``'s stock AITER call.
+        Only called when ``_verify_eligible`` has already checked the batch
+        is pure and uniform."""
+        from vllm.models.qwen4_exp.amd.mono import k1
+
+        a = layer.linear_attn
+        hc = layer.attn_hyper_connection
+        m = md[a.prefix]
+        conv_state, rstate = a.kv_cache
+        if not is_conv_state_dim_first():
+            conv_state = conv_state.transpose(-1, -2)
+        s = state.size(0)
+        n_req = s // k1.VERIFY_WINDOW
+        core = torch.empty(s, self.lay.CORE, dtype=state.dtype, device=state.device)
+        k1.verify_pre(
+            k1.K1Build(
+                tokens=s,
+                tp=self.tp,
+                self_msq=msq is None,
+                verify=True,
+                eps=hc.config.rms_norm_eps,
+                norm_eps=a.norm.eps,
+            ),
+            **self._hc_args(hc, state, msq, inj),
+            w_qkvz=a.in_proj_qkvz.weight,
+            w_qkvzs=a.in_proj_qkvz.weight_scale,
+            w_ba=a.in_proj_ba.weight,
+            conv_w=a.conv1d.weight,
+            conv_state=conv_state,
+            a_log=a.A_log,
+            dt_bias=a.dt_bias,
+            norm_w=a.norm.weight,
+            rstate=rstate,
+            spec_state_indices=m.spec_state_indices_tensor[:n_req].contiguous(),
+            num_accepted_tokens=m.num_accepted_tokens[:n_req].contiguous(),
+            core=core,
+            scratch=self.k1_scratch[s],
+            epoch=self.epoch,
+            layer=layer.layer_idx,
+        )
+        return core
 
     def _k1(self, layer, md, state, msq, inj, core) -> None:
         from vllm.models.qwen4_exp.amd.mono import k1
