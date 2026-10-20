@@ -33,6 +33,21 @@ above runs them, their bf16 rows going straight to ``qkvz_out`` / ``ba_out``
 instead of the GDN tasks (not run here: a verify step still needs the stock
 AITER conv + gated delta rule for the per-draft-token state rollback K1's
 decode recurrence does not do, ``gather/gdn_verify.md`` §2.4).
+
+``qsa_proj`` (P2, ``VLLM_ROCM_MONO_K1_QSA_PROJ``): a QSA layer's K1, the HC
+front plus the QSA attention's two input GEMVs -- ``attn.qkv_proj`` (``lay.QKV``
+bf16 rows) and the indexer's ``index_qk_proj`` (``L.IDXQK`` bf16 rows,
+replicated) against the just-produced block input, straight to ``qkv_out`` /
+``idx_out`` -- so the verify step's two skinny BF16 GEMMs after this launch
+(``mono_decode._qsa_core``'s ``attn.qkv_proj`` / ``indexer.index_qk_proj``) are
+no longer needed; ``qsa_prepare``, top-k and sparse attention stay separate
+launches on ``qkv_out`` / ``idx_out``. Both weight streams are BF16 and far
+bigger than in_proj_qkvz's MXFP4 one (35.6 MiB combined), so, unlike
+``qkvz_loads``, only round 0 of ``qkv_proj`` (one row group a CTA) and
+``index_qk_proj``'s (CTAs 0 .. ``idx_tasks``) are issued at kernel entry; the
+second ``qkv_proj`` round (CTAs needing two row groups, ``lay.QKV`` having
+more than ``BLOCKS`` of them) is issued only after round 0's load has been
+consumed, to keep the two BF16 streams' VGPRs from overlapping.
 """
 
 from dataclasses import dataclass
@@ -45,6 +60,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int32, Int64
 
 from vllm.models.kimi_k3.amd.mono.common.ops import (
+    CM_DEV,
     bf16_pair,
     bf16_round,
     row_sum,
@@ -95,6 +111,7 @@ class K1Build:
     self_msq: bool = False  # the state's sums of squares computed here
     front_only: bool = False  # the HC front alone (a QSA layer)
     proj_only: bool = False  # the HC front + in_proj_qkvz/ba, no GDN tasks
+    qsa_proj: bool = False  # the HC front + qkv_proj/index_qk_proj (a QSA layer)
     eps: float = 1e-6  # the HC norm
     norm_eps: float = 1e-6  # the GDN gated norm
 
@@ -128,6 +145,10 @@ ABI = KernelAbi(
         "layer",
         "qkvz_out",
         "ba_out",
+        "w_qkv",
+        "w_idx",
+        "qkv_out",
+        "idx_out",
     )
 )
 
@@ -145,7 +166,8 @@ def scratch_layout(key: K1Build) -> dict:
     s = key.tokens
     lay = L.Layout(key.tp)
     pairs = hc.regions(s)
-    if not key.front_only:
+    gdn_layer = not key.front_only and not key.qsa_proj
+    if gdn_layer:
         pairs = pairs | {"bapart": ba_tasks(lay) * s * ROWS}
         if not key.proj_only:
             # proj_only stores in_proj_qkvz straight to ``qkvz_out``: no GDN
@@ -157,6 +179,9 @@ def scratch_layout(key: K1Build) -> dict:
             }
     out = pair_layout(pairs.items())
     if not key.front_only:
+        # proj_only, qsa_proj and the full decode build all read the block
+        # input back in-launch (``hc.bin_to_lds``), so all three need the
+        # scratch copy -- a QSA layer has none of the GDN regions above.
         end = (max(o + n for o, n in out.values()) + 15) // 16 * 16
         out["bin"] = (end, hc.bin_bytes(s))
     return out
@@ -226,6 +251,64 @@ def store_ba_out(c):
         bo.buffer_store(a.to(fx.BFloat16), rsrc(c["ba_out"]), (s + t) * lay.NV + h)
 
 
+# ---------------------------------------------------------------- qsa_proj
+@traced
+def _store_qsa_row(c, rg, valid, ops, out, nrows):
+    """Row group ``rg`` (16 of ``out``'s ``nrows`` output columns, clamped
+    into range by the caller) against the block input already in ``c["xl"]``
+    (``hc.bin_to_lds``): bf16(x @ w[rg]^T), the same GEMV ``stage_qkvz`` runs
+    for in_proj_qkvz (bf16, not FP4) -- stored only while ``valid`` (a CTA
+    past the real task count still runs the GEMV, just discards it, rather
+    than branch around it) -> ``out`` [S, nrows] bf16, device scope."""
+    s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
+    acc = gemv.mfmas(lane, wave, c["xl"], XROW, H, s, ops)
+    fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
+    gpu.barrier()
+    if tid < (ROWS // 2) * s:
+        rp = tid % (ROWS // 2)
+        tt = tid // (ROWS // 2)
+        v0 = bf16_round(row_sum(red, 2 * rp, tt))
+        v1 = bf16_round(row_sum(red, 2 * rp + 1, tt))
+        if valid:
+            bo.buffer_store(
+                bf16_pair(v0, v1).bitcast(fx.Int32),
+                rsrc(out),
+                (tt * nrows + rg * ROWS + 2 * rp) // 2,
+                cache_modifier=CM_DEV,
+            )
+    gpu.barrier()
+
+
+@traced
+def stage_qsa_proj(
+    c, qkv_rg0, qkv_ops0, idx_rg, idx_ops, idx_tasks, qkv_rounds, qkv_tasks
+):
+    """``K1Build.qsa_proj``: round 0's ``qkv_proj`` row group (every CTA,
+    always real: ``qkv_tasks >= BLOCKS``) and ``index_qk_proj``'s (CTAs <
+    ``idx_tasks``, else a harmlessly discarded clamped GEMV), both loaded at
+    kernel entry -> ``qkv_out`` / ``idx_out``. If ``qkv_proj`` has more row
+    groups than CTAs (``qkv_rounds > 1``), round 1's load is issued only now
+    -- after round 0's is consumed -- so the two concurrent BF16 weight loads
+    never overlap round 0's, within the VGPR budget round 0 + ``index_qk_proj``
+    already uses."""
+    lay, bid = c["lay"], c["bid"]
+    _store_qsa_row(c, qkv_rg0, True, qkv_ops0, c["qkv_out"], lay.QKV)
+    _store_qsa_row(c, idx_rg, bid < idx_tasks, idx_ops, c["idx_out"], L.IDXQK)
+    if const_expr(qkv_rounds > 1):
+        rg1_raw = bid + BLOCKS
+        rg1 = fx.min(rg1_raw, qkv_tasks - 1)
+        ops1 = gemv.loads(c["lane"], c["wave"], c["args"]["w_qkv"], rg1 * ROWS, H)
+        _store_qsa_row(c, rg1, rg1_raw < qkv_tasks, ops1, c["qkv_out"], lay.QKV)
+
+
+def qkv_tasks_of(lay):
+    return lay.QKV // ROWS
+
+
+def idx_tasks_of():
+    return L.IDXQK // ROWS
+
+
 # ---------------------------------------------------------------- kernel
 def _put_inj(c, t, r, vs):
     """The injection rows r, r + 1 of token t -> ``inj_out`` [S, HC] bf16."""
@@ -244,7 +327,10 @@ def build(key: K1Build):
         return _BUILDS[key]
     s = key.tokens
     need(1 <= s <= L.MAX_TOKENS, f"{s} rows, the kernels take 1..{L.MAX_TOKENS}")
-    need(not (key.front_only and key.proj_only), "front_only and proj_only")
+    need(
+        sum((key.front_only, key.proj_only, key.qsa_proj)) <= 1,
+        "front_only, proj_only and qsa_proj are mutually exclusive",
+    )
     lay = L.Layout(key.tp)
     scr = scratch_layout(key)
     gt = gdn_tasks_of(lay)
@@ -253,6 +339,13 @@ def build(key: K1Build):
     need(BA0 + nba <= BLOCKS, "in_proj_ba's CTAs")
     need(lay.QKVZ // ROWS == 2 * BLOCKS, "in_proj_qkvz: two row groups a CTA")
     need(H % (BA_PARTS * gemv.KCH) == 0, "in_proj_ba's K halves")
+    need(lay.QKV % ROWS == 0, "qkv_proj rows, a whole number of 16-row tasks")
+    need(L.IDXQK % ROWS == 0, "index_qk_proj rows, a whole number of 16-row tasks")
+    qkv_tasks = qkv_tasks_of(lay)
+    idx_tasks = idx_tasks_of()
+    qkv_rounds = -(-qkv_tasks // BLOCKS)
+    need(qkv_tasks >= BLOCKS, "qkv_proj: round 0 covers every CTA")
+    need(idx_tasks <= BLOCKS, "index_qk_proj: one round covers it")
     xwords = s * (max(H, hc.DK) + gemv.LDS_PAD) // 2
 
     @fx.struct
@@ -280,7 +373,7 @@ def build(key: K1Build):
     keyed = key_tuple(key, digest())
     name = (
         f"flashnext_mono_k1_s{s}_t{key.tp}_m{int(key.self_msq)}_f{int(key.front_only)}"
-        f"_p{int(key.proj_only)}"
+        f"_p{int(key.proj_only)}_q{int(key.qsa_proj)}"
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -312,6 +405,10 @@ def build(key: K1Build):
         layer: Int32,
         qkvz_out: Int64,
         ba_out: Int64,
+        w_qkv: Int64,
+        w_idx: Int64,
+        qkv_out: Int64,
+        idx_out: Int64,
     ):
         _ = keyed
         tid = fx.thread_idx.x
@@ -362,14 +459,19 @@ def build(key: K1Build):
                 "rs_seq": rs_seq,
                 "st_idx": st_idx,
                 "core": core,
+                "w_qkv": w_qkv,
+                "w_idx": w_idx,
             },
         }
-        if const_expr(not key.front_only):
+        gdn_layer = not key.front_only and not key.qsa_proj
+        if const_expr(gdn_layer):
             regions = ("bapart",) if key.proj_only else ("proj", "qk", "onrm", "bapart")
             for region in regions:
                 c[region] = sreg(scratch, scr[region][0], region)
             c["qkvz_out"] = qkvz_out if key.proj_only else None
             c["ba_out"] = ba_out if key.proj_only else None
+        c["qkv_out"] = qkv_out if key.qsa_proj else None
+        c["idx_out"] = idx_out if key.qsa_proj else None
         c["hc"] = {
             "state": state,
             "state_cm": 0,
@@ -382,13 +484,18 @@ def build(key: K1Build):
             "lora": sreg(scratch, scr["lora"][0], "lora"),
             "binf": None if key.front_only else sreg(scratch, scr["binf"][0], "binf"),
             "bin": bin_out if key.front_only else scratch + fx.Int64(scr["bin"][0]),
-            "bin_out": bin_out if key.proj_only else None,
+            "bin_out": bin_out if (key.proj_only or key.qsa_proj) else None,
             "inj_out": lambda t, r, vs: _put_inj(c, t, r, vs),
         }
         # ---- the HC front: a CTA's whole sequence in one branch, its weights
-        # (and its in_proj_qkvz ones) in flight first
-        if const_expr(not key.front_only):
+        # (in_proj_qkvz's, or qsa_proj's round-0 qkv_proj / full index_qk_proj
+        # ones) in flight first
+        if const_expr(gdn_layer):
             qops = [qkvz_loads(c, bid + BLOCKS * j) for j in range(2)]
+        if const_expr(key.qsa_proj):
+            qkv_ops0 = gemv.loads(c["lane"], c["wave"], w_qkv, bid * ROWS, H)
+            idx_rg = fx.min(bid, idx_tasks - 1)
+            idx_ops = gemv.loads(c["lane"], c["wave"], w_idx, idx_rg * ROWS, H)
         if const_expr(key.self_msq):  # noqa: SIM102 (traced: `and` does not combine traced values)
             if bid < hc.NRED:
                 hc.stage_msq(c, bid)
@@ -407,6 +514,19 @@ def build(key: K1Build):
                 dops = hc.down_loads(c, bid - D0)
                 hc.load_rrms(c)
                 hc.stage_down(c, bid - D0, dops)
+        elif const_expr(key.qsa_proj):
+            if bid >= hc.UP_TASKS:
+                dops = hc.down_loads(c, bid - D0)
+                hc.load_rrms(c)
+                hc.stage_down(c, bid - D0, dops)
+            # ---- qkv_proj / index_qk_proj against the block input, round 0's
+            # (and index_qk_proj's) loads already in flight at kernel entry;
+            # round 1's qkv_proj load (if any) is issued only now, inside
+            # ``stage_qsa_proj``, after round 0's is consumed
+            hc.bin_to_lds(c, XROW)
+            stage_qsa_proj(
+                c, bid, qkv_ops0, idx_rg, idx_ops, idx_tasks, qkv_rounds, qkv_tasks
+            )
         else:
             is_ba = (bid >= BA0) & (bid < BA0 + nba)
             if is_ba:
@@ -462,6 +582,10 @@ def build(key: K1Build):
         layer: Int32,
         qkvz_out: Int64,
         ba_out: Int64,
+        w_qkv: Int64,
+        w_idx: Int64,
+        qkv_out: Int64,
+        idx_out: Int64,
         stream: fx.Stream = _STREAM,
     ):
         _ = keyed
@@ -493,6 +617,10 @@ def build(key: K1Build):
             layer,
             qkvz_out,
             ba_out,
+            w_qkv,
+            w_idx,
+            qkv_out,
+            idx_out,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     ABI.check(k1, launch)
@@ -660,6 +788,10 @@ def gdn_pre(
         "layer": layer,
         "qkvz_out": 0,
         "ba_out": 0,
+        "w_qkv": 0,
+        "w_idx": 0,
+        "qkv_out": 0,
+        "idx_out": 0,
     }
     build(key)(*ABI.pack(vals), stream=torch.cuda.current_stream())
 
@@ -739,6 +871,81 @@ def proj_pre(
         "w_ba": w_ba.data_ptr(),
         "qkvz_out": qkvz_out.data_ptr(),
         "ba_out": ba_out.data_ptr(),
+        "scratch": scratch.data_ptr(),
+        "epoch": epoch.data_ptr(),
+        "layer": layer,
+    }
+    build(key)(*ABI.pack(vals), stream=torch.cuda.current_stream())
+
+
+def qsa_proj_pre(
+    key: K1Build,
+    *,
+    state,
+    msq_in,
+    hc_w,
+    w_down,
+    w_up,
+    inj_out,
+    bin_out,
+    w_qkv,
+    w_idx,
+    qkv_out,
+    idx_out,
+    scratch,
+    epoch,
+    layer,
+):
+    """Host launcher of a QSA layer's K1 ``qsa_proj`` build (P2,
+    ``VLLM_ROCM_MONO_K1_QSA_PROJ``): ``hc_front``'s ``bin_out`` [S, H] /
+    ``inj_out`` [S, 4], plus ``attn.qkv_proj``'s bf16 output -> ``qkv_out``
+    [S, lay.QKV] and the indexer's ``index_qk_proj``'s -> ``idx_out``
+    [S, L.IDXQK], the same values/rounding ``F.linear`` on the HC front's
+    ``x`` produces. ``qsa_prepare``, top-k and sparse attention stay a
+    separate launch on these two tensors, via
+    ``mono_decode._qsa_core``'s ``qkv`` / ``idx_qk`` kwargs."""
+    s = key.tokens
+    lay = L.Layout(key.tp)
+    bf = torch.bfloat16
+    need(key.qsa_proj, "qsa_proj_pre takes a qsa_proj build")
+    _hc_checks(key, s, state, msq_in, hc_w, w_down, w_up, inj_out)
+    need(
+        bin_out.shape == (s, H)
+        and bin_out.dtype == bf
+        and bin_out.is_contiguous(),
+        "bin_out: bf16 [S, H]",
+    )
+    need(
+        w_qkv.shape == (lay.QKV, H) and w_qkv.dtype == bf,
+        f"qkv_proj: bf16 [{lay.QKV}, {H}]",
+    )
+    need(
+        w_idx.shape == (L.IDXQK, H) and w_idx.dtype == bf,
+        f"index_qk_proj: bf16 [{L.IDXQK}, {H}]",
+    )
+    need(
+        qkv_out.shape == (s, lay.QKV) and qkv_out.dtype == bf,
+        f"qkv_out: bf16 [S, {lay.QKV}]",
+    )
+    need(
+        idx_out.shape == (s, L.IDXQK) and idx_out.dtype == bf,
+        f"idx_out: bf16 [S, {L.IDXQK}]",
+    )
+    dense = (w_qkv, w_idx, qkv_out, idx_out)
+    need(all(t.is_contiguous() for t in dense), "a non-contiguous QSA input")
+    vals = dict.fromkeys(ABI.names, 0)
+    vals |= {
+        "state": state.data_ptr(),
+        "msq_in": 0 if msq_in is None else msq_in.data_ptr(),
+        "hc_w": hc_w.data_ptr(),
+        "w_down": w_down.data_ptr(),
+        "w_up": w_up.data_ptr(),
+        "inj_out": inj_out.data_ptr(),
+        "bin_out": bin_out.data_ptr(),
+        "w_qkv": w_qkv.data_ptr(),
+        "w_idx": w_idx.data_ptr(),
+        "qkv_out": qkv_out.data_ptr(),
+        "idx_out": idx_out.data_ptr(),
         "scratch": scratch.data_ptr(),
         "epoch": epoch.data_ptr(),
         "layer": layer,

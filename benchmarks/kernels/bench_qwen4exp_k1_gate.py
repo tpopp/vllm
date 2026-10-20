@@ -7,11 +7,14 @@ UTILIZATION_DESIGN.md #1): graph-replayed timing of K1's full decode build
 the production TP=2 shapes, plus the stock op chain that build would replace
 (in_proj_qkvz's quant + ASM FP4 GEMM, in_proj_ba's bf16 GEMM, the unpack
 Triton kernel, the gated RMSNorm), K2's ``gn`` variant (P1a) against K2 +
-the separate gated-norm launch it replaces, and K1's ``proj_only`` build
+the separate gated-norm launch it replaces, K1's ``proj_only`` build
 (P1b, shipped: the HC front + in_proj_qkvz/ba, no GDN tasks) against
 ``hc_front`` + the stock quant+GEMM / bf16 GEMM / unpack chain it folds in
 (the GDN verify core's conv + gated delta rule are untouched either way,
-left to AITER -- §1 of gather/gdn_verify.md).
+left to AITER -- §1 of gather/gdn_verify.md), and K1's ``qsa_proj`` build
+(P2: the HC front + ``qkv_proj`` / ``index_qk_proj``) against ``hc_front``
++ the two stock skinny BF16 GEMMs it folds in (``qsa_prepare``, top-k and
+sparse attention are untouched either way -- gather/qsa_front.md).
 
 Usage:
     torchrun --nproc-per-node 2 benchmarks/kernels/bench_qwen4exp_k1_gate.py \
@@ -421,6 +424,82 @@ def bench_k1_proj_gate(s, device, rank, world_size, epoch, iters):
     ]
 
 
+# ------------------------------------------------------ 5. K1 qsa_proj (P2)
+def bench_k1_qsa_proj_gate(s, device, rank, world_size, epoch, iters):
+    """P2: K1's ``qsa_proj`` build (the HC front + ``qkv_proj`` /
+    ``index_qk_proj``) against ``hc_front`` + the two stock skinny BF16 GEMMs
+    a verify step runs today in its place (``attn.qkv_proj``, the indexer's
+    ``index_qk_proj``) -- ``hc_front``'s own x feeding both stock GEMMs,
+    graph-replayed."""
+    from tests.models.qwen4_exp.test_amd_mono import _qsa_proj_inputs
+    from vllm.models.qwen4_exp.amd.mono import k1
+    from vllm.models.qwen4_exp.amd.mono.layout import HC, HIDDEN, IDXQK, Layout
+
+    lay = Layout(TP)
+    w = _qsa_proj_inputs(s)
+    inj = torch.empty(s, HC, dtype=bf, device=device)
+    x_bin = torch.empty(s, HIDDEN, dtype=bf, device=device)
+
+    key_qsa = k1.K1Build(tokens=s, tp=TP, self_msq=True, qsa_proj=True)
+    scr_qsa = torch.zeros(
+        k1.scratch_bytes(key_qsa), dtype=torch.uint8, device=device
+    )
+    qkv_out = torch.empty(s, lay.QKV, dtype=bf, device=device)
+    idx_out = torch.empty(s, IDXQK, dtype=bf, device=device)
+
+    def _k1_qsa():
+        epoch.add_(1)
+        k1.qsa_proj_pre(
+            key_qsa,
+            state=w["state"],
+            msq_in=None,
+            hc_w=w["hc_w"],
+            w_down=w["w_down"],
+            w_up=w["w_up"],
+            inj_out=inj,
+            bin_out=x_bin,
+            w_qkv=w["w_qkv"],
+            w_idx=w["w_idx"],
+            qkv_out=qkv_out,
+            idx_out=idx_out,
+            scratch=scr_qsa,
+            epoch=epoch,
+            layer=4,
+        )
+
+    key_front = k1.K1Build(tokens=s, tp=TP, self_msq=True, front_only=True)
+    scr_front = torch.zeros(
+        k1.scratch_bytes(key_front), dtype=torch.uint8, device=device
+    )
+
+    def _front_plus_stock():
+        epoch.add_(1)
+        k1.hc_front(
+            key_front,
+            state=w["state"],
+            msq_in=None,
+            hc_w=w["hc_w"],
+            w_down=w["w_down"],
+            w_up=w["w_up"],
+            inj_out=inj,
+            bin_out=x_bin,
+            scratch=scr_front,
+            epoch=epoch,
+            layer=5,
+        )
+        qkv_ref = F.linear(x_bin, w["w_qkv"])
+        idx_ref = F.linear(x_bin, w["w_idx"])
+        del qkv_ref, idx_ref
+
+    cases = (
+        ("k1.qsa_proj_pre (P2: HC front + qkv_proj/index_qk_proj)", _k1_qsa),
+        ("hc_front + 2 F.linear (qkv_proj + index_qk_proj)", _front_plus_stock),
+    )
+    return [
+        (name, _time_eager(fn, iters), _time_graph(fn, iters)) for name, fn in cases
+    ]
+
+
 # ---------------------------------------------------------------- plumbing
 def setup_distributed():
     if not {"RANK", "WORLD_SIZE", "LOCAL_RANK"} <= os.environ.keys():
@@ -493,6 +572,11 @@ def main() -> None:
         (
             "4. K1 proj_only (P1b) vs hc_front + stock in_proj",
             bench_k1_proj_gate,
+            {},
+        ),
+        (
+            "5. K1 qsa_proj (P2) vs hc_front + 2 F.linear",
+            bench_k1_qsa_proj_gate,
             {},
         ),
     )

@@ -122,17 +122,28 @@ class MonoDecode(B.QwenMonoDecode):
         from vllm.models.qwen4_exp.amd.mono import k1, k2
 
         def k1_bytes(s):
-            # (front_only, proj_only): the only two True together with the
-            # decode build (both False) the width's scratch must also fit.
-            variants = ((False, False), (False, True), (True, False))
+            # (front_only, proj_only, qsa_proj): at most one True together
+            # with the decode build (all False) the width's scratch must
+            # also fit.
+            variants = (
+                (False, False, False),
+                (False, True, False),
+                (True, False, False),
+                (False, False, True),
+            )
             return max(
                 k1.scratch_bytes(
                     k1.K1Build(
-                        tokens=s, tp=self.tp, self_msq=m, front_only=f, proj_only=p
+                        tokens=s,
+                        tp=self.tp,
+                        self_msq=m,
+                        front_only=f,
+                        proj_only=p,
+                        qsa_proj=q,
                     )
                 )
                 for m in (False, True)
-                for f, p in variants
+                for f, p, q in variants
             )
 
         def k2_bytes(s):
@@ -233,6 +244,19 @@ class MonoDecode(B.QwenMonoDecode):
                     gn_norm_w, gn_eps = norm.weight, norm.eps
                 else:
                     core = B.gdn_core(a, qkvz=qkvz, ba2=ba)
+            elif (
+                layer.layer_type != "linear_attention"
+                and envs.VLLM_ROCM_MONO_K1_QSA_PROJ
+            ):
+                # P2: K1's front + qkv_proj/index_qk_proj in one launch, the
+                # stock qsa_prepare / top-k / sparse attention on their output
+                # directly in place of the two separate skinny BF16 GEMM
+                # launches the else branch's ``_qsa_core`` runs.
+                x = torch.empty(s, L.HIDDEN, dtype=state.dtype, device=state.device)
+                qkv, idx_qk = self._front_qsa_proj(layer, state, msq, inj, x)
+                core, gate = _qsa_core(
+                    layer.self_attn, x, positions, qkv=qkv, idx_qk=idx_qk
+                )
             else:
                 x = torch.empty(s, L.HIDDEN, dtype=state.dtype, device=state.device)
                 self._front(layer, state, msq, inj, x)
@@ -318,6 +342,41 @@ class MonoDecode(B.QwenMonoDecode):
             layer=layer.layer_idx,
         )
         return qkvz, ba
+
+    def _front_qsa_proj(
+        self, layer, state, msq, inj, x
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """P2 (``VLLM_ROCM_MONO_K1_QSA_PROJ``): K1's ``qsa_proj`` build -> (x
+        in-place, as ``_front``) plus ``attn.qkv_proj``'s / the indexer's
+        ``index_qk_proj``'s bf16 output, for ``_qsa_core``'s ``qkv`` /
+        ``idx_qk``."""
+        from vllm.models.qwen4_exp.amd.mono import k1
+
+        a = layer.self_attn
+        hc = layer.attn_hyper_connection
+        s = state.size(0)
+        lay = self.lay
+        qkv = torch.empty(s, lay.QKV, dtype=state.dtype, device=state.device)
+        idx_qk = torch.empty(s, L.IDXQK, dtype=state.dtype, device=state.device)
+        k1.qsa_proj_pre(
+            k1.K1Build(
+                tokens=s,
+                tp=self.tp,
+                self_msq=msq is None,
+                qsa_proj=True,
+                eps=hc.config.rms_norm_eps,
+            ),
+            **self._hc_args(hc, state, msq, inj),
+            bin_out=x,
+            w_qkv=a.qkv_proj.weight,
+            w_idx=a.indexer.index_qk_proj.weight,
+            qkv_out=qkv,
+            idx_out=idx_qk,
+            scratch=self.k1_scratch[s],
+            epoch=self.epoch,
+            layer=layer.layer_idx,
+        )
+        return qkv, idx_qk
 
     def _k1(self, layer, md, state, msq, inj, core) -> None:
         from vllm.models.qwen4_exp.amd.mono import k1
@@ -414,12 +473,24 @@ class MonoDecode(B.QwenMonoDecode):
         return out, msq
 
 
-def _qsa_core(attn, x, positions) -> tuple[torch.Tensor, torch.Tensor | None]:
+def _qsa_core(
+    attn, x, positions, *, qkv=None, idx_qk=None
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     """``Qwen4ExpQSAAttention.forward`` up to the output gate (K2 applies it to
-    o_proj's input) -> (attention output [S, heads HD], gate or None)."""
+    o_proj's input) -> (attention output [S, heads HD], gate or None).
+
+    ``qkv`` / ``idx_qk`` (P2, ``VLLM_ROCM_MONO_K1_QSA_PROJ``): a caller that
+    already ran ``attn.qkv_proj`` / ``indexer.index_qk_proj`` (K1's
+    ``qsa_proj`` build) passes their outputs here instead of letting this
+    function call the projections itself; None (the default) is the stock
+    path, bit-identical to before. ``idx_qk`` only reaches the indexer when
+    ``attn.use_fused_qsa_prepare`` (the only path with a precomputed-
+    projection short-circuit); it is otherwise unused -- the rest of the QSA
+    core stays stock either way."""
     from vllm.models.qwen4_exp.amd import qsa
 
-    qkv, _ = attn.qkv_proj(x)
+    if qkv is None:
+        qkv, _ = attn.qkv_proj(x)
     n = x.shape[0]
     name = qsa._encode_layer_name(attn.layer_name)
     if attn.use_fused_qsa_prepare:
@@ -427,10 +498,12 @@ def _qsa_core(attn, x, positions) -> tuple[torch.Tensor, torch.Tensor | None]:
         gate = torch.empty_like(out)
         if current_platform.opaque_attention_op():
             torch.ops.vllm.qwen4_exp_qsa_prepare_with_output(
-                x, positions, qkv, out, gate, name
+                x, positions, qkv, out, gate, name, idx_qk
             )
         else:
-            qsa.qwen4_exp_qsa_prepare_with_output(x, positions, qkv, out, gate, name)
+            qsa.qwen4_exp_qsa_prepare_with_output(
+                x, positions, qkv, out, gate, name, idx_qk
+            )
         return out.view(n, -1), gate.view(n, -1)
     q, k, v, gate = attn._project_qkv_gate(qkv, positions)
     query = q.view(n, attn.num_heads, attn.head_dim)
