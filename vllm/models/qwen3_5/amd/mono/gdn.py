@@ -553,6 +553,34 @@ def gdn_norm(c, k, t, h, ch):
     gpu.barrier()
 
 
+@traced
+def gdn_norm_verify(c, k, t, h, ch):
+    """Rows 16 ch ..: (verify: a duplicate task stores nothing) RMSNormGated over the head's 128 (every chunk's partial):
+    bf16(o rstd w gate(z)) -> ``core``, the gate the model's ``z_gate``."""
+    tid = c["tid"]
+    a, g = c["args"], c["gdn"]
+    tl = k["tl"]
+    if tid < VCH:
+        vr = ch * VCH + tid
+        z0 = 2 * g.nk * HD + g.nv * HD
+        got = c["poll"](
+            [(c["onrm"], (t * g.nv + h) * NVCH + q, 1) for q in range(NVCH)]
+            + [(c["proj"], t * g.proj + z0 + h * HD + vr, 1)]
+        )
+        ss = f32_of(got[0][0])
+        for q in range_constexpr(1, NVCH):
+            ss = ss + f32_of(got[q][0])
+        r = hw_rsq(ss * fx.Float32(1.0 / HD) + fx.Float32(c["norm_eps"]))
+        y = fx.ptr_load(c["ol"] + tid) * r * ld_bf(a["norm_w"], vr)
+        y = y * c["z_gate"](f32_of(got[NVCH][0]))
+        y = (k["slot"] > 0).select(y, fx.Float32(0.0))
+        if tl:
+            bo.buffer_store(
+                y.to(fx.BFloat16), rsrc(a["core"]), t * (g.nv * HD) + h * HD + vr
+            )
+    gpu.barrier()
+
+
 def gdn_offset(key) -> int:
     """The first GDN CTA: past the front CTAs (whose in_proj weights go out
     late) and short of the two-task in_proj ones, if a single round fits."""
@@ -629,7 +657,7 @@ def gdn_round_verify(c, r, n_req):
 
 
 @traced
-def gdn_stage_verify(c, req, h, ch, t_tokens):
+def gdn_stage_verify(c, req, h, ch, t_tokens, tl):
     """A verify task's per-request setup, read once (no per-token hand-off):
     the conv-state slot (``spec_state_indices[req, 0]``), the checkpoint
     recurrent-state slot (``spec_state_indices[req, num_accepted[req] - 1]``),
@@ -649,7 +677,11 @@ def gdn_stage_verify(c, req, h, ch, t_tokens):
     accepted = uniform(ld_i32w(a["num_accepted"], req))
     offset = fx.max(accepted - 1, 0)
     ssm_src = uniform(ld_i32w(idx_base, offset))
-    live = (conv_slot > 0) & (ssm_src > 0)
+    # tl: this CTA really owns the task this round (else it runs a clamped
+    # duplicate with every global side effect masked, so no value it carries
+    # from token to token crosses a dynamic-if region)
+    live = (conv_slot > 0) & (ssm_src > 0) & tl
+    k["tl"] = tl
     k["live"] = live
     k["slot"] = live.select(fx.Int32(1), fx.Int32(0))
     k["idx_base"] = idx_base
@@ -695,15 +727,20 @@ def gdn_conv_verify(c, k, req, h, ch, row):
     tid = c["tid"]
     a, g = c["args"], c["gdn"]
     part, owner = k["part"], k["owner"]
-    if tid < 3 * VCH:
-        x = f32_of(c["poll"]([(c["proj"], row * g.proj + k["chan"], 1)])[0][0])
-        w, win = k["cw"], k["win"]
-        acc = bf16_round(w[0] * win[0]) + bf16_round(w[1] * win[1])
-        acc = acc + bf16_round(w[2] * win[2])
-        acc = acc + bf16_round(w[3] * x)
-        o = bf16_round(silu(acc))
-        k["win"] = [win[1], win[2], x]
-        k["raw"].append(x)
+    # every thread computes (``k['chan']`` is clamped into range), so the
+    # window / raw-sample updates are outside any dynamic branch (the AST
+    # rewriter cannot carry a list that grows inside one); only the stores
+    # are gated to the real channels
+    x = f32_of(c["poll"]([(c["proj"], row * g.proj + k["chan"], 1)])[0][0])
+    w, win = k["cw"], k["win"]
+    acc = bf16_round(w[0] * win[0]) + bf16_round(w[1] * win[1])
+    acc = acc + bf16_round(w[2] * win[2])
+    acc = acc + bf16_round(w[3] * x)
+    o = bf16_round(silu(acc))
+    k["win"] = [win[1], win[2], x]
+    k["raw"].append(x)
+    tl = k["tl"]
+    if (tid < 3 * VCH) & tl:
         if (part < 2) & owner:
             kh = h // (g.nv // g.nk)
             at = ((row * g.nk + kh) * 2 + part) * HD + ch * VCH + k["i"]
@@ -747,7 +784,8 @@ def gdn_recur_verify(c, k, row, h, ch, tok):
     if lane % 32 == 0:
         fx.ptr_store(o, c["ol"] + v)
     gpu.barrier()
-    if tid == 0:
+    tl = k["tl"]
+    if (tid == 0) & tl:
         ss = fx.Float32(0.0)
         for e in range_constexpr(VCH):
             x = fx.ptr_load(c["ol"] + e)
@@ -788,21 +826,22 @@ def gdn_tasks_verify(c, rounds, n_req, t_tokens):
     from one token to the next in ``ks``, and the conv-state write-back
     happens once, after the last token."""
     tasks = [gdn_round_verify(c, r, n_req) for r in range(rounds)]
-    ks = [gdn_stage_verify(cr, req, h, ch, t_tokens) for cr, _, req, h, ch in tasks]
+    ks = [
+        gdn_stage_verify(cr, req, h, ch, t_tokens, live)
+        for cr, live, req, h, ch in tasks
+    ]
     phases = (
         lambda cr, k, req, row, h, ch, tok: gdn_conv_verify(cr, k, req, h, ch, row),
         lambda cr, k, req, row, h, ch, tok: gdn_gates(cr, k, row, h),
         lambda cr, k, req, row, h, ch, tok: gdn_recur_verify(cr, k, row, h, ch, tok),
-        lambda cr, k, req, row, h, ch, tok: gdn_norm(cr, k, row, h, ch),
+        lambda cr, k, req, row, h, ch, tok: gdn_norm_verify(cr, k, row, h, ch),
     )
     for tok in range_constexpr(t_tokens):
         for phase in phases:
-            for (cr, live, req, h, ch), k in zip(tasks, ks):
-                if live:
-                    phase(cr, k, req, req * t_tokens + tok, h, ch, tok)
-    for (cr, live, req, h, ch), k in zip(tasks, ks):
-        if live:
-            gdn_conv_writeback_verify(cr, k)
+            for (cr, _, req, h, ch), k in zip(tasks, ks):
+                phase(cr, k, req, req * t_tokens + tok, h, ch, tok)
+    for (cr, _, req, h, ch), k in zip(tasks, ks):
+        gdn_conv_writeback_verify(cr, k)
 
 
 # ---------------------------------------------------------------- kernel

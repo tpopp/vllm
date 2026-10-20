@@ -586,7 +586,7 @@ def _verify_reference(w, lay, live_n_req: int, qkvz=None, ba=None):
     mixed_qkv = causal_conv1d_update(
         mixed_qkv.clone(),
         conv_state,
-        w["conv_w"],
+        w["conv_w"].view(w["conv_w"].size(0), w["conv_w"].size(2)),
         None,
         "silu",
         conv_state_indices=idx[:, 0],
