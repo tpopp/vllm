@@ -35,6 +35,7 @@ from functools import cached_property
 
 import torch
 
+from vllm import envs
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.models.qwen3_5.amd import mono_base as B
@@ -121,12 +122,17 @@ class MonoDecode(B.QwenMonoDecode):
         from vllm.models.qwen4_exp.amd.mono import k1, k2
 
         def k1_bytes(s):
+            # (front_only, proj_only): the only two True together with the
+            # decode build (both False) the width's scratch must also fit.
+            variants = ((False, False), (False, True), (True, False))
             return max(
                 k1.scratch_bytes(
-                    k1.K1Build(tokens=s, tp=self.tp, self_msq=m, front_only=f)
+                    k1.K1Build(
+                        tokens=s, tp=self.tp, self_msq=m, front_only=f, proj_only=p
+                    )
                 )
                 for m in (False, True)
-                for f in (False, True)
+                for f, p in variants
             )
 
         def k2_bytes(s):
@@ -205,19 +211,43 @@ class MonoDecode(B.QwenMonoDecode):
                 msq = None
             inj = torch.empty(s, L.HC, dtype=state.dtype, device=state.device)
             gate = None
+            gn_z = None
+            gn_norm_w = None
+            gn_eps = 1e-6
             if layer.layer_type == "linear_attention" and not self.spec:
                 core = torch.empty(
                     s, self.lay.CORE, dtype=state.dtype, device=state.device
                 )
                 self._k1(layer, md, state, msq, inj, core)
+            elif layer.layer_type == "linear_attention" and envs.VLLM_ROCM_MONO_K1_PROJ:
+                # P1b: K1's front + in_proj_qkvz/ba in one launch (no GDN
+                # tasks), the stock AITER conv + gated delta rule on their
+                # output directly in place of the separate quant+GEMM / bf16
+                # GEMM / unpack launches the else branch's ``gdn_core`` runs.
+                a = layer.linear_attn
+                x = torch.empty(s, L.HIDDEN, dtype=state.dtype, device=state.device)
+                qkvz, ba = self._front_proj(layer, state, msq, inj, x)
+                if envs.VLLM_ROCM_MONO_K2_GATED_NORM:
+                    core, gn_z = B.gdn_core_ungated(a, qkvz=qkvz, ba2=ba)
+                    norm = a.norm
+                    gn_norm_w, gn_eps = norm.weight, norm.eps
+                else:
+                    core = B.gdn_core(a, qkvz=qkvz, ba2=ba)
             else:
                 x = torch.empty(s, L.HIDDEN, dtype=state.dtype, device=state.device)
                 self._front(layer, state, msq, inj, x)
                 if layer.layer_type == "linear_attention":
-                    core = B.gdn_core(layer.linear_attn, x)
+                    if envs.VLLM_ROCM_MONO_K2_GATED_NORM:
+                        core, gn_z = B.gdn_core_ungated(layer.linear_attn, x)
+                        norm = layer.linear_attn.norm
+                        gn_norm_w, gn_eps = norm.weight, norm.eps
+                    else:
+                        core = B.gdn_core(layer.linear_attn, x)
                 else:
                     core, gate = _qsa_core(layer.self_attn, x, positions)
-            state, msq = self._k2(layer, core, gate, state, inj)
+            state, msq = self._k2(
+                layer, core, gate, state, inj, gn_z, gn_norm_w, gn_eps
+            )
         if model._mtp_hidden_buffer is not None:
             # the drafter's input: the multi-stream state before the final mixer
             model._mtp_hidden_buffer[:s].copy_(state)
@@ -254,6 +284,41 @@ class MonoDecode(B.QwenMonoDecode):
             layer=layer.layer_idx,
         )
 
+    def _front_proj(
+        self, layer, state, msq, inj, x
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """P1b (``VLLM_ROCM_MONO_K1_PROJ``): K1's ``proj_only`` build -> (x
+        in-place, as ``_front``) plus in_proj_qkvz's / in_proj_ba's bf16
+        output, for ``B.gdn_core``/``gdn_core_ungated``'s ``qkvz``/``ba``."""
+        from vllm.models.qwen4_exp.amd.mono import k1
+
+        a = layer.linear_attn
+        hc = layer.attn_hyper_connection
+        s = state.size(0)
+        lay = self.lay
+        qkvz = torch.empty(s, lay.QKVZ, dtype=state.dtype, device=state.device)
+        ba = torch.empty(2, s, lay.NV, dtype=state.dtype, device=state.device)
+        k1.proj_pre(
+            k1.K1Build(
+                tokens=s,
+                tp=self.tp,
+                self_msq=msq is None,
+                proj_only=True,
+                eps=hc.config.rms_norm_eps,
+            ),
+            **self._hc_args(hc, state, msq, inj),
+            bin_out=x,
+            w_qkvz=a.in_proj_qkvz.weight,
+            w_qkvzs=a.in_proj_qkvz.weight_scale,
+            w_ba=a.in_proj_ba.weight,
+            qkvz_out=qkvz,
+            ba_out=ba,
+            scratch=self.k1_scratch[s],
+            epoch=self.epoch,
+            layer=layer.layer_idx,
+        )
+        return qkvz, ba
+
     def _k1(self, layer, md, state, msq, inj, core) -> None:
         from vllm.models.qwen4_exp.amd.mono import k1
 
@@ -289,7 +354,17 @@ class MonoDecode(B.QwenMonoDecode):
             layer=layer.layer_idx,
         )
 
-    def _k2(self, layer, core, gate, state, inj) -> tuple[torch.Tensor, torch.Tensor]:
+    def _k2(
+        self,
+        layer,
+        core,
+        gate,
+        state,
+        inj,
+        gn_z=None,
+        gn_norm_w=None,
+        gn_eps=1e-6,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         from vllm.models.qwen4_exp.amd.mono import hc as mhc
         from vllm.models.qwen4_exp.amd.mono import k2
 
@@ -308,9 +383,13 @@ class MonoDecode(B.QwenMonoDecode):
                 eps=hc.config.rms_norm_eps,
                 oq=oq,
                 og=gate is not None,
+                gn=gn_z is not None,
+                gn_eps=gn_eps,
             ),
             core=core,
             gate=gate,
+            gn_z=gn_z,
+            gn_norm_w=gn_norm_w,
             state=state,
             inj_a=inj,
             w_o=o.weight,

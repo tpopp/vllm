@@ -401,6 +401,98 @@ def test_k1_matches_vllm_ops(s: int, n_real: int, self_msq: bool) -> None:
     torch.testing.assert_close(conv_state[0], w["conv_state"][0], atol=0, rtol=0)
 
 
+# ---------------------------------------------------------------- K1 proj_only
+@pytest.mark.parametrize("s", [1, 4, 8])
+@torch.inference_mode()
+def test_k1_proj_only_matches_hc_front_and_stock_in_proj(s: int) -> None:
+    """P1b: K1's ``proj_only`` build (the HC front + in_proj_qkvz/ba, no GDN
+    tasks) against ``hc_front`` (``x`` / ``inj_out`` must be bitwise equal:
+    the same HC-stage code either way, just a different ``bin_out`` store
+    alongside the scratch one) and the stock in_proj chain ``proj_only``
+    folds in: ``qkvz_out`` against the real stock MXFP4 GEMM
+    (``_mxfp4_linear_stock``, as ``test_k1_matches_vllm_ops`` checks the
+    decode build's own in_proj against) and the dequantized reference;
+    ``ba_out`` against the stock bf16 ``F.linear``."""
+    from vllm.models.qwen4_exp.amd.mono import k1
+    from vllm.models.qwen4_exp.amd.mono.layout import HC, HIDDEN, Layout
+
+    lay = Layout(TP)
+    w = _gdn_inputs(s, s)  # every row live: proj_only doesn't read st_idx
+
+    key_front = k1.K1Build(tokens=s, tp=TP, self_msq=True, front_only=True)
+    x_front = torch.full((s, HIDDEN), float("nan"), dtype=bf, device="cuda")
+    inj_front = torch.full((s, HC), float("nan"), dtype=bf, device="cuda")
+    scr_front = torch.zeros(
+        k1.scratch_bytes(key_front), dtype=torch.uint8, device="cuda"
+    )
+    k1.hc_front(
+        key_front,
+        state=w["state"],
+        msq_in=None,
+        hc_w=w["hc_w"],
+        w_down=w["w_down"],
+        w_up=w["w_up"],
+        inj_out=inj_front,
+        bin_out=x_front,
+        scratch=scr_front,
+        epoch=torch.ones(1, dtype=torch.int32, device="cuda"),
+        layer=0,
+    )
+
+    key_proj = k1.K1Build(tokens=s, tp=TP, self_msq=True, proj_only=True)
+    x_proj = torch.full((s, HIDDEN), float("nan"), dtype=bf, device="cuda")
+    inj_proj = torch.full((s, HC), float("nan"), dtype=bf, device="cuda")
+    qkvz_out = torch.full((s, lay.QKVZ), float("nan"), dtype=bf, device="cuda")
+    ba_out = torch.full((2, s, lay.NV), float("nan"), dtype=bf, device="cuda")
+    scr_proj = torch.zeros(k1.scratch_bytes(key_proj), dtype=torch.uint8, device="cuda")
+    k1.proj_pre(
+        key_proj,
+        state=w["state"],
+        msq_in=None,
+        hc_w=w["hc_w"],
+        w_down=w["w_down"],
+        w_up=w["w_up"],
+        inj_out=inj_proj,
+        bin_out=x_proj,
+        w_qkvz=w["w_qkvz"],
+        w_qkvzs=w["w_qkvzs"],
+        w_ba=w["w_ba"],
+        qkvz_out=qkvz_out,
+        ba_out=ba_out,
+        scratch=scr_proj,
+        epoch=torch.ones(1, dtype=torch.int32, device="cuda"),
+        layer=1,
+    )
+    torch.accelerator.synchronize()
+
+    # x / inj_out: the same HC-stage code as hc_front, on the same inputs
+    assert torch.equal(x_proj, x_front)
+    assert torch.equal(inj_proj, inj_front)
+
+    # qkvz_out: the real stock MXFP4 GEMM (loose, hardware-rounding bound,
+    # as test_k1_matches_vllm_ops's own "stock" check uses) and the
+    # dequantized reference (tight, matching the decode K1 in_proj check)
+    stock = _mxfp4_linear_stock(x_proj, w["w_qkvz"], w["w_qkvzs"])
+    assert _cos(qkvz_out, stock) > STOCK_COS_MIN
+    want_qkvz = F.linear(_mxfp4_qdq(x_proj).to(bf), w["w_qkvz_ref"])
+    assert _cos(qkvz_out, want_qkvz) > COS_MIN
+    qkvz_diff = (qkvz_out.float() - want_qkvz.float()).abs()
+    qkvz_ulp = (qkvz_diff / _bf16_ulp(want_qkvz).clamp_min(1e-30)).max().item()
+    print(f"\nqkvz_out vs dequant reference: max {qkvz_ulp:.2f} bf16 ulp")
+    assert qkvz_ulp <= 4.0, qkvz_ulp
+
+    # ba_out: the stock bf16 F.linear (loose, as the decode build's own
+    # in_proj_ba check is: a K-split summed in a different order)
+    want_ba = F.linear(x_proj, w["w_ba"])
+    want_ba = torch.stack((want_ba[:, : lay.NV], want_ba[:, lay.NV :]))
+    assert _cos(ba_out, want_ba) > COS_MIN
+    ba_ulp = (
+        (ba_out.float() - want_ba.float()).abs() / _bf16_ulp(want_ba).clamp_min(1e-30)
+    ).max().item()
+    print(f"ba_out vs F.linear: max {ba_ulp:.2f} bf16 ulp")
+    assert ba_ulp <= 4.0, ba_ulp
+
+
 # ---------------------------------------------------------------- K2
 def _pad_halves(x, ri, rip, fill):
     """[ne, 2 ri, ...] [gate; up] rows -> [ne, 2 rip, ...], each half padded."""
@@ -601,6 +693,148 @@ K2_MODES: tuple[dict[str, bool], ...] = ({"oq": True}, {"og": True})
 @multi_gpu_test(num_gpus=2)
 def test_k2_tp2_matches_vllm_ops(monkeypatch: pytest.MonkeyPatch) -> None:
     multi_process_parallel(monkeypatch, 2, 1, _k2_worker)
+
+
+# ---------------------------------------------------------------- K2 gn
+@ray.remote(num_gpus=1, max_calls=1)
+def _k2_gn_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    tp_size: int,
+    pp_size: int,
+    rank: int,
+    distributed_init_port: str,
+) -> None:
+    """K2's ``gn`` (the GDN gated norm folded into o_proj's input staging) on
+    random un-normed core/z against K2 with no ``gn``, fed the same inputs
+    pre-normed by ``RMSNormGated.forward_static`` on the host: the two must
+    reach the same o_proj input, and so (everything past it being the same
+    deterministic pipeline on the same weights/state) the same step output."""
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    device = torch.device(f"cuda:{rank}")
+    torch.accelerator.set_device_index(device)
+    init_test_distributed_environment(tp_size, pp_size, rank, distributed_init_port)
+
+    from vllm.distributed import get_tp_group
+    from vllm.model_executor.layers.layernorm import RMSNormGated
+    from vllm.models.kimi_k3.amd.mono.common.peer_memory import PeerBuffer
+    from vllm.models.qwen4_exp.amd.mono import k2
+    from vllm.models.qwen4_exp.amd.mono.layout import (
+        HC,
+        HD,
+        HH,
+        HIDDEN,
+        MAX_TOKENS,
+        Layout,
+    )
+
+    lay = Layout(TP)
+    tp = get_tp_group()
+    peers = PeerBuffer(
+        k2.peer_bytes(MAX_TOKENS, TP), tp.cpu_group, rank, tp_size, device
+    )
+    peers.bytes.zero_()
+    epoch = torch.zeros(1, dtype=torch.int32, device=device)
+    mw = _moe_weights(rank, device)
+    gc = torch.Generator(device=device).manual_seed(61)
+    hw = _hc_weights(gc)
+    w_o = _randn(
+        torch.Generator(device=device).manual_seed(610 + rank),
+        HIDDEN,
+        lay.CORE,
+        scale=0.02,
+    )
+    eps = 1e-6
+    layer_slot = [0]
+
+    def run(key, core_in, state_in, inj_a_in, gn_z_in, gn_norm_w_in):
+        layer_slot[0] += 1
+        epoch.add_(1)
+        s = core_in.size(0)
+        scratch = torch.zeros(k2.scratch_bytes(key), dtype=torch.uint8, device=device)
+        out = torch.full((s, HH), float("nan"), dtype=bf, device=device)
+        msq = torch.full((20, s, HC), float("nan"), device=device)
+        k2.layer_post(
+            key,
+            core=core_in,
+            gate=None,
+            gn_z=gn_z_in,
+            gn_norm_w=gn_norm_w_in,
+            state=state_in,
+            inj_a=inj_a_in,
+            w_o=w_o,
+            w_os=None,
+            **hw,
+            w_gate=mw["w_gate"],
+            w_sg=mw["w_sg"],
+            w13=mw["w13"],
+            w13s=mw["w13s"],
+            w2=mw["w2"],
+            w2s=mw["w2s"],
+            out=out,
+            msq_out=msq,
+            scratch=scratch,
+            peers=peers.addresses,
+            rank=rank,
+            epoch=epoch,
+            layer=layer_slot[0],
+        )
+        torch.accelerator.synchronize()
+        scr = k2.scratch_layout(key)
+        off, n = scr["state1"]
+        state1 = scratch[off : off + n].view(bf).view(s, HH).clone()
+        return out, msq, state1
+
+    max_ulp = 0.0
+    for s in (1, 4, 8):
+        gr = torch.Generator(device=device).manual_seed(620 + rank + s)
+        core = _randn(gr, s, lay.CORE)
+        z = _randn(gr, s, lay.CORE, scale=2.0)
+        norm_w = (1 + _randn(gr, HD, scale=0.1)).to(bf)
+        state = _randn(gc, s, HH, scale=2.0)
+        inj_a = _randn(gc, s, HC)
+
+        key_gn = k2.K2Build(tokens=s, tp=TP, gn=True, gn_eps=eps)
+        out_gn, msq_gn, state1_gn = run(key_gn, core, state.clone(), inj_a, z, norm_w)
+
+        core_normed = RMSNormGated.forward_static(
+            core.view(s, lay.NV, HD),
+            z.view(s, lay.NV, HD),
+            norm_w,
+            eps,
+            bf,
+            activation="sigmoid",
+        ).view(s, lay.CORE)
+        key_plain = k2.K2Build(tokens=s, tp=TP)
+        out_plain, msq_plain, state1_plain = run(
+            key_plain, core_normed, state.clone(), inj_a, None, None
+        )
+
+        # state1 (the attention combine's output, before any MoE routing): the
+        # layer most directly downstream of o_proj's input, so the tightest
+        # signal that ``gn``'s gated norm matches ``_gated_rms_norm``'s.
+        if not torch.equal(state1_gn, state1_plain):
+            ulp = _bf16_ulp(state1_plain)
+            diff = (state1_gn.float() - state1_plain.float()).abs()
+            rel = (diff / ulp.clamp_min(1e-30)).max().item()
+            max_ulp = max(max_ulp, rel)
+            assert rel <= 2.0, (s, "state1 ulp", rel)
+        # out / msq_out: a loose end-to-end sanity check only -- a borderline
+        # MoE routing decision can flip on a sub-ulp difference upstream and
+        # swing the final combine far more than ``state1``'s own tolerance.
+        assert _cos(out_gn, out_plain) > STOCK_COS_MIN, (s, "out cosine")
+        assert torch.allclose(msq_gn, msq_plain, rtol=1e-2, atol=1e-2), (s, "msq_out")
+    peers.close()
+    print(f"K2 gn vs K2 + _gated_rms_norm: max {max_ulp:.2f} bf16 ulp (rank {rank})")
+
+
+@multi_gpu_test(num_gpus=2)
+def test_k2_gn_matches_gated_rms_norm(monkeypatch: pytest.MonkeyPatch) -> None:
+    """K2's ``gn`` variant (GDN gated norm fused into o_proj input staging) on
+    un-normed core/z equals K2 fed ``_gated_rms_norm``'s output directly, at
+    S 1/4/8, TP2: bitwise if the kernel's rsqrt/mul order matches, else within
+    a couple of bf16 ulp of the reference (the kernel's ``hw_rsq`` is ~1 ulp,
+    not an exact rsqrt)."""
+    multi_process_parallel(monkeypatch, 2, 1, _k2_gn_worker)
 
 
 # ---------------------------------------------------------------- replay

@@ -102,20 +102,29 @@ def dense_error(i: int, dense: dict[str, torch.Tensor]) -> str | None:
     return None
 
 
-def gdn_core(attn, x) -> torch.Tensor:
-    """``QwenGatedDeltaNetAttention.forward_hip`` up to out_proj's input: the
-    input projections, AITER's conv + gated delta rule (vLLM's spec-decode
-    path on verify steps) and the gated norm -> [S, heads HD]."""
+def _gdn_core_raw(
+    attn, x=None, *, qkvz=None, ba=None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``QwenGatedDeltaNetAttention.forward_hip`` up to (not including) the
+    gated norm: the input projections and AITER's conv + gated delta rule
+    (vLLM's spec-decode path on verify steps) -> (core, z), [S, heads, HD].
+
+    ``qkvz`` / ``ba`` (``VLLM_ROCM_MONO_K1_PROJ``): K1's ``proj_only`` build
+    already produced in_proj_qkvz's / in_proj_ba's bf16 output; skip
+    ``attn.in_proj_qkvz(x)`` / ``attn.in_proj_ba(x)`` and hand them to the
+    same custom op the stock projections would feed."""
     from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
         _encode_layer_name,
     )
 
-    n = x.size(0)
-    qkvz, _ = attn.in_proj_qkvz(x)
-    ba, _ = attn.in_proj_ba(x)
+    if qkvz is None:
+        qkvz, _ = attn.in_proj_qkvz(x)
+    if ba is None:
+        ba, _ = attn.in_proj_ba(x)
+    n = qkvz.size(0)
     shape = (n, attn.num_v_heads // attn.tp_size, attn.head_v_dim)
-    core = torch.empty(shape, dtype=x.dtype, device=x.device)
-    z = torch.empty(shape, dtype=qkvz.dtype, device=x.device)
+    core = torch.empty(shape, dtype=qkvz.dtype, device=qkvz.device)
+    z = torch.empty(shape, dtype=qkvz.dtype, device=qkvz.device)
     torch.ops.vllm.qwen_gdn_attention_core(
         qkvz.view(n, -1),
         ba.view(n, -1),
@@ -124,8 +133,90 @@ def gdn_core(attn, x) -> torch.Tensor:
         layer_name=_encode_layer_name(attn.prefix),
         use_aiter=True,
     )
+    return core, z
+
+
+def _gdn_core_planar(attn, qkvz, ba2) -> tuple[torch.Tensor, torch.Tensor]:
+    """``_gdn_core_raw`` for K1 ``proj_only``'s outputs: ``qkvz`` [S, QKVZ]
+    and ``ba2`` [2, S, NV] (contiguous b and a planes). On a pure spec-decode
+    batch this calls the stock conv + AITER gated delta rule directly on them
+    (what ``gdn_spec_decode_packed_aiter`` does after its unpack launch, which
+    is not needed: b / a are already contiguous and z is read in place);
+    anything else goes through the stock custom op on an interleaved copy."""
+    from vllm.forward_context import get_forward_context
+    from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
+    from vllm.model_executor.layers.mamba.ops.gdn_spec_decode_rocm import (
+        gdn_spec_decode_conv_gdr_aiter,
+    )
+
+    md = get_forward_context().attn_metadata
+    md = md.get(attn.prefix) if isinstance(md, dict) else None
+    if (
+        md is None
+        or not getattr(attn, "enable_rocm_spec_fast_path", False)
+        or not attn._is_pure_spec_decode(md)
+    ):
+        return _gdn_core_raw(attn, qkvz=qkvz, ba=torch.cat((ba2[0], ba2[1]), dim=-1))
+    n = qkvz.size(0)
+    nv, hd = attn.num_v_heads // attn.tp_size, attn.head_v_dim
+    key_dim, value_dim = attn.key_dim // attn.tp_size, attn.value_dim // attn.tp_size
+    qkv_size = 2 * key_dim + value_dim
+    core = torch.empty(n, nv, hd, dtype=qkvz.dtype, device=qkvz.device)
+    if md.num_actual_tokens < n:
+        core[md.num_actual_tokens :].zero_()
+    draft_window = attn.num_spec + 1
+    if md.uniform_spec_sequence_length != draft_window:
+        draft_window = None
+    w = attn.conv1d.weight
+    gdn_spec_decode_conv_gdr_aiter(
+        qkv=qkvz[: md.num_actual_tokens, :qkv_size],
+        b=ba2[0],
+        a=ba2[1],
+        core_attn_out=core,
+        conv_state=attn.kv_cache[0]
+        if is_conv_state_dim_first()
+        else attn.kv_cache[0].transpose(-1, -2),
+        conv_weights=w.view(w.size(0), w.size(2)),
+        conv_bias=attn.conv1d.bias,
+        activation=attn.activation,
+        A_log=attn.A_log,
+        dt_bias=attn.dt_bias,
+        ssm_state=attn.kv_cache[1],
+        spec_query_start_loc=md.spec_query_start_loc,
+        spec_state_indices=md.spec_state_indices_tensor,
+        num_accepted_tokens=md.num_accepted_tokens,
+        num_spec_decodes=md.num_spec_decodes,
+        key_dim=key_dim,
+        value_dim=value_dim,
+        head_k_dim=attn.head_k_dim,
+        head_v_dim=hd,
+        draft_window=draft_window,
+    )
+    return core, qkvz[:, qkv_size:].view(n, nv, hd)
+
+
+def gdn_core(attn, x=None, *, qkvz=None, ba=None, ba2=None) -> torch.Tensor:
+    """``_gdn_core_raw`` then the gated norm -> out_proj's input, [S, heads HD]."""
+    if ba2 is not None:
+        core, z = _gdn_core_planar(attn, qkvz, ba2)
+    else:
+        core, z = _gdn_core_raw(attn, x, qkvz=qkvz, ba=ba)
     norm = attn.norm
     return _gated_rms_norm(core, z, norm.weight, norm.eps, norm.activation).flatten(-2)
+
+
+def gdn_core_ungated(
+    attn, x=None, *, qkvz=None, ba=None, ba2=None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Like ``gdn_core`` but stops short of the gated norm
+    (``VLLM_ROCM_MONO_K2_GATED_NORM``): K2's ``gn`` variant applies
+    ``RMSNormGated`` while staging o_proj's input instead, folding this
+    launch into K2 -> (core, z), both [S, heads HD]."""
+    if ba2 is not None:
+        core, z = _gdn_core_planar(attn, qkvz, ba2)
+    else:
+        core, z = _gdn_core_raw(attn, x, qkvz=qkvz, ba=ba)
+    return core.flatten(-2), z.flatten(-2)
 
 
 @torch.compile(dynamic=True, backend=current_platform.simple_compile_backend)

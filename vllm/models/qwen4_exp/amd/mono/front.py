@@ -389,6 +389,7 @@ def build(key: FrontBuild):
             "lora": sreg(scratch, scr["lora"][0], "lora"),
             "binf": None,
             "bin": bin_out,
+            "bin_out": None,
             "inj_out": lambda t, r, vs: _put_inj(c, t, r, vs),
         }
         # ---- F1 (norms) + F2 (fc projections), CTAs 0 .. 159 double as F1's

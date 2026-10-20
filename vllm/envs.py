@@ -156,6 +156,8 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: bool = False
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_MONO_DECODE: bool = False
+    VLLM_ROCM_MONO_K2_GATED_NORM: bool = False
+    VLLM_ROCM_MONO_K1_PROJ: bool = False
     VLLM_ROCM_MONO_DRAFT: bool = False
     VLLM_ROCM_MONO_DRAFT_FRONT: bool = True
     VLLM_ROCM_MONO_DRAFT_HEAD: bool = True
@@ -1399,6 +1401,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (DeepSeek-V4.1 on CDNA4). By default is disabled.
     "VLLM_ROCM_MONO_DECODE": lambda: (
         os.getenv("VLLM_ROCM_MONO_DECODE", "False").lower() in ("true", "1")
+    ),
+    # With VLLM_ROCM_MONO_DECODE, a GDN verify step's K2 applies the gated
+    # RMSNorm (RMSNormGated) while staging o_proj's input, so the verify
+    # step's K1 front skips its own gated-norm launch. By default is disabled.
+    "VLLM_ROCM_MONO_K2_GATED_NORM": lambda: (
+        os.getenv("VLLM_ROCM_MONO_K2_GATED_NORM", "0").lower() in ("true", "1")
+    ),
+    # With VLLM_ROCM_MONO_DECODE, a GDN verify step's K1 front also runs
+    # in_proj_qkvz / in_proj_ba (K1Build.proj_only) and hands their bf16
+    # output to the stock conv + gated delta rule call directly, skipping
+    # the separate quant+GEMM / bf16 GEMM / unpack launches. By default is
+    # disabled.
+    "VLLM_ROCM_MONO_K1_PROJ": lambda: (
+        os.getenv("VLLM_ROCM_MONO_K1_PROJ", "0").lower() in ("true", "1")
     ),
     # Run the eligible MTP draft step (the single draft layer's QSA attention,
     # HC and sparse MoE) on the mono kernels. By default is disabled.
