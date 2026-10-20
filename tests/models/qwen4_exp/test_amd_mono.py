@@ -644,16 +644,19 @@ def _verify_reference(w, lay, live_n_req: int, qkvz=None, ba=None):
         ([3, 1], True),
     ],
 )
+@pytest.mark.parametrize("verify_head", [True, False])
 @torch.inference_mode()
 def test_k1_verify_matches_stock_spec_decode_chain(
-    accepted: list, pad_last: bool
+    accepted: list, pad_last: bool, verify_head: bool
 ) -> None:
     """P3: K1's ``verify`` build against the stock spec-decode chain
     (``causal_conv1d_update`` + FLA's non-AITER
     ``fused_sigmoid_gating_delta_rule_update`` + ``RMSNormGated``) that a
     pure, uniform verify step runs today (P1b / ``B._gdn_core_planar``),
     across ``n_req in {1, 2}``, every accepted-count in ``1..VERIFY_WINDOW``,
-    and a whole padding request (``pad_last``)."""
+    a whole padding request (``pad_last``), and both task layouts
+    (``verify_head``: one a (request, value head), the default, vs. one a
+    (request, value head, chunk))."""
     from vllm.models.qwen4_exp.amd.mono import k1
     from vllm.models.qwen4_exp.amd.mono.layout import HC, HIDDEN
 
@@ -662,7 +665,9 @@ def test_k1_verify_matches_stock_spec_decode_chain(
     live_s = live_n_req * k1.VERIFY_WINDOW
     ref = _verify_reference(w, lay, live_n_req)
 
-    key = k1.K1Build(tokens=s, tp=TP, self_msq=True, verify=True)
+    key = k1.K1Build(
+        tokens=s, tp=TP, self_msq=True, verify=True, verify_head=verify_head
+    )
     conv_state, rstate = w["conv_state"].clone(), w["rstate"].clone()
     core = torch.full((s, lay.CORE), float("nan"), dtype=bf, device="cuda")
     inj = torch.full((s, HC), float("nan"), dtype=bf, device="cuda")

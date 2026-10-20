@@ -37,13 +37,17 @@ decode recurrence does not do, ``gather/gdn_verify.md`` §2.4).
 ``verify`` (P3, ``VLLM_ROCM_MONO_K1_VERIFY``): a GDN verify step's K1,
 in-kernel end to end -- the HC front, in_proj_qkvz/ba as ``proj_only`` runs
 them (into the "proj" mailbox, not ``qkvz_out``), then the GDN tasks' own
-verify variant (``qwen3_5.amd.mono.gdn``'s ``gdn_tasks_verify``): one task a
-(request, value head, chunk), not a (token row, value head, chunk) -- a
-request's whole ``VERIFY_WINDOW`` (num_spec + 1) verify tokens run through
-conv / gates / recurrence / norm token by token, conv-window and recurrent
-state carried in registers from one token to the next, each token's state
-snapshot written to its own ``spec_state_indices`` column. Replaces the
-stock AITER conv + gated delta rule call ``proj_only`` still needs (P1b,
+verify variant: a request's whole ``VERIFY_WINDOW`` (num_spec + 1) verify
+tokens run through conv / gates / recurrence / norm token by token, conv-
+window and recurrent state carried in registers from one token to the
+next, each token's state snapshot written to its own ``spec_state_indices``
+column. ``K1Build.verify_head`` (default on) picks the task layout: one a
+(request, value head), the whole 128 x 128 head in one CTA
+(``qwen3_5.amd.mono.gdn``'s ``gdn_tasks_verify_head`` -- no cross-CTA "qk"
+/ "onrm" hand-off, q / k conv redone redundantly per value head instead);
+off, one a (request, value head, chunk) of 16 state rows
+(``gdn_tasks_verify``, kept for A/B). Either way this replaces the stock
+AITER conv + gated delta rule call ``proj_only`` still needs (P1b,
 ``B.gdn_core``'s ``_gdn_core_planar``) with K1's own math; only usable on a
 *uniform* spec-decode batch (every live request exactly ``VERIFY_WINDOW``
 tokens, request-major row order) -- ``mono_decode`` falls back to P1b
@@ -77,7 +81,13 @@ from vllm.models.kimi_k3.amd.mono.common.plan import (
 from vllm.models.kimi_k3.amd.mono.common.sync import Mailbox, sreg
 from vllm.models.kimi_k3.amd.mono.stages import gemv
 from vllm.models.qwen3_5.amd.mono import gdn as G
-from vllm.models.qwen3_5.amd.mono.gdn import NVCH, VCH, gdn_tasks, gdn_tasks_verify
+from vllm.models.qwen3_5.amd.mono.gdn import (
+    NVCH,
+    VCH,
+    gdn_tasks,
+    gdn_tasks_verify,
+    gdn_tasks_verify_head,
+)
 from vllm.models.qwen3_5.amd.mono.moe import (
     fp4_gemv,
     fp4_gemv_loads,
@@ -122,6 +132,10 @@ class K1Build:
     front_only: bool = False  # the HC front alone (a QSA layer)
     proj_only: bool = False  # the HC front + in_proj_qkvz/ba, no GDN tasks
     verify: bool = False  # the HC front + in_proj + the GDN verify core (P3)
+    verify_head: bool = True  # ``verify``'s task layout: one a (request, head)
+    # (default, no "qk" / "onrm" cross-CTA hand-off), else the original one a
+    # (request, head, chunk) layout (``gdn_tasks_verify``), kept selectable
+    # for A/B (ignored unless ``verify``).
     eps: float = 1e-6  # the HC norm
     norm_eps: float = 1e-6  # the GDN gated norm
 
@@ -165,8 +179,12 @@ def ba_tasks(lay):
     return lay.BA // ROWS * BA_PARTS
 
 
-def gdn_tasks_of(lay):
-    """GDN tasks a token (decode) or a request (verify)."""
+def gdn_tasks_of(lay, key: K1Build | None = None):
+    """GDN tasks a token (decode), a (request, head) pair (``verify_head``),
+    or a (request, head, chunk) triple (decode's layout, or the chunked
+    ``verify`` A/B build)."""
+    if key is not None and key.verify and key.verify_head:
+        return lay.NV
     return lay.NV * NVCH
 
 
@@ -220,7 +238,7 @@ def f32_of(w):
 
 def gdn_offset(key: K1Build) -> int:
     """The first GDN CTA: the high (down only) CTAs while a single round fits."""
-    n = task_units(key) * gdn_tasks_of(L.Layout(key.tp))
+    n = task_units(key) * gdn_tasks_of(L.Layout(key.tp), key)
     return BLOCKS - n if n < BLOCKS else 0
 
 
@@ -299,8 +317,10 @@ def build(key: K1Build):
     n_req = req_count(key) if key.verify else 0
     lay = L.Layout(key.tp)
     scr = scratch_layout(key)
-    gt = gdn_tasks_of(lay)
+    gt = gdn_tasks_of(lay, key)
     nr = -(-task_units(key) * gt // BLOCKS)
+    # verify_head's tasks own the whole head (HD wide), not a VCH chunk
+    vo_width = HD if (key.verify and key.verify_head) else VCH
     nba = ba_tasks(lay)
     need(BA0 + nba <= BLOCKS, "in_proj_ba's CTAs")
     need(lay.QKVZ // ROWS == 2 * BLOCKS, "in_proj_qkvz: two row groups a CTA")
@@ -314,8 +334,8 @@ def build(key: K1Build):
     @fx.struct
     class GdnLds:
         qkl: fx.Array[fx.Float32, nr * 2 * HD, 16]
-        vloc: fx.Array[fx.Float32, nr * VCH, 16]
-        ol: fx.Array[fx.Float32, nr * VCH, 16]
+        vloc: fx.Array[fx.Float32, nr * vo_width, 16]
+        ol: fx.Array[fx.Float32, nr * vo_width, 16]
         scal: fx.Array[fx.Float32, nr * 4, 16]
 
     @fx.union
@@ -332,7 +352,7 @@ def build(key: K1Build):
     keyed = key_tuple(key, digest())
     name = (
         f"flashnext_mono_k1_s{s}_t{key.tp}_m{int(key.self_msq)}_f{int(key.front_only)}"
-        f"_p{int(key.proj_only)}_v{int(key.verify)}"
+        f"_p{int(key.proj_only)}_v{int(key.verify)}_vh{int(key.verify_head)}"
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -488,7 +508,10 @@ def build(key: K1Build):
                 store_ba_out(c)
             else:
                 if const_expr(key.verify):
-                    gdn_tasks_verify(c, nr, n_req, VERIFY_WINDOW)
+                    if const_expr(key.verify_head):
+                        gdn_tasks_verify_head(c, nr, n_req, VERIFY_WINDOW)
+                    else:
+                        gdn_tasks_verify(c, nr, n_req, VERIFY_WINDOW)
                 else:
                     gdn_tasks(c, nr)
 
