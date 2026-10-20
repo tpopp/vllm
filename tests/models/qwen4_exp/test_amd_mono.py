@@ -493,6 +493,253 @@ def test_k1_proj_only_matches_hc_front_and_stock_in_proj(s: int) -> None:
     assert ba_ulp <= 4.0, ba_ulp
 
 
+# ---------------------------------------------------------------- K1 verify
+def _verify_inputs(accepted: list, pad_last: bool):
+    """A uniform verify batch: ``len(accepted)`` requests, ``k1.VERIFY_WINDOW``
+    rows each, request-major (row ``req * VERIFY_WINDOW + t``). Every live
+    request gets ``1 + VERIFY_WINDOW`` distinct state slots (slot 0 is never
+    assigned: vLLM's null block); ``accepted[r]`` is this request's
+    num_accepted_tokens (picks the conv rewind offset and the checkpoint
+    recurrent-state column, ``accepted - 1``). ``pad_last``: the last
+    request's conv slot (column 0) is 0, a whole padding row-group."""
+    from vllm.models.qwen4_exp.amd.mono import k1
+    from vllm.models.qwen4_exp.amd.mono.layout import HD, HH, HIDDEN, Layout
+
+    lay = Layout(TP)
+    n_req = len(accepted)
+    s = n_req * k1.VERIFY_WINDOW
+    g = torch.Generator(device="cuda").manual_seed(0)
+    w = {
+        "state": _randn(g, s, HH, scale=2.0),
+        **_hc_weights(g),
+        "w_ba": _randn(g, lay.BA, HIDDEN, scale=0.05),
+        "conv_w": _randn(g, lay.CONV, 1, 4, scale=0.4),
+        "a_log": _randn(g, lay.NV, scale=0.5, dtype=torch.float32),
+        "dt_bias": _randn(g, lay.NV, scale=0.5),
+        "norm_w": (1 + _randn(g, HD, scale=0.1, dtype=torch.float32)).to(bf),
+    }
+    q, sc, w["w_qkvz"], w["w_qkvzs"] = _mxfp4_linear(g, lay.QKVZ, HIDDEN)
+    w["w_qkvz_ref"] = _mxfp4_dequant(q, sc).to(bf)
+
+    slots = 1 + n_req * (1 + k1.VERIFY_WINDOW)
+    n = lay.NV * HD * HD
+    pad_t = _randn(g, slots, n + 8192, scale=0.05, dtype=torch.float32)
+    rstate = pad_t[:, :n].view(slots, lay.NV, HD, HD)
+    conv = _randn(g, slots, lay.CONV * k1.VERIFY_SL + 1024)
+    conv = conv[:, : lay.CONV * k1.VERIFY_SL]
+    w["conv_state"] = conv.view(slots, k1.VERIFY_SL, lay.CONV).transpose(-1, -2)
+    w["rstate"] = rstate
+
+    idx = torch.zeros(n_req, k1.VERIFY_WINDOW, dtype=torch.int32, device="cuda")
+    for r in range(n_req):
+        if pad_last and r == n_req - 1:
+            continue  # column 0 (and every column) stays 0: a null row-group
+        base = 1 + r * (1 + k1.VERIFY_WINDOW)
+        idx[r] = torch.arange(base, base + k1.VERIFY_WINDOW, device="cuda")
+    w["spec_state_indices"] = idx
+    w["num_accepted_tokens"] = torch.tensor(accepted, dtype=torch.int32, device="cuda")
+    return w, lay, s, n_req
+
+
+def _verify_reference(w, lay, live_n_req: int, qkvz=None, ba=None):
+    """The stock verify chain (``causal_conv1d_update`` rewound by
+    ``num_accepted_tokens``, FLA's ``fused_sigmoid_gating_delta_rule_update``
+    checkpointed/written the same way, ``RMSNormGated``) on cloned
+    conv/recurrent state, matching ``gather/gdn_verify.md``'s §1.2 call
+    chain and the semantics K1's ``verify`` build reimplements in-kernel.
+
+    Only the first ``live_n_req`` requests (K1's own padding-request slot<=0
+    guard aside, the stock FLA kernel's grid comes straight from
+    ``len(cu_seqlens) - 1`` with no such guard -- a whole padding row-group
+    must not be handed to it, matching
+    ``tests/models/qwen4_exp/test_amd_gdn_verify_fused.py``'s own reference).
+    """
+    from vllm.model_executor.layers.layernorm import RMSNormGated
+    from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
+        causal_conv1d_update,
+    )
+    from vllm.models.qwen4_exp.amd.mono import k1
+    from vllm.models.qwen4_exp.amd.mono.layout import HD
+    from vllm.third_party.flash_linear_attention.ops import (
+        fused_sigmoid_gating_delta_rule_update,
+    )
+
+    nk, nv = lay.NK, lay.NV
+    key_dim, value_dim = nk * HD, nv * HD
+    qkv_size = 2 * key_dim + value_dim
+    live_s = live_n_req * k1.VERIFY_WINDOW
+    x, inj, _ = _mix_ref(w["state"], w)
+    if qkvz is None:
+        qkvz = F.linear(_mxfp4_qdq(x).to(bf), w["w_qkvz_ref"])
+        ba = F.linear(x, w["w_ba"])
+    qkvz, ba = qkvz[:live_s], ba[:live_s]
+    mixed_qkv, z = qkvz.split([qkv_size, value_dim], dim=-1)
+    b, a = ba.chunk(2, dim=-1)
+    idx = w["spec_state_indices"][:live_n_req]
+    nacc = w["num_accepted_tokens"][:live_n_req]
+    qsl = torch.arange(
+        0, live_s + 1, k1.VERIFY_WINDOW, dtype=torch.int32, device="cuda"
+    )
+
+    conv_state = w["conv_state"].clone()
+    rstate = w["rstate"].clone()
+    mixed_qkv = causal_conv1d_update(
+        mixed_qkv.clone(),
+        conv_state,
+        w["conv_w"].view(w["conv_w"].size(0), w["conv_w"].size(2)),
+        None,
+        "silu",
+        conv_state_indices=idx[:, 0],
+        num_accepted_tokens=nacc,
+        query_start_loc=qsl,
+        max_query_len=idx.size(-1),
+        validate_data=False,
+    )
+    q, k, v = mixed_qkv.split([key_dim, key_dim, value_dim], dim=-1)
+    o, _ = fused_sigmoid_gating_delta_rule_update(
+        A_log=w["a_log"],
+        a=a,
+        b=b,
+        dt_bias=w["dt_bias"],
+        q=q.contiguous().view(1, live_s, nk, HD),
+        k=k.contiguous().view(1, live_s, nk, HD),
+        v=v.contiguous().view(1, live_s, nv, HD),
+        initial_state=rstate,
+        inplace_final_state=True,
+        cu_seqlens=qsl,
+        ssm_state_indices=idx,
+        num_accepted_tokens=nacc,
+        use_qk_l2norm_in_kernel=True,
+    )
+    core = o.squeeze(0)
+    core = RMSNormGated.forward_static(
+        core,
+        z.view(live_s, nv, HD),
+        w["norm_w"],
+        1e-6,
+        core.dtype,
+        group_size=None,
+        norm_before_gate=True,
+        activation="sigmoid",
+    ).reshape(live_s, -1)
+    return {
+        "x": x,
+        "inj": inj,
+        "qkvz": qkvz,
+        "ba": ba,
+        "conv_state": conv_state,
+        "rstate": rstate,
+        "core": core,
+    }
+
+
+@pytest.mark.parametrize(
+    "accepted,pad_last",
+    [
+        ([1], False),
+        ([2], False),
+        ([4], False),
+        ([1, 4], False),
+        ([2, 3], False),
+        ([3, 1], True),
+    ],
+)
+@torch.inference_mode()
+def test_k1_verify_matches_stock_spec_decode_chain(
+    accepted: list, pad_last: bool
+) -> None:
+    """P3: K1's ``verify`` build against the stock spec-decode chain
+    (``causal_conv1d_update`` + FLA's non-AITER
+    ``fused_sigmoid_gating_delta_rule_update`` + ``RMSNormGated``) that a
+    pure, uniform verify step runs today (P1b / ``B._gdn_core_planar``),
+    across ``n_req in {1, 2}``, every accepted-count in ``1..VERIFY_WINDOW``,
+    and a whole padding request (``pad_last``)."""
+    from vllm.models.qwen4_exp.amd.mono import k1
+    from vllm.models.qwen4_exp.amd.mono.layout import HC, HIDDEN
+
+    w, lay, s, n_req = _verify_inputs(accepted, pad_last)
+    live_n_req = n_req - 1 if pad_last else n_req
+    live_s = live_n_req * k1.VERIFY_WINDOW
+    ref = _verify_reference(w, lay, live_n_req)
+
+    key = k1.K1Build(tokens=s, tp=TP, self_msq=True, verify=True)
+    conv_state, rstate = w["conv_state"].clone(), w["rstate"].clone()
+    core = torch.full((s, lay.CORE), float("nan"), dtype=bf, device="cuda")
+    inj = torch.full((s, HC), float("nan"), dtype=bf, device="cuda")
+    scratch = torch.zeros(k1.scratch_bytes(key), dtype=torch.uint8, device="cuda")
+    k1.verify_pre(
+        key,
+        state=w["state"],
+        msq_in=None,
+        hc_w=w["hc_w"],
+        w_down=w["w_down"],
+        w_up=w["w_up"],
+        inj_out=inj,
+        w_qkvz=w["w_qkvz"],
+        w_qkvzs=w["w_qkvzs"],
+        w_ba=w["w_ba"],
+        conv_w=w["conv_w"],
+        conv_state=conv_state,
+        a_log=w["a_log"],
+        dt_bias=w["dt_bias"],
+        norm_w=w["norm_w"],
+        rstate=rstate,
+        spec_state_indices=w["spec_state_indices"],
+        num_accepted_tokens=w["num_accepted_tokens"],
+        core=core,
+        scratch=scratch,
+        epoch=torch.ones(1, dtype=torch.int32, device="cuda"),
+        layer=0,
+    )
+    torch.accelerator.synchronize()
+
+    scr = k1.scratch_layout(key)
+    off, n = scr["bin"]
+    x = scratch[off : off + n].view(bf).view(s, HIDDEN)
+    assert _cos(x, ref["x"]) > COS_MIN
+    torch.testing.assert_close(inj, ref["inj"], atol=2e-2, rtol=2e-2)
+    qkvz = _pairs(scratch, scr["proj"], s * lay.QKVZ).view(s, lay.QKVZ)
+    parts = _pairs(scratch, scr["bapart"], k1.ba_tasks(lay) * s * k1.ROWS)
+    parts = parts.view(lay.BA // k1.ROWS, 2, s, k1.ROWS)
+    ba = parts[:, 0] + parts[:, 1]
+    ba = ba.permute(1, 0, 2).reshape(s, lay.BA).to(bf)
+
+    live_slots = []
+    for r in range(live_n_req):
+        acc = accepted[r]
+        live_slots += [w["spec_state_indices"][r, 0].item()]
+        live_slots += [w["spec_state_indices"][r, t].item() for t in range(acc)]
+    live_slots = sorted(set(live_slots))
+    live_core, live_qkvz, live_ba = core[:live_s], qkvz[:live_s], ba[:live_s]
+
+    def errs_vs(r):
+        return {
+            "conv_state": _rel_l2(conv_state[live_slots], r["conv_state"][live_slots]),
+            "rstate": _rel_l2(rstate[live_slots], r["rstate"][live_slots]),
+            "core": _rel_l2(live_core, r["core"]),
+        }
+
+    # K1's own in_proj output fed through the stock chain: conv / gates /
+    # recurrence / norm alone, matching test_k1_matches_vllm_ops's "own" tier
+    own_ref = _verify_reference(
+        w, lay, live_n_req, qkvz=live_qkvz.to(bf), ba=live_ba.to(bf)
+    )
+    own = errs_vs(own_ref)
+    assert own["conv_state"] < 1e-6 and own["rstate"] < 1e-6, own
+    assert own["core"] < 1e-4, own
+    # end to end: the HC GEMVs' and in_proj's summation order differ a little
+    errs = errs_vs(ref)
+    assert errs["conv_state"] < 5e-3 and errs["rstate"] < 5e-3, errs
+    assert _cos(live_core, ref["core"]) > COS_MIN, errs
+    if pad_last:
+        pr = n_req - 1
+        rows = slice(pr * k1.VERIFY_WINDOW, (pr + 1) * k1.VERIFY_WINDOW)
+        assert torch.equal(core[rows], torch.zeros_like(core[rows]))
+        # an all-zero padding row-group's slot 0 is never touched
+        torch.testing.assert_close(conv_state[0], w["conv_state"][0], atol=0, rtol=0)
+        torch.testing.assert_close(rstate[0], w["rstate"][0], atol=0, rtol=0)
+
+
 # ---------------------------------------------------------------- K2
 def _pad_halves(x, ri, rip, fill):
     """[ne, 2 ri, ...] [gate; up] rows -> [ne, 2 rip, ...], each half padded."""
