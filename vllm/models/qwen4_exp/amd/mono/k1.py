@@ -281,24 +281,23 @@ def _store_qsa_row(c, rg, valid, ops, out, nrows):
 
 @traced
 def stage_qsa_proj(
-    c, qkv_rg0, qkv_ops0, idx_rg, idx_ops, idx_tasks, qkv_rounds, qkv_tasks
+    c, qkv_rg0, qkv_ops0, idx_rg, idx_ops, idx_tasks, qkv_rounds, qkv_tasks, ops1
 ):
     """``K1Build.qsa_proj``: round 0's ``qkv_proj`` row group (every CTA,
-    always real: ``qkv_tasks >= BLOCKS``) and ``index_qk_proj``'s (CTAs <
-    ``idx_tasks``, else a harmlessly discarded clamped GEMV), both loaded at
-    kernel entry -> ``qkv_out`` / ``idx_out``. If ``qkv_proj`` has more row
-    groups than CTAs (``qkv_rounds > 1``), round 1's load is issued only now
-    -- after round 0's is consumed -- so the two concurrent BF16 weight loads
-    never overlap round 0's, within the VGPR budget round 0 + ``index_qk_proj``
-    already uses."""
+    always real: ``qkv_tasks >= BLOCKS``), ``index_qk_proj``'s (CTAs <
+    ``idx_tasks``) and round 1's ``qkv_proj`` row group (CTAs whose
+    ``bid + BLOCKS`` is a real task) -> ``qkv_out`` / ``idx_out``. Every load
+    was issued at kernel entry (``ops1`` too), so all three stream during the
+    HC front's hand-off chain; a CTA skips the GEMVs it has no real task for
+    (CTA-uniform conditions)."""
     lay, bid = c["lay"], c["bid"]
     _store_qsa_row(c, qkv_rg0, True, qkv_ops0, c["qkv_out"], lay.QKV)
-    _store_qsa_row(c, idx_rg, bid < idx_tasks, idx_ops, c["idx_out"], L.IDXQK)
+    if bid < idx_tasks:
+        _store_qsa_row(c, idx_rg, True, idx_ops, c["idx_out"], L.IDXQK)
     if const_expr(qkv_rounds > 1):
         rg1_raw = bid + BLOCKS
-        rg1 = fx.min(rg1_raw, qkv_tasks - 1)
-        ops1 = gemv.loads(c["lane"], c["wave"], c["args"]["w_qkv"], rg1 * ROWS, H)
-        _store_qsa_row(c, rg1, rg1_raw < qkv_tasks, ops1, c["qkv_out"], lay.QKV)
+        if rg1_raw < qkv_tasks:
+            _store_qsa_row(c, rg1_raw, True, ops1, c["qkv_out"], lay.QKV)
 
 
 def qkv_tasks_of(lay):
@@ -496,6 +495,10 @@ def build(key: K1Build):
             qkv_ops0 = gemv.loads(c["lane"], c["wave"], w_qkv, bid * ROWS, H)
             idx_rg = fx.min(bid, idx_tasks - 1)
             idx_ops = gemv.loads(c["lane"], c["wave"], w_idx, idx_rg * ROWS, H)
+            ops1 = None
+            if const_expr(qkv_rounds > 1):
+                rg1 = fx.min(bid + BLOCKS, qkv_tasks - 1)
+                ops1 = gemv.loads(c["lane"], c["wave"], w_qkv, rg1 * ROWS, H)
         if const_expr(key.self_msq):  # noqa: SIM102 (traced: `and` does not combine traced values)
             if bid < hc.NRED:
                 hc.stage_msq(c, bid)
@@ -525,7 +528,8 @@ def build(key: K1Build):
             # ``stage_qsa_proj``, after round 0's is consumed
             hc.bin_to_lds(c, XROW)
             stage_qsa_proj(
-                c, bid, qkv_ops0, idx_rg, idx_ops, idx_tasks, qkv_rounds, qkv_tasks
+                c, bid, qkv_ops0, idx_rg, idx_ops, idx_tasks, qkv_rounds, qkv_tasks,
+                ops1,
             )
         else:
             is_ba = (bid >= BA0) & (bid < BA0 + nba)
