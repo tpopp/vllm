@@ -457,19 +457,15 @@ def gdn_conv(c, k, t, h, ch):
 
 
 @traced
-def gdn_gates(c, k, t, h, local=False):
+def gdn_gates(c, k, t, h):
     """The key head's q and k (QK) l2-normed (q scaled by HD^-1/2); the head's
     decay exp(-exp(A_log) softplus(a + dt_bias)) and beta = sigmoid(b), b and a
-    as the model's ``ba_of`` hands them over. ``local`` (the verify-head
-    layout, ``gdn_tasks_verify_head``): q / k are already in ``qkl``, this
-    task's own conv having just written them there -- no "qk" mailbox poll
-    (a single-head task has no sibling CTA to hand them off to/from)."""
+    as the model's ``ba_of`` hands them over."""
     tid, lane, wave, g = c["tid"], c["lane"], c["wave"], c["gdn"]
     kh = h // (g.nv // g.nk)
-    if const_expr(not local):
-        if tid < 2 * HD:
-            v = c["poll"]([(c["qk"], (t * g.nk + kh) * 2 * HD + tid, 1)])[0][0]
-            fx.ptr_store(f32_of(v), c["qkl"] + tid)
+    if tid < 2 * HD:
+        v = c["poll"]([(c["qk"], (t * g.nk + kh) * 2 * HD + tid, 1)])[0][0]
+        fx.ptr_store(f32_of(v), c["qkl"] + tid)
     if tid == 2 * HD:
         b, a = c["ba_of"](c, t, h)
         x = a + k["dtb"]
@@ -840,279 +836,24 @@ def gdn_tasks_verify(c, rounds, n_req, t_tokens):
         lambda cr, k, req, row, h, ch, tok: gdn_recur_verify(cr, k, row, h, ch, tok),
         lambda cr, k, req, row, h, ch, tok: gdn_norm_verify(cr, k, row, h, ch),
     )
-    if const_expr(c.get("phase_major", False)):
-        # Phase-major: conv for every token, then gates, then the recurrence,
-        # then the gated norm. Only the recurrence carries state token to
-        # token; conv's outputs (and the norm's sums of squares) cross CTAs
-        # through mailboxes, so ordering by phase pays each hand-off once per
-        # cycle instead of once per token. Each (round, token) has its own LDS
-        # slot (K1 sizes GdnLds for rounds x t_tokens).
-        def tok_cr(cr, r, tok):
-            ct = dict(cr)
-            for name, m in (("qkl", 2 * HD), ("vloc", VCH), ("ol", VCH), ("scal", 4)):
-                ct[name] = c[name] + (r * t_tokens + tok) * m
-            return ct
+    # Phase-major: conv for every token, then gates, then the recurrence,
+    # then the gated norm. Only the recurrence carries state token to token;
+    # conv's outputs (and the norm's sums of squares) cross CTAs through
+    # mailboxes, so ordering by phase pays each hand-off once a cycle instead
+    # of once a token (S=4: 32.1 vs 37.1 us token-major). Each (round, token)
+    # has its own LDS slot (K1 sizes GdnLds for rounds x t_tokens).
+    def tok_cr(cr, r, tok):
+        ct = dict(cr)
+        for name, m in (("qkl", 2 * HD), ("vloc", VCH), ("ol", VCH), ("scal", 4)):
+            ct[name] = c[name] + (r * t_tokens + tok) * m
+        return ct
 
-        for phase in phases:
-            for tok in range_constexpr(t_tokens):
-                for r, ((cr, _, req, h, ch), k) in enumerate(zip(tasks, ks)):
-                    phase(tok_cr(cr, r, tok), k, req, req * t_tokens + tok, h, ch, tok)
-    else:
+    for phase in phases:
         for tok in range_constexpr(t_tokens):
-            for phase in phases:
-                for (cr, _, req, h, ch), k in zip(tasks, ks):
-                    phase(cr, k, req, req * t_tokens + tok, h, ch, tok)
+            for r, ((cr, _, req, h, ch), k) in enumerate(zip(tasks, ks)):
+                phase(tok_cr(cr, r, tok), k, req, req * t_tokens + tok, h, ch, tok)
     for (cr, _, req, h, ch), k in zip(tasks, ks):
         gdn_conv_writeback_verify(cr, k)
-
-
-# ------------------------------------------------- gdn (verify, per-head)
-#
-# ``K1Build.verify_head`` (default on; the chunked layout above stays
-# selectable for A/B): a task is one (request, value head), not one
-# (request, value head, chunk) -- the whole 128 x 128 head lives in one
-# CTA, so neither of the chunked layout's two cross-CTA mailboxes is
-# needed: "qk" (a key head's q / k, shared by its ``HPK`` value-head CTAs)
-# is replaced by every task recomputing its own q / k conv redundantly
-# (cheap, as the Triton reference ``gdn_spec_decode_mono_fused.py`` does
-# the same -- "every program in a key head's group recomputes that head's
-# q/k conv redundantly ... so that each program can feed its own
-# delta-rule step without a cross-program handoff"); "onrm" (a head's
-# gated-norm sum of squares, split across its 8 chunk CTAs) is replaced by
-# summing the whole head's ``ol`` locally, since one CTA already holds all
-# of it. The only hand-off left is the initial poll of this launch's own
-# in_proj phase's PROJ / bapart output (``gdn_conv_verify_head`` /
-# ``gdn_gates``'s ``ba_of``), unavoidable: it comes from different CTAs
-# of the same launch.
-#
-# The 128 x 128 recurrent state lives in registers: thread ``tid`` owns
-# state row ``tid // HEAD_COLGROUPS`` (0 .. 127), columns ``(tid %
-# HEAD_COLGROUPS) * HEAD_COLW ..`` (``HEAD_COLW`` = 32 of them, so 16384
-# floats / 512 threads = 32 a thread). The ``HEAD_COLGROUPS`` (4) threads
-# of a row are one hardware DPP quad (``tid % 4``), so a row's K-dimension
-# reduction (state . k, state . q) is a local 32-term sum then a 2-step
-# quad butterfly (offsets 2, 1, the tail of ``wave_sum``'s 64-lane tree) --
-# no LDS, every one of the 4 lanes ends up with the row's total.
-
-HEAD_COLGROUPS = THREADS // HD  # 4: lanes (one DPP quad) sharing a state row
-HEAD_COLW = HD // HEAD_COLGROUPS  # 32: columns (and state registers) a lane owns
-assert THREADS % HD == 0 and HD % HEAD_COLGROUPS == 0
-
-
-def gdn_round_verify_head(c, r, n_req):
-    """Round r's task of this CTA, counting (request, value head) pairs (not
-    chunks): the task's (request, head) -- otherwise exactly ``gdn_round``."""
-    nv = c["gdn"].nv
-    n = n_req * nv
-    task = (c["bid"] + (BLOCKS - c["goff"])) % BLOCKS + BLOCKS * r
-    tc = fx.min(task, n - 1)
-    cr = dict(c)
-    for name, m in (("qkl", 2 * HD), ("vloc", HD), ("ol", HD), ("scal", 4)):
-        cr[name] = c[name] + r * m
-    return cr, task < n, tc // nv, tc % nv
-
-
-@traced
-def gdn_stage_verify_head(c, req, h, t_tokens, tl):
-    """A verify-head task's per-(request, value head) setup: like
-    ``gdn_stage_verify``, but ``k['chan']`` spans the whole head (3 * HD
-    owned channels: q, k redundant across the key head's ``HPK`` sibling
-    value heads, v its own -- not a ``VCH``-wide chunk), and ``k['st']`` is
-    the whole head's state row this thread owns (``HEAD_COLW`` registers,
-    not 4): thread ``tid`` is row ``tid // HEAD_COLGROUPS``, columns
-    ``(tid % HEAD_COLGROUPS) * HEAD_COLW ..``."""
-    tid = c["tid"]
-    a, g = c["args"], c["gdn"]
-    k = {}
-    idx_base = a["spec_idx"] + fx.Int64(req) * fx.Int64(t_tokens) * fx.Int64(4)
-    conv_slot = uniform(ld_i32w(idx_base, 0))
-    accepted = uniform(ld_i32w(a["num_accepted"], req))
-    offset = fx.max(accepted - 1, 0)
-    ssm_src = uniform(ld_i32w(idx_base, offset))
-    live = (conv_slot > 0) & (ssm_src > 0) & tl
-    k["tl"] = tl
-    k["live"] = live
-    k["idx_base"] = idx_base
-    kh = h // (g.nv // g.nk)
-    ct = fx.min(tid, 3 * HD - 1)
-    part = ct // HD
-    i = ct % HD
-    qk_chan = part * (g.nk * HD) + kh * HD + i
-    v_chan = 2 * g.nk * HD + h * HD + i
-    chan = (part < 2).select(qk_chan, v_chan)
-    k["part"], k["i"], k["chan"] = part, i, chan
-    cs = a["conv_st"] + fx.Int64(fx.max(conv_slot, 0)) * fx.Int64(a["cs_seq"]) * 2
-    co = chan * a["cs_dim"]
-    k["cs"], k["co"] = cs, co
-    win = [ld_bf(cs, co + (offset + j) * a["cs_tok"]) for j in range(SL)]
-    k["win"] = win
-    k["hist"] = win[1:]
-    k["raw"] = []
-    cw = fx.Vector(
-        bo.buffer_load(rsrc(a["conv_w"]), chan * 2, vec_width=2, dtype=T.i32)
-    )
-    k["cw"] = [bf_lo(cw[0]), bf_hi(cw[0]), bf_lo(cw[1]), bf_hi(cw[1])]
-    row = tid // HEAD_COLGROUPS
-    colg = tid % HEAD_COLGROUPS
-    k["row"], k["colg"] = row, colg
-    k["head_off"] = (h * HD + row) * HD + colg * HEAD_COLW
-    k["sbase"] = a["rstate"] + fx.Int64(fx.max(ssm_src, 0)) * fx.Int64(a["rs_seq"]) * 4
-    st = []
-    for e in range_constexpr(HEAD_COLW // 4):
-        v4 = fx.Vector(
-            bo.buffer_load(
-                rsrc(k["sbase"]), k["head_off"] + 4 * e, vec_width=4, dtype=T.f32
-            )
-        )
-        st += [v4[q] for q in range(4)]
-    k["st"] = st
-    k["a_log"] = ld_f32(a["a_log"], h)
-    k["dtb"] = ld_bf(a["dt_bias"], h)
-    return k
-
-
-@traced
-def gdn_conv_verify_head(c, k, req, h, row):
-    """One token's width-4 conv for the owned channel, generalized past
-    ``gdn_conv_verify``'s ``VCH``-wide chunk to the whole head (3 * HD
-    channels): q / k land straight in ``qkl`` (this task's own head, no
-    "qk" mailbox -- ``gdn_gates``'s ``local=True`` skips its poll)."""
-    tid = c["tid"]
-    a, g = c["args"], c["gdn"]
-    part = k["part"]
-    x = f32_of(c["poll"]([(c["proj"], row * g.proj + k["chan"], 1)])[0][0])
-    w, win = k["cw"], k["win"]
-    acc = bf16_round(w[0] * win[0]) + bf16_round(w[1] * win[1])
-    acc = acc + bf16_round(w[2] * win[2])
-    acc = acc + bf16_round(w[3] * x)
-    o = bf16_round(silu(acc))
-    k["win"] = [win[1], win[2], x]
-    k["raw"].append(x)
-    tl = k["tl"]
-    if (tid < 3 * HD) & tl:
-        if part < 2:
-            fx.ptr_store(o, c["qkl"] + (part * HD + k["i"]))
-        else:
-            fx.ptr_store(o, c["vloc"] + k["i"])
-    gpu.barrier()
-
-
-@traced
-def gdn_recur_verify_head(c, k, row, h, tok):
-    """One token's delta-rule update over the whole 128 x 128 state, held in
-    registers (``k['st']``, ``HEAD_COLW`` a thread): a row's K-dimension dot
-    products (state . k, state . q) are a local ``HEAD_COLW``-term sum then a
-    2-step quad butterfly (offsets 2, 1), not ``gdn_recur_verify``'s 4-term
-    sum + 32-lane butterfly -- the state is ``HEAD_COLGROUPS`` (4) times
-    wider a thread, the reduction ``HEAD_COLGROUPS`` times narrower. The
-    state snapshot still goes to this token's own ``spec_state_indices``
-    column; ``ol`` (``HD`` wide, not ``VCH``) gets every row of the head, so
-    ``gdn_norm_verify_head`` needs no "onrm" poll."""
-    tid = c["tid"]
-    a = c["args"]
-    live = k["live"]
-    decay = fx.ptr_load(c["scal"] + 0)
-    beta = fx.ptr_load(c["scal"] + 1)
-    c0 = k["colg"] * HEAD_COLW
-    qv = [fx.ptr_load(c["qkl"] + (c0 + e)) for e in range(HEAD_COLW)]
-    kv = [fx.ptr_load(c["qkl"] + (HD + c0 + e)) for e in range(HEAD_COLW)]
-    stv = [live.select(k["st"][e], fx.Float32(0.0)) * decay for e in range(HEAD_COLW)]
-    p = fx.Float32(0.0)
-    for e in range_constexpr(HEAD_COLW):
-        p = p + stv[e] * kv[e]
-    p = butterfly(p, (2, 1))
-    vn = (fx.ptr_load(c["vloc"] + k["row"]) - p) * beta
-    stv = [stv[e] + vn * kv[e] for e in range(HEAD_COLW)]
-    o = fx.Float32(0.0)
-    for e in range_constexpr(HEAD_COLW):
-        o = o + stv[e] * qv[e]
-    o = bf16_round(butterfly(o, (2, 1)))
-    o = live.select(o, fx.Float32(0.0))
-    k["st"] = stv
-    dst = uniform(ld_i32w(k["idx_base"], tok))
-    if live & (dst > 0):
-        dbase = a["rstate"] + fx.Int64(fx.max(dst, 0)) * fx.Int64(a["rs_seq"]) * 4
-        for e in range_constexpr(HEAD_COLW // 4):
-            v4 = fx.Vector.from_elements(stv[4 * e : 4 * e + 4], fx.Float32)
-            bo.buffer_store(v4, rsrc(dbase), k["head_off"] + 4 * e)
-    if k["colg"] == 0:
-        fx.ptr_store(o, c["ol"] + k["row"])
-    gpu.barrier()
-
-
-@traced
-def gdn_norm_verify_head(c, k, t, h):
-    """Rows 0 .. HD - 1: the whole head's gated RMSNorm, the sum of squares
-    over ``ol`` redone by every lane (clamped row -- cheap, ~128 FMAs --
-    against the cross-CTA "onrm" hand-off it replaces), in the same 8-
-    chunks-of-16 grouping ``gdn_norm``'s "onrm" partials were summed in, so
-    the fp32 rounding matches that path bit for bit; only the real rows
-    actually store."""
-    tid = c["tid"]
-    a, g = c["args"], c["gdn"]
-    r = fx.min(tid, HD - 1)
-    z0 = 2 * g.nk * HD + g.nv * HD
-    z = f32_of(c["poll"]([(c["proj"], t * g.proj + z0 + h * HD + r, 1)])[0][0])
-    ss = fx.Float32(0.0)
-    for ch in range_constexpr(NVCH):
-        part = fx.Float32(0.0)
-        for e in range_constexpr(VCH):
-            x = fx.ptr_load(c["ol"] + (ch * VCH + e))
-            part = part + x * x
-        ss = ss + part
-    rstd = hw_rsq(ss * fx.Float32(1.0 / HD) + fx.Float32(c["norm_eps"]))
-    y = fx.ptr_load(c["ol"] + r) * rstd * ld_bf(a["norm_w"], r)
-    y = y * c["z_gate"](z)
-    y = k["live"].select(y, fx.Float32(0.0))
-    if (tid < HD) & k["tl"]:
-        bo.buffer_store(
-            y.to(fx.BFloat16), rsrc(a["core"]), t * (g.nv * HD) + h * HD + r
-        )
-    gpu.barrier()
-
-
-@traced
-def gdn_conv_writeback_verify_head(c, k):
-    """After the last token: the whole head's channels' write-back, as
-    ``gdn_conv_writeback_verify`` generalized past ``VCH`` -- every value
-    head's task writes its key head's q / k slot redundantly (harmless, the
-    same values every time)."""
-    tid = c["tid"]
-    a = c["args"]
-    if (tid < 3 * HD) & k["live"]:
-        rs = rsrc(k["cs"])
-        seq = k["hist"] + k["raw"]
-        for j in range_constexpr(len(seq)):
-            bo.buffer_store(
-                fx.Float32(seq[j]).to(fx.BFloat16), rs, k["co"] + j * a["cs_tok"]
-            )
-    gpu.barrier()
-
-
-@traced
-def gdn_tasks_verify_head(c, rounds, n_req, t_tokens):
-    """This CTA's GDN verify-head tasks (``rounds`` of them, each a whole
-    (request, value head)): ``gdn_tasks_verify``'s orchestration, one
-    (request, head) pair a task instead of a (request, head, chunk) triple,
-    with no "qk" poll (``gdn_gates(local=True)``) and no "onrm" poll in the
-    norm phase."""
-    tasks = [gdn_round_verify_head(c, r, n_req) for r in range(rounds)]
-    ks = [
-        gdn_stage_verify_head(cr, req, h, t_tokens, live)
-        for cr, live, req, h in tasks
-    ]
-    phases = (
-        lambda cr, k, req, h, row, tok: gdn_conv_verify_head(cr, k, req, h, row),
-        lambda cr, k, req, h, row, tok: gdn_gates(cr, k, row, h, local=True),
-        lambda cr, k, req, h, row, tok: gdn_recur_verify_head(cr, k, row, h, tok),
-        lambda cr, k, req, h, row, tok: gdn_norm_verify_head(cr, k, row, h),
-    )
-    for tok in range_constexpr(t_tokens):
-        for phase in phases:
-            for (cr, _, req, h), k in zip(tasks, ks):
-                phase(cr, k, req, h, req * t_tokens + tok, tok)
-    for (cr, _, req, h), k in zip(tasks, ks):
-        gdn_conv_writeback_verify_head(cr, k)
 
 
 # ---------------------------------------------------------------- kernel

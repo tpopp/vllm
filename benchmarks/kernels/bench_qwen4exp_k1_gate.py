@@ -348,11 +348,7 @@ def bench_k1_verify_gate(s, device, rank, world_size, epoch, iters):
     inj = torch.empty(s, HC, dtype=bf, device=device)
     qsl = torch.arange(0, s + 1, k1.VERIFY_WINDOW, dtype=torch.int32, device=device)
 
-    # verify_head=True (default): one task a (request, value head), the
-    # whole head in one CTA, no "qk" / "onrm" cross-CTA hand-off.
-    key_verify = k1.K1Build(
-        tokens=s, tp=TP, self_msq=True, verify=True, verify_head=False, verify_pm=False
-    )
+    key_verify = k1.K1Build(tokens=s, tp=TP, self_msq=True, verify=True)
     scr_verify = torch.zeros(
         k1.scratch_bytes(key_verify), dtype=torch.uint8, device=device
     )
@@ -447,50 +443,8 @@ def bench_k1_verify_gate(s, device, rank, world_size, epoch, iters):
             "sigmoid",
         )
 
-    # verify_head=False: the original one task a (request, value head,
-    # chunk) layout, kept for the A/B this bracket's task asks for.
-    key_verify_chunked = k1.K1Build(
-        tokens=s, tp=TP, self_msq=True, verify=True, verify_head=False, verify_pm=True
-    )
-    scr_verify_chunked = torch.zeros(
-        k1.scratch_bytes(key_verify_chunked), dtype=torch.uint8, device=device
-    )
-    c_conv_state, c_rstate = w["conv_state"].clone(), w["rstate"].clone()
-    c_core = torch.empty(s, lay.CORE, dtype=bf, device=device)
-
-    def _k1_verify_chunked():
-        epoch.add_(1)
-        k1.verify_pre(
-            key_verify_chunked,
-            state=w["state"],
-            msq_in=None,
-            hc_w=w["hc_w"],
-            w_down=w["w_down"],
-            w_up=w["w_up"],
-            inj_out=inj,
-            w_qkvz=w["w_qkvz"],
-            w_qkvzs=w["w_qkvzs"],
-            w_ba=w["w_ba"],
-            conv_w=w["conv_w"],
-            conv_state=c_conv_state,
-            a_log=w["a_log"],
-            dt_bias=w["dt_bias"],
-            norm_w=w["norm_w"],
-            rstate=c_rstate,
-            spec_state_indices=w["spec_state_indices"],
-            num_accepted_tokens=w["num_accepted_tokens"],
-            core=c_core,
-            scratch=scr_verify_chunked,
-            epoch=epoch,
-            layer=8,
-        )
-
     cases = (
-        ("k1.verify_pre (P3, chunked, token-major)", _k1_verify),
-        (
-            "k1.verify_pre (P3, chunked, phase-major)",
-            _k1_verify_chunked,
-        ),
+        ("k1.verify_pre (P3: HC front + in_proj + GDN verify core)", _k1_verify),
         ("proj_pre (P1b) + stock conv_gdr + _gated_rms_norm", _proj_plus_stock),
     )
     return [
