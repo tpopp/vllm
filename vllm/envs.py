@@ -157,7 +157,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_MONO_DECODE: bool = False
     VLLM_ROCM_MONO_K1_PROJ: bool = True
-    VLLM_ROCM_MONO_K1_VERIFY: bool = False
+    VLLM_ROCM_MONO_K1_VERIFY: bool = True
     VLLM_ROCM_MONO_DRAFT: bool = False
     VLLM_ROCM_MONO_DRAFT_FRONT: bool = True
     VLLM_ROCM_MONO_DRAFT_HEAD: bool = True
@@ -1415,10 +1415,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # conv update, gated delta rule and gated norm in K1 itself
     # (K1Build.verify / k1.verify_pre, P3), in place of VLLM_ROCM_MONO_K1_PROJ's
     # stock AITER conv + gated delta rule call; falls back to
-    # VLLM_ROCM_MONO_K1_PROJ on any other batch shape. By default is disabled
-    # (not yet GPU-validated).
+    # VLLM_ROCM_MONO_K1_PROJ on any other batch shape (taken for a single
+    # request's verify step only: -4.5% TPOT at c1 on MI355X, GSM8K
+    # unchanged). By default is enabled.
     "VLLM_ROCM_MONO_K1_VERIFY": lambda: (
-        os.getenv("VLLM_ROCM_MONO_K1_VERIFY", "False").lower() in ("true", "1")
+        os.getenv("VLLM_ROCM_MONO_K1_VERIFY", "1").lower() in ("true", "1")
     ),
     # Run the eligible MTP draft step (the single draft layer's QSA attention,
     # HC and sparse MoE) on the mono kernels. By default is disabled.
