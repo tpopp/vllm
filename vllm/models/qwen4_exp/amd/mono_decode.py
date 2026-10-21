@@ -321,9 +321,16 @@ class MonoDecode(B.QwenMonoDecode):
         fixed ``VERIFY_WINDOW``) falls back to P1b's stock-core path."""
         from vllm.models.qwen4_exp.amd.mono import k1
 
-        # one request only: at two (S=8) each CTA runs two task rounds and
-        # the in-kernel core is slower than the stock one (46.6 vs 41.0 us)
-        if not envs.VLLM_ROCM_MONO_K1_VERIFY or s != k1.VERIFY_WINDOW:
+        # one or two requests (S=4 or S=8): at two, the wider GDN task chunk
+        # (``_k1_verify``'s vch=32, half the tasks a request) fits them in
+        # one task round on 256 CTAs, so the in-kernel core now beats the
+        # stock one there too (37.3-38.1 vs 41.0-41.3 us graph-replayed,
+        # vch=16's two task rounds were 46.1-46.6 vs the same stock -- see
+        # INTEGRATION_LEDGER.md §C2 and mono-draft/NOTES.md 2026-10-21).
+        if not envs.VLLM_ROCM_MONO_K1_VERIFY or s not in (
+            k1.VERIFY_WINDOW,
+            2 * k1.VERIFY_WINDOW,
+        ):
             return False
         a = layer.linear_attn
         m = md.get(a.prefix)
@@ -357,6 +364,10 @@ class MonoDecode(B.QwenMonoDecode):
             conv_state = conv_state.transpose(-1, -2)
         s = state.size(0)
         n_req = s // k1.VERIFY_WINDOW
+        # the GDN task chunk size: 16 (8 chunks/value head) is fastest at one
+        # request (S=4), 32 (4 chunks, half the tasks/request) at two (S=8:
+        # it fits one task round on 256 CTAs instead of vch=16's two).
+        vch = 16 if s == k1.VERIFY_WINDOW else 32
         core = torch.empty(s, self.lay.CORE, dtype=state.dtype, device=state.device)
         k1.verify_pre(
             k1.K1Build(
@@ -366,6 +377,7 @@ class MonoDecode(B.QwenMonoDecode):
                 verify=True,
                 eps=hc.config.rms_norm_eps,
                 norm_eps=a.norm.eps,
+                vch=vch,
             ),
             **self._hc_args(hc, state, msq, inj),
             w_qkvz=a.in_proj_qkvz.weight,
