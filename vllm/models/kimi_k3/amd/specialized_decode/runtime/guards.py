@@ -119,12 +119,22 @@ class FailStop:
     every CHECK_EVERY steps the ranks agree on those over the TP CPU group and all
     raise together. A rank that raised alone would leave the others in the next
     collective (the drafter's) for ever. A failure is seen within about
-    CHECK_EVERY steps."""
+    CHECK_EVERY steps. ``name`` and ``instead`` (how to run without the
+    specialized decode) word the error."""
 
     CHECK_EVERY = 16
 
-    def __init__(self, failed: torch.Tensor, rank: int, world: int, group):
+    def __init__(
+        self,
+        failed: torch.Tensor,
+        rank: int,
+        world: int,
+        group,
+        name: str,
+        instead: str,
+    ):
         self.failed, self.rank, self.world, self.group = failed, rank, world, group
+        self.name, self.instead = name, instead
         self.host = torch.zeros(1, dtype=torch.int32, pin_memory=True)
         self.copied: torch.cuda.Event | None = None
         self.seen = False
@@ -149,6 +159,6 @@ class FailStop:
         if votes.any():
             ranks = [r for r, v in enumerate(votes.tolist()) if v]
             raise RuntimeError(
-                f"Kimi-K3 specialized decode: TP ranks {ranks} gave up an in-kernel "
-                "wait; stopping the engine (decode_backend=auto runs vLLM's decode)"
+                f"{self.name}: TP ranks {ranks} gave up an in-kernel wait; stopping "
+                f"the engine ({self.instead})"
             )

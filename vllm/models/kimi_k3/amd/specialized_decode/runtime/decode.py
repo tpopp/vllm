@@ -122,7 +122,12 @@ class SpecializedDecode:
         for build in builds:
             compile_build(build)
         self.failstop = FailStop(
-            runner.health[FAILED : FAILED + 1], runner.rank, tp.world_size, tp.cpu_group
+            runner.health[FAILED : FAILED + 1],
+            runner.rank,
+            tp.world_size,
+            tp.cpu_group,
+            "Kimi-K3 specialized decode",
+            "decode_backend=auto runs vLLM's decode",
         )
         # (data_ptr, numel) of the first KDA layer's state prepare_kv bound
         self._kv: tuple[int, int] | None = None
