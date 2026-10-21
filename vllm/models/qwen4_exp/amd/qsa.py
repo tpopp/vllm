@@ -440,9 +440,13 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         output: torch.Tensor,
         qkv: torch.Tensor | None = None,
         gate: torch.Tensor | None = None,
+        idx_qk: torch.Tensor | None = None,
     ) -> None:
         # query/key/value are None when the fused prepare runs inside the
-        # indexer launch, which then writes the gate into ``gate``.
+        # indexer launch, which then writes the gate into ``gate``. ``idx_qk``
+        # (P2, ``VLLM_ROCM_MONO_K1_QSA_PROJ``): a caller that already ran
+        # ``index_qk_proj`` passes its output here so the indexer skips its
+        # own projection GEMM; None (the default) is the stock path.
         metadata = get_forward_context().attn_metadata
         if isinstance(metadata, list):
             metadata = metadata[0]
@@ -479,6 +483,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             qkv=qkv,
             slot_mapping=main_metadata.slot_mapping,
             gate_out=gate,
+            idx_qk=idx_qk,
             **indexer_kwargs,
         )
         if selected.shape != (
@@ -620,8 +625,15 @@ def qwen4_exp_qsa_prepare_with_output(
     output: torch.Tensor,
     gate: torch.Tensor,
     layer_name: LayerNameType,
+    idx_qk: torch.Tensor | None = None,
 ) -> None:
-    """Run the QSA transaction with the main QK-norm/RoPE/gate fused in."""
+    """Run the QSA transaction with the main QK-norm/RoPE/gate fused in.
+
+    ``idx_qk`` (P2, ``VLLM_ROCM_MONO_K1_QSA_PROJ``): the indexer's
+    ``index_qk_proj`` output, already computed by the caller (K1's
+    ``qsa_proj`` build); None (the default) has the indexer run its own
+    projection, as before.
+    """
     layer_name = _resolve_layer_name(layer_name)
     layer = get_forward_context().no_compile_layers[layer_name]
     if not isinstance(layer, Qwen4ExpQSAAttention):
@@ -635,6 +647,7 @@ def qwen4_exp_qsa_prepare_with_output(
         output,
         qkv=qkv,
         gate=gate,
+        idx_qk=idx_qk,
     )
 
 

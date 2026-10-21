@@ -158,6 +158,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_MONO_DECODE: bool = False
     VLLM_ROCM_MONO_K1_PROJ: bool = True
     VLLM_ROCM_MONO_K1_VERIFY: bool = True
+    VLLM_ROCM_MONO_K1_QSA_PROJ: bool = False
     VLLM_ROCM_MONO_DRAFT: bool = False
     VLLM_ROCM_MONO_DRAFT_FRONT: bool = True
     VLLM_ROCM_MONO_DRAFT_HEAD: bool = True
@@ -1420,6 +1421,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # unchanged). By default is enabled.
     "VLLM_ROCM_MONO_K1_VERIFY": lambda: (
         os.getenv("VLLM_ROCM_MONO_K1_VERIFY", "1").lower() in ("true", "1")
+    ),
+    # With VLLM_ROCM_MONO_DECODE, a QSA layer's verify-step K1 front also
+    # runs attn.qkv_proj (online MXFP4, K1Build.qsa_proj) and index_qk_proj
+    # (bf16), handing their output to qsa_prepare / top-k / sparse attention
+    # directly, in place of the two separate skinny GEMM launches. Only
+    # engages when qkv_proj's quant method is the online MXFP4 one on the
+    # ASM FP4 GEMM (else the stock path runs, unaffected). By default is
+    # disabled.
+    "VLLM_ROCM_MONO_K1_QSA_PROJ": lambda: (
+        os.getenv("VLLM_ROCM_MONO_K1_QSA_PROJ", "0").lower() in ("true", "1")
     ),
     # Run the eligible MTP draft step (the single draft layer's QSA attention,
     # HC and sparse MoE) on the mono kernels. By default is disabled.

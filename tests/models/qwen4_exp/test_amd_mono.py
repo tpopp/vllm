@@ -493,6 +493,113 @@ def test_k1_proj_only_matches_hc_front_and_stock_in_proj(s: int) -> None:
     assert ba_ulp <= 4.0, ba_ulp
 
 
+# ---------------------------------------------------------------- K1 qsa_proj
+def _qsa_proj_inputs(s: int):
+    from vllm.models.qwen4_exp.amd.mono.layout import HH, HIDDEN, IDXQK, Layout
+
+    lay = Layout(TP)
+    g = torch.Generator(device="cuda").manual_seed(0)
+    w = {
+        "state": _randn(g, s, HH, scale=2.0),
+        **_hc_weights(g),
+        "w_idx": _randn(g, IDXQK, HIDDEN, scale=0.05),
+    }
+    q, sc, w["w_qkv"], w["w_qkvs"] = _mxfp4_linear(g, lay.QKV, HIDDEN)
+    w["w_qkv_ref"] = _mxfp4_dequant(q, sc).to(bf)
+    return w
+
+
+@pytest.mark.parametrize("s", [1, 4, 8])
+@torch.inference_mode()
+def test_k1_qsa_proj_matches_hc_front_and_stock_proj(s: int) -> None:
+    """P2Q: K1's ``qsa_proj`` build (the HC front + online-MXFP4 ``qkv_proj``
+    / bf16 ``index_qk_proj``) against ``hc_front`` (``x`` / ``inj_out`` must
+    be bitwise equal: the same HC-stage code either way, just a different
+    ``bin_out`` store alongside the scratch one) and the stock projections it
+    folds in: ``qkv_out`` against the real stock MXFP4 GEMM
+    (``_mxfp4_linear_stock``, as ``test_k1_proj_only_matches_hc_front_and_
+    stock_in_proj`` checks in_proj_qkvz against) and the dequantized
+    reference; ``idx_out`` against the stock bf16 ``F.linear``."""
+    from vllm.models.qwen4_exp.amd.mono import k1
+    from vllm.models.qwen4_exp.amd.mono.layout import HC, HIDDEN, IDXQK, Layout
+
+    lay = Layout(TP)
+    w = _qsa_proj_inputs(s)
+
+    key_front = k1.K1Build(tokens=s, tp=TP, self_msq=True, front_only=True)
+    x_front = torch.full((s, HIDDEN), float("nan"), dtype=bf, device="cuda")
+    inj_front = torch.full((s, HC), float("nan"), dtype=bf, device="cuda")
+    scr_front = torch.zeros(
+        k1.scratch_bytes(key_front), dtype=torch.uint8, device="cuda"
+    )
+    k1.hc_front(
+        key_front,
+        state=w["state"],
+        msq_in=None,
+        hc_w=w["hc_w"],
+        w_down=w["w_down"],
+        w_up=w["w_up"],
+        inj_out=inj_front,
+        bin_out=x_front,
+        scratch=scr_front,
+        epoch=torch.ones(1, dtype=torch.int32, device="cuda"),
+        layer=0,
+    )
+
+    key_qsa = k1.K1Build(tokens=s, tp=TP, self_msq=True, qsa_proj=True)
+    x_qsa = torch.full((s, HIDDEN), float("nan"), dtype=bf, device="cuda")
+    inj_qsa = torch.full((s, HC), float("nan"), dtype=bf, device="cuda")
+    qkv_out = torch.full((s, lay.QKV), float("nan"), dtype=bf, device="cuda")
+    idx_out = torch.full((s, IDXQK), float("nan"), dtype=bf, device="cuda")
+    scr_qsa = torch.zeros(k1.scratch_bytes(key_qsa), dtype=torch.uint8, device="cuda")
+    k1.qsa_proj_pre(
+        key_qsa,
+        state=w["state"],
+        msq_in=None,
+        hc_w=w["hc_w"],
+        w_down=w["w_down"],
+        w_up=w["w_up"],
+        inj_out=inj_qsa,
+        bin_out=x_qsa,
+        w_qkv=w["w_qkv"],
+        w_qkvs=w["w_qkvs"],
+        w_idx=w["w_idx"],
+        qkv_out=qkv_out,
+        idx_out=idx_out,
+        scratch=scr_qsa,
+        epoch=torch.ones(1, dtype=torch.int32, device="cuda"),
+        layer=1,
+    )
+    torch.accelerator.synchronize()
+
+    # x / inj_out: the same HC-stage code as hc_front, on the same inputs
+    assert torch.equal(x_qsa, x_front)
+    assert torch.equal(inj_qsa, inj_front)
+
+    # qkv_out: the real stock MXFP4 GEMM (loose, hardware-rounding bound) and
+    # the dequantized reference (tight, matching the decode K1 in_proj check)
+    stock = _mxfp4_linear_stock(x_qsa, w["w_qkv"], w["w_qkvs"])
+    assert _cos(qkv_out, stock) > STOCK_COS_MIN
+    want_qkv = F.linear(_mxfp4_qdq(x_qsa).to(bf), w["w_qkv_ref"])
+    assert _cos(qkv_out, want_qkv) > COS_MIN
+    qkv_ulp = (
+        (qkv_out.float() - want_qkv.float()).abs()
+        / _bf16_ulp(want_qkv).clamp_min(1e-30)
+    ).max().item()
+    print(f"\nqkv_out vs dequant reference: max {qkv_ulp:.2f} bf16 ulp")
+    assert qkv_ulp <= 4.0, qkv_ulp
+
+    # idx_out: the stock bf16 F.linear
+    want_idx = F.linear(x_qsa, w["w_idx"])
+    assert _cos(idx_out, want_idx) > COS_MIN
+    idx_ulp = (
+        (idx_out.float() - want_idx.float()).abs()
+        / _bf16_ulp(want_idx).clamp_min(1e-30)
+    ).max().item()
+    print(f"idx_out vs F.linear: max {idx_ulp:.2f} bf16 ulp")
+    assert idx_ulp <= 4.0, idx_ulp
+
+
 # ---------------------------------------------------------------- K1 verify
 def _verify_inputs(accepted: list, pad_last: bool):
     """A uniform verify batch: ``len(accepted)`` requests, ``k1.VERIFY_WINDOW``

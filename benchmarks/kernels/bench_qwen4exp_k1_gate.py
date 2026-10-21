@@ -10,11 +10,19 @@ Triton kernel, the gated RMSNorm), K1's ``proj_only`` build
 (P1b, shipped: the HC front + in_proj_qkvz/ba, no GDN tasks) against
 ``hc_front`` + the stock quant+GEMM / bf16 GEMM / unpack chain it folds in
 (the GDN verify core's conv + gated delta rule are untouched either way,
-left to AITER -- §1 of gather/gdn_verify.md), and (P3) K1's ``verify``
+left to AITER -- §1 of gather/gdn_verify.md), (P3) K1's ``verify``
 build (the GDN verify core -- conv, gated delta rule, gated norm -- also
 in-kernel) against ``proj_only`` chained into the stock calls it still
 needs (``gdn_spec_decode_conv_gdr_aiter`` + ``_gated_rms_norm``): only
-meaningful at S a multiple of ``k1.VERIFY_WINDOW`` (4), i.e. ``--s 4,8``.
+meaningful at S a multiple of ``k1.VERIFY_WINDOW`` (4), i.e. ``--s 4,8``,
+and (P2Q) K1's ``qsa_proj`` build (a QSA layer's HC front + online-MXFP4
+``qkv_proj`` / bf16 ``index_qk_proj``) against two stock references:
+``hc_front`` + the real stock MXFP4 GEMM (quant + ASM FP4 GEMM) on
+``qkv_proj``, and ``hc_front`` + today's actual stock dispatch for
+``qkv_proj`` (bf16, ``rocm_unquantized_gemm_impl`` -- wvSplitK at the
+shapes that qualify) -- the second is what every deployment without
+``--quantization-config.targets``'s ``"*self_attn.qkv_proj": "mxfp4"``
+still runs, so ``qsa_proj`` must beat *both* to be worth wiring in.
 
 Usage:
     torchrun --nproc-per-node 2 benchmarks/kernels/bench_qwen4exp_k1_gate.py \
@@ -460,6 +468,104 @@ def bench_k1_verify_gate(s, device, rank, world_size, epoch, iters, vch=16):
     ]
 
 
+# ------------------------------------------------------- 6. K1 qsa_proj (P2Q)
+def bench_k1_qsa_proj_gate(s, device, rank, world_size, epoch, iters):
+    """P2Q: K1's ``qsa_proj`` build (the HC front + online-MXFP4 ``qkv_proj``
+    / bf16 ``index_qk_proj``) against two stock references a verify step's
+    QSA layer runs today in its place: the real stock MXFP4 GEMM (quant +
+    ASM FP4 GEMM, the path ``--quantization-config.targets``'s
+    ``"*self_attn.qkv_proj": "mxfp4"`` engages) and today's actual default
+    dispatch (bf16, ``rocm_unquantized_gemm_impl`` -- wvSplitK at the shapes
+    that qualify) -- ``hc_front``'s own x feeding all three."""
+    from tests.models.qwen3_5.test_amd_mono import _mxfp4_linear_stock
+    from tests.models.qwen4_exp.test_amd_mono import _qsa_proj_inputs
+    from vllm.model_executor.layers.utils import rocm_unquantized_gemm_impl
+    from vllm.models.qwen4_exp.amd.mono import k1
+    from vllm.models.qwen4_exp.amd.mono.layout import HC, HIDDEN, IDXQK, Layout
+
+    lay = Layout(TP)
+    w = _qsa_proj_inputs(s)
+    inj = torch.empty(s, HC, dtype=bf, device=device)
+    x_bin = torch.empty(s, HIDDEN, dtype=bf, device=device)
+
+    key_qsa = k1.K1Build(tokens=s, tp=TP, self_msq=True, qsa_proj=True)
+    scr_qsa = torch.zeros(
+        k1.scratch_bytes(key_qsa), dtype=torch.uint8, device=device
+    )
+    qkv_out = torch.empty(s, lay.QKV, dtype=bf, device=device)
+    idx_out = torch.empty(s, IDXQK, dtype=bf, device=device)
+
+    def _k1_qsa():
+        epoch.add_(1)
+        k1.qsa_proj_pre(
+            key_qsa,
+            state=w["state"],
+            msq_in=None,
+            hc_w=w["hc_w"],
+            w_down=w["w_down"],
+            w_up=w["w_up"],
+            inj_out=inj,
+            bin_out=x_bin,
+            w_qkv=w["w_qkv"],
+            w_qkvs=w["w_qkvs"],
+            w_idx=w["w_idx"],
+            qkv_out=qkv_out,
+            idx_out=idx_out,
+            scratch=scr_qsa,
+            epoch=epoch,
+            layer=4,
+        )
+
+    key_front = k1.K1Build(tokens=s, tp=TP, self_msq=True, front_only=True)
+    scr_front = torch.zeros(
+        k1.scratch_bytes(key_front), dtype=torch.uint8, device=device
+    )
+
+    def _launch_front(layer):
+        k1.hc_front(
+            key_front,
+            state=w["state"],
+            msq_in=None,
+            hc_w=w["hc_w"],
+            w_down=w["w_down"],
+            w_up=w["w_up"],
+            inj_out=inj,
+            bin_out=x_bin,
+            scratch=scr_front,
+            epoch=epoch,
+            layer=layer,
+        )
+
+    def _front_plus_stock_mxfp4():
+        epoch.add_(1)
+        _launch_front(5)
+        qkv_ref = _mxfp4_linear_stock(x_bin, w["w_qkv"], w["w_qkvs"])
+        idx_ref = F.linear(x_bin, w["w_idx"])
+        del qkv_ref, idx_ref
+
+    def _front_plus_stock_bf16():
+        epoch.add_(1)
+        _launch_front(6)
+        qkv_ref = rocm_unquantized_gemm_impl(x_bin, w["w_qkv_ref"], None)
+        idx_ref = F.linear(x_bin, w["w_idx"])
+        del qkv_ref, idx_ref
+
+    cases = (
+        ("k1.qsa_proj_pre (P2Q: HC front + MXFP4 qkv_proj + index_qk_proj)", _k1_qsa),
+        (
+            "hc_front + stock MXFP4 qkv_proj (quant + ASM GEMM) + F.linear",
+            _front_plus_stock_mxfp4,
+        ),
+        (
+            "hc_front + stock bf16 qkv_proj (today's dispatch) + F.linear",
+            _front_plus_stock_bf16,
+        ),
+    )
+    return [
+        (name, _time_eager(fn, iters), _time_graph(fn, iters)) for name, fn in cases
+    ]
+
+
 # ---------------------------------------------------------------- plumbing
 def setup_distributed():
     if not {"RANK", "WORLD_SIZE", "LOCAL_RANK"} <= os.environ.keys():
@@ -542,6 +648,11 @@ def main() -> None:
             "5. K1 verify (P3, vch=32) vs proj_only + stock conv_gdr + gated norm",
             bench_k1_verify_gate,
             {"vch": 32},
+        ),
+        (
+            "6. K1 qsa_proj (P2Q) vs hc_front + stock MXFP4 / stock bf16 qkv_proj",
+            bench_k1_qsa_proj_gate,
+            {},
         ),
     )
     for s in s_list:
