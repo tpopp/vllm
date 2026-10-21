@@ -4,12 +4,20 @@
 launch a draft step, ``BLOCKS`` x ``THREADS``, S <= 8 rows:
 
     gemv     (every CTA, row groups 16 g .. of this rank's vocab shard, g =
-             bid, bid + 256, ... < ceil(rows / 16), ``AHEAD`` groups' weights
-             kept in flight, as ``run_ug``'s union tasks): an online-MXFP4
-             GEMV (``quant_x`` first) of the shard's rows against the block's
-             x, bf16-rounded, folded into a running (max, global row) a token
-             (padding rows -- >= ``valid`` -- never win; a non-live group
-             never runs at all, the dynamic loop just exits)
+             bid, bid + 256, ... < ceil(rows / 16), ``key.ahead`` groups'
+             weights kept in flight, as ``run_ug``'s union tasks): an
+             online-MXFP4 GEMV (``quant_x`` first) of the shard's rows
+             against the block's x, bf16-rounded, folded into a running
+             (max, global row) a token (padding rows -- >= ``valid`` --
+             never win; a non-live group never runs at all, the dynamic
+             loop just exits). ``key.one_barrier``: the running MFMA tile
+             is reduced through a double-buffered LDS scratch (alternating
+             by iteration parity), one ``gpu.barrier()`` a group instead of
+             two -- the next iteration's store (the other half) can only
+             happen once every thread has passed this iteration's barrier,
+             and every thread's own read of the current half precedes its
+             own next store in program order, so that barrier already
+             implies the current half's reads are done.
     cta      (every CTA): the running best reduced to one a token (a
              4/2/1-lane xor-shuffle window: the 8 row-pair threads of a
              token) -> every CTA's (value, local row) to a scratch mailbox
@@ -78,7 +86,7 @@ ROWS = L.ROWS  # 16: a weight row group
 RP = ROWS // 2  # 8: the fold's row-pair threads a token
 XROW = H + gemv.LDS_PAD
 NEG_INF = -(2.0**127)  # a logit that never wins
-AHEAD = 2  # row groups' weights kept in flight (raise to 3 if VGPRs allow)
+RED_BUF = WAVES * 64 * 4  # words a (one-barrier) reduction buffer
 
 _STREAM = fx.Stream(None)
 
@@ -88,6 +96,8 @@ class HeadBuild:
     tokens: int
     tp: int = 2
     rows: int = 124160  # this rank's vocab shard, padding included: a multiple of 32
+    ahead: int = 3  # row groups' weights kept in flight (swept 2..5, see NOTES)
+    one_barrier: bool = True  # double-buffered reduction: 1 barrier a group
 
 
 ABI = KernelAbi(
@@ -168,26 +178,34 @@ def _store_i64(ptr, i, v):
 
 
 # ---------------------------------------------------------------- stages
+def run_head(c, groups, ahead, one_barrier):
+    """Dispatches to the one- or two-``gpu.barrier()``-a-group loop (a
+    build-time choice, ``one_barrier``): both walk this rank's vocab shard,
+    16-row groups ``bid, bid + 256, ...`` (a dynamic loop: a CTA whose first
+    group is already past ``groups`` never runs its body, as a non-live round
+    used to be masked), ``ahead`` groups' online-MXFP4 operands kept in
+    flight (``run_ug``'s union-task pipelining), each group's bf16-rounded
+    logits folded into a running (max, global row) a token. Returns
+    (best_val, best_idx); the per-row math is identical either way."""
+    if one_barrier:
+        return _run_head_1barrier(c, groups, ahead)
+    return _run_head_2barrier(c, groups, ahead)
+
+
 @traced
-def run_head(c, groups):
-    """This rank's vocab shard, 16-row groups ``bid, bid + 256, ...`` (a
-    dynamic loop: a CTA whose first group is already past ``groups`` never
-    runs its body, as a non-live round used to be masked): ``AHEAD`` groups'
-    online-MXFP4 operands kept in flight (``run_ug``'s union-task pipelining),
-    each group's bf16-rounded logits folded into a running (max, global row)
-    a token. Returns (best_val, best_idx)."""
+def _run_head_2barrier(c, groups, ahead):
     lane, wave, tid, s, red = c["lane"], c["wave"], c["tid"], c["S"], c["red"]
     xl, valid, bid = c["xl"], c["valid"], c["bid"]
     last = groups - 1
     g = bid
-    ops = [_group_ops(c, fx.min(g + BLOCKS * j, last)) for j in range(AHEAD)]
+    ops = [_group_ops(c, fx.min(g + BLOCKS * j, last)) for j in range(ahead)]
     best_val = fx.Float32(NEG_INF)
     best_idx = fx.Int32(0)
     mine = tid < RP * s
     r = 2 * (tid % RP)
     t = fx.min(tid // RP, s - 1)
     while g < groups:
-        ops_n = _group_ops(c, fx.min(g + BLOCKS * AHEAD, last))
+        ops_n = _group_ops(c, fx.min(g + BLOCKS * ahead, last))
         acc = fp4_gemv(lane, wave, xl, XROW, H, s, g, ops[0])
         fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
         gpu.barrier()
@@ -202,6 +220,47 @@ def run_head(c, groups):
         gpu.barrier()
         g = g + BLOCKS
         ops = ops[1:] + [ops_n]
+    return best_val, best_idx
+
+
+@traced
+def _run_head_1barrier(c, groups, ahead):
+    """As ``_run_head_2barrier``, but ``red`` is double-buffered by iteration
+    parity (``par``): a group's store lands in the other half from the
+    previous group's, so the single barrier right after this group's store
+    both publishes it and (for free) proves the previous group's reads of
+    its own half are done -- each thread's own read-then-next-store is
+    already in program order, and no thread passes the barrier until every
+    thread has reached it, i.e. has issued its own store, which it can only
+    do after its own prior read of that same half."""
+    lane, wave, tid, s, red = c["lane"], c["wave"], c["tid"], c["S"], c["red"]
+    xl, valid, bid = c["xl"], c["valid"], c["bid"]
+    last = groups - 1
+    g = bid
+    ops = [_group_ops(c, fx.min(g + BLOCKS * j, last)) for j in range(ahead)]
+    best_val = fx.Float32(NEG_INF)
+    best_idx = fx.Int32(0)
+    mine = tid < RP * s
+    r = 2 * (tid % RP)
+    t = fx.min(tid // RP, s - 1)
+    par = fx.Int32(0)
+    while g < groups:
+        ops_n = _group_ops(c, fx.min(g + BLOCKS * ahead, last))
+        acc = fp4_gemv(lane, wave, xl, XROW, H, s, g, ops[0])
+        buf = red + par * RED_BUF
+        fx.ptr_store(acc, buf + (wave * 64 + lane) * 4)
+        gpu.barrier()
+        v0 = _safe(bf16_round(row_sum(buf, r, t)))
+        v1 = _safe(bf16_round(row_sum(buf, r + 1, t)))
+        idx0 = g * ROWS + r
+        idx1 = idx0 + 1
+        cv0 = (mine & (idx0 < valid)).select(v0, fx.Float32(NEG_INF))
+        cv1 = (mine & (idx1 < valid)).select(v1, fx.Float32(NEG_INF))
+        best_val, best_idx = _better(cv0, idx0, best_val, best_idx)
+        best_val, best_idx = _better(cv1, idx1, best_val, best_idx)
+        g = g + BLOCKS
+        ops = ops[1:] + [ops_n]
+        par = fx.Int32(1) - par
     return best_val, best_idx
 
 
@@ -271,25 +330,32 @@ def build(key: HeadBuild):
         return _BUILDS[key]
     s = key.tokens
     tp = key.tp
+    ahead = key.ahead
+    one_barrier = key.one_barrier
     need(1 <= s <= L.MAX_TOKENS, f"{s} rows, the kernel takes 1..{L.MAX_TOKENS}")
     need(
         key.rows % 32 == 0,
         "rows: the ASM FP4 GEMM's scale shuffle needs a 32-row shard",
     )
+    need(ahead >= 1, "ahead: at least this group's own operands must be in flight")
     L.Layout(tp)  # validates tp against L.TPS
     groups = key.rows // ROWS
     scr = scratch_layout(key)
     play = peer_layout(L.MAX_TOKENS, tp)
     half = peer_bytes(tp) // 2
     xwords = s * (H + gemv.LDS_PAD) // 2
+    # one_barrier's double-buffered reduction needs 2 x RED_BUF; the plain
+    # 2-barrier loop only ever touches the first half, so sharing one (larger)
+    # layout keeps Smem's shape independent of key.one_barrier.
+    red_words = (2 if one_barrier else 1) * RED_BUF
 
     @fx.struct
     class Smem:
-        red: fx.Array[fx.Float32, WAVES * 64 * 4, 16]
+        red: fx.Array[fx.Float32, red_words, 16]
         xl: fx.Array[fx.Int32, xwords, 16]
 
     keyed = key_tuple(key, digest())
-    name = f"flashnext_mono_head_s{s}_t{tp}"
+    name = f"flashnext_mono_head_s{s}_t{tp}_a{ahead}_b{1 if one_barrier else 2}"
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def head(
@@ -349,7 +415,7 @@ def build(key: HeadBuild):
         quant_x(c, H)
 
         # ---- the shard's row groups -> one (max, local row) a token a CTA
-        c["best"] = run_head(c, groups)
+        c["best"] = run_head(c, groups, ahead, one_barrier)
         stage_cta(c)
 
         # ---- CTA 0, a token a wave: every CTA's winner, then every rank's

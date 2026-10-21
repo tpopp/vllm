@@ -345,6 +345,12 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--s", type=str, default="1,2,4,8")
     p.add_argument("--iters", type=int, default=200)
+    p.add_argument(
+        "--sections",
+        type=str,
+        default="1,2,3,4",
+        help="comma-separated section numbers to run (default: all 4)",
+    )
     return p.parse_args()
 
 
@@ -367,12 +373,14 @@ def main() -> None:
     head_peers.bytes.zero_()
     k2_peers.bytes.zero_()
 
-    sections = (
+    all_sections = (
         ("1. draft_head", bench_draft_head, {"peers": head_peers}),
         ("2. draft_front", bench_draft_front, {}),
         ("3. final mixer (hc_front)", bench_mixer, {}),
         ("4. K2 layer_post (draft layer)", bench_k2_layer_post, {"peers": k2_peers}),
     )
+    wanted = {int(v) for v in args.sections.split(",") if v}
+    sections = [s for i, s in enumerate(all_sections, 1) if i in wanted]
     for s in s_list:
         if rank == 0:
             print(f"\n=== S={s} ===")
