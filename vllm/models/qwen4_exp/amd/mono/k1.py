@@ -124,6 +124,12 @@ class K1Build:
     verify: bool = False  # the HC front + in_proj + the GDN verify core (P3)
     eps: float = 1e-6  # the HC norm
     norm_eps: float = 1e-6  # the GDN gated norm
+    vch: int = 16  # ``verify`` only: a GDN verify task's state-row chunk size
+    # (decode ignores this: its tasks always use ``gdn.VCH``). A bigger chunk
+    # means fewer tasks a request (``gdn.HD // vch``), so a 2-request verify
+    # batch (S=8) can still fit one task round on 256 CTAs (vch=32 -> 96
+    # tasks/request, 192 for 2 requests) instead of the two rounds vch=16
+    # needs (192/request, 384 total) -- see INTEGRATION_LEDGER.md §C2.
 
 
 ABI = KernelAbi(
@@ -165,9 +171,9 @@ def ba_tasks(lay):
     return lay.BA // ROWS * BA_PARTS
 
 
-def gdn_tasks_of(lay):
-    """GDN tasks a token (decode) or a request (verify)."""
-    return lay.NV * NVCH
+def gdn_tasks_of(lay, vch: int = VCH):
+    """GDN tasks a token (decode) or a request (verify), ``vch``-row chunks."""
+    return lay.NV * (HD // vch)
 
 
 def req_count(key: K1Build) -> int:
@@ -197,11 +203,14 @@ def scratch_layout(key: K1Build) -> dict:
             # tasks poll a mailbox copy of it, so there is none. ``verify``'s
             # GDN tasks *do* poll one (same shape as the decode build: one
             # row a token, same ``s`` rows, just grouped ``VERIFY_WINDOW`` a
-            # request instead of one a task).
+            # request instead of one a task). ``onrm``'s partial count a
+            # (token, head) is the chunk count: ``NVCH`` (decode's fixed
+            # VCH=16 chunk) or ``HD // key.vch`` (verify's build parameter).
+            nvch_eff = (HD // key.vch) if key.verify else NVCH
             pairs = pairs | {
                 "proj": s * lay.QKVZ,
                 "qk": s * lay.NK * 2 * HD,
-                "onrm": s * lay.NV * NVCH,
+                "onrm": s * lay.NV * nvch_eff,
             }
     out = pair_layout(pairs.items())
     if not key.front_only:
@@ -220,7 +229,8 @@ def f32_of(w):
 
 def gdn_offset(key: K1Build) -> int:
     """The first GDN CTA: the high (down only) CTAs while a single round fits."""
-    n = task_units(key) * gdn_tasks_of(L.Layout(key.tp))
+    vch = key.vch if key.verify else VCH
+    n = task_units(key) * gdn_tasks_of(L.Layout(key.tp), vch)
     return BLOCKS - n if n < BLOCKS else 0
 
 
@@ -299,7 +309,13 @@ def build(key: K1Build):
     n_req = req_count(key) if key.verify else 0
     lay = L.Layout(key.tp)
     scr = scratch_layout(key)
-    gt = gdn_tasks_of(lay)
+    vch = key.vch if key.verify else VCH
+    if key.verify:
+        need(
+            HD % vch == 0 and THREADS % vch == 0,
+            f"vch={vch} must divide HD={HD} and THREADS={THREADS}",
+        )
+    gt = gdn_tasks_of(lay, vch)
     nr = -(-task_units(key) * gt // BLOCKS)
     # verify runs phase-major: one LDS slot a (round, token)
     nr_lds = nr * (VERIFY_WINDOW if key.verify else 1)
@@ -316,8 +332,8 @@ def build(key: K1Build):
     @fx.struct
     class GdnLds:
         qkl: fx.Array[fx.Float32, nr_lds * 2 * HD, 16]
-        vloc: fx.Array[fx.Float32, nr_lds * VCH, 16]
-        ol: fx.Array[fx.Float32, nr_lds * VCH, 16]
+        vloc: fx.Array[fx.Float32, nr_lds * vch, 16]
+        ol: fx.Array[fx.Float32, nr_lds * vch, 16]
         scal: fx.Array[fx.Float32, nr_lds * 4, 16]
 
     @fx.union
@@ -334,7 +350,7 @@ def build(key: K1Build):
     keyed = key_tuple(key, digest())
     name = (
         f"flashnext_mono_k1_s{s}_t{key.tp}_m{int(key.self_msq)}_f{int(key.front_only)}"
-        f"_p{int(key.proj_only)}_v{int(key.verify)}"
+        f"_p{int(key.proj_only)}_v{int(key.verify)}_vc{key.vch}"
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -491,7 +507,7 @@ def build(key: K1Build):
                 store_ba_out(c)
             else:
                 if const_expr(key.verify):
-                    gdn_tasks_verify(c, nr, n_req, VERIFY_WINDOW)
+                    gdn_tasks_verify(c, nr, n_req, VERIFY_WINDOW, key.vch)
                 else:
                     gdn_tasks(c, nr)
 

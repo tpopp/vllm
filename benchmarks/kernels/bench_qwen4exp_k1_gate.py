@@ -322,7 +322,7 @@ def bench_k1_proj_gate(s, device, rank, world_size, epoch, iters):
 
 
 # ------------------------------------------------------------- 5. K1 verify
-def bench_k1_verify_gate(s, device, rank, world_size, epoch, iters):
+def bench_k1_verify_gate(s, device, rank, world_size, epoch, iters, vch=16):
     """P3: K1's ``verify`` build (the HC front + in_proj + the GDN verify
     core -- conv, gated delta rule, gated norm -- all in-kernel) against
     P1b's ``proj_pre`` (the HC front + in_proj alone) chained into the stock
@@ -332,7 +332,12 @@ def bench_k1_verify_gate(s, device, rank, world_size, epoch, iters):
     ``n_req = s // k1.VERIFY_WINDOW`` live requests, no padding row-group:
     every request's state read/written, the stock chain's worst case).
     Only meaningful at ``s`` a multiple of ``k1.VERIFY_WINDOW`` (4): the
-    production verify widths, S=4 (one request) and S=8 (two)."""
+    production verify widths, S=4 (one request) and S=8 (two).
+
+    ``vch``: the verify build's GDN task chunk size (``K1Build.vch``), 16
+    (8 chunks/value head, P3's original layout) or 32 (4 chunks, half the
+    tasks a request -- lets S=8's 2 requests fit one task round on 256 CTAs
+    instead of two, INTEGRATION_LEDGER.md §C2)."""
     from tests.models.qwen4_exp.test_amd_mono import _verify_inputs
     from vllm.model_executor.layers.mamba.ops.gdn_spec_decode_rocm import (
         gdn_spec_decode_conv_gdr_aiter,
@@ -348,7 +353,7 @@ def bench_k1_verify_gate(s, device, rank, world_size, epoch, iters):
     inj = torch.empty(s, HC, dtype=bf, device=device)
     qsl = torch.arange(0, s + 1, k1.VERIFY_WINDOW, dtype=torch.int32, device=device)
 
-    key_verify = k1.K1Build(tokens=s, tp=TP, self_msq=True, verify=True)
+    key_verify = k1.K1Build(tokens=s, tp=TP, self_msq=True, verify=True, vch=vch)
     scr_verify = torch.zeros(
         k1.scratch_bytes(key_verify), dtype=torch.uint8, device=device
     )
@@ -444,7 +449,10 @@ def bench_k1_verify_gate(s, device, rank, world_size, epoch, iters):
         )
 
     cases = (
-        ("k1.verify_pre (P3: HC front + in_proj + GDN verify core)", _k1_verify),
+        (
+            f"k1.verify_pre (P3 vch={vch}: HC front + in_proj + GDN verify core)",
+            _k1_verify,
+        ),
         ("proj_pre (P1b) + stock conv_gdr + _gated_rms_norm", _proj_plus_stock),
     )
     return [
@@ -526,9 +534,14 @@ def main() -> None:
             {},
         ),
         (
-            "5. K1 verify (P3) vs proj_only + stock conv_gdr + gated norm",
+            "5. K1 verify (P3, vch=16) vs proj_only + stock conv_gdr + gated norm",
             bench_k1_verify_gate,
-            {},
+            {"vch": 16},
+        ),
+        (
+            "5. K1 verify (P3, vch=32) vs proj_only + stock conv_gdr + gated norm",
+            bench_k1_verify_gate,
+            {"vch": 32},
         ),
     )
     for s in s_list:

@@ -554,25 +554,27 @@ def gdn_norm(c, k, t, h, ch):
 
 
 @traced
-def gdn_norm_verify(c, k, t, h, ch):
-    """Rows 16 ch ..: (verify: a duplicate task stores nothing) RMSNormGated over the head's 128 (every chunk's partial):
-    bf16(o rstd w gate(z)) -> ``core``, the gate the model's ``z_gate``."""
+def gdn_norm_verify(c, k, t, h, ch, vch):
+    """Rows ``vch`` ch ..: (verify: a duplicate task stores nothing)
+    RMSNormGated over the head's 128 (every chunk's partial): bf16(o rstd w
+    gate(z)) -> ``core``, the gate the model's ``z_gate``."""
     tid = c["tid"]
     a, g = c["args"], c["gdn"]
     tl = k["tl"]
-    if tid < VCH:
-        vr = ch * VCH + tid
+    nvch = HD // vch
+    if tid < vch:
+        vr = ch * vch + tid
         z0 = 2 * g.nk * HD + g.nv * HD
         got = c["poll"](
-            [(c["onrm"], (t * g.nv + h) * NVCH + q, 1) for q in range(NVCH)]
+            [(c["onrm"], (t * g.nv + h) * nvch + q, 1) for q in range(nvch)]
             + [(c["proj"], t * g.proj + z0 + h * HD + vr, 1)]
         )
         ss = f32_of(got[0][0])
-        for q in range_constexpr(1, NVCH):
+        for q in range_constexpr(1, nvch):
             ss = ss + f32_of(got[q][0])
         r = hw_rsq(ss * fx.Float32(1.0 / HD) + fx.Float32(c["norm_eps"]))
         y = fx.ptr_load(c["ol"] + tid) * r * ld_bf(a["norm_w"], vr)
-        y = y * c["z_gate"](f32_of(got[NVCH][0]))
+        y = y * c["z_gate"](f32_of(got[nvch][0]))
         y = (k["slot"] > 0).select(y, fx.Float32(0.0))
         if tl:
             bo.buffer_store(
@@ -643,21 +645,49 @@ def gdn_tasks(c, rounds):
 # ``gdn_spec_decode_mono_fused``'s ``bad`` check.
 
 
-def gdn_round_verify(c, r, n_req):
+def _load_rows(ptr, off, n):
+    """``n`` consecutive fp32 at ``off`` of ``ptr``, as dwordx4 chunks (the
+    hardware has no wider buffer load): a flat Python list of ``n`` scalars,
+    for a verify task's recurrent-state row(s) at any ``vch`` (``n`` a
+    multiple of 4: ``HD // (THREADS // vch)`` for ``vch`` in (16, 32)).
+    ``range_constexpr``, not ``range``: a plain Python list grown across a
+    traced ``for`` loop's iterations must not become a dynamic ``scf.for``
+    (the rewriter would turn ``i`` into a traced value, breaking the list
+    index)."""
+    vals = []
+    for i in range_constexpr(0, n, 4):
+        v = fx.Vector(bo.buffer_load(rsrc(ptr), off + i, vec_width=4, dtype=T.f32))
+        vals += [v[j] for j in range(4)]
+    return vals
+
+
+def _store_rows(ptr, off, vals):
+    """The inverse of ``_load_rows``: ``vals`` (a Python list, len a multiple
+    of 4) stored as dwordx4 chunks starting at ``off``."""
+    for i in range_constexpr(0, len(vals), 4):
+        bo.buffer_store(
+            fx.Vector.from_elements(vals[i : i + 4], fx.Float32), rsrc(ptr), off + i
+        )
+
+
+def gdn_round_verify(c, r, n_req, vch):
     """Round r's task of this CTA, counting requests (not token rows): the
-    task's (request, head, chunk) -- otherwise exactly ``gdn_round``."""
+    task's (request, head, chunk) -- otherwise exactly ``gdn_round``. ``vch``:
+    the verify build's state-row chunk size (``K1Build.vch``, decode's fixed
+    ``VCH`` otherwise); ``nvch`` is ``HD // vch``, chunks a value head."""
     nv = c["gdn"].nv
-    n = n_req * nv * NVCH
+    nvch = HD // vch
+    n = n_req * nv * nvch
     task = (c["bid"] + (BLOCKS - c["goff"])) % BLOCKS + BLOCKS * r
     tc = fx.min(task, n - 1)
     cr = dict(c)
-    for name, m in (("qkl", 2 * HD), ("vloc", VCH), ("ol", VCH), ("scal", 4)):
+    for name, m in (("qkl", 2 * HD), ("vloc", vch), ("ol", vch), ("scal", 4)):
         cr[name] = c[name] + r * m
-    return cr, task < n, tc // (nv * NVCH), (tc // NVCH) % nv, tc % NVCH
+    return cr, task < n, tc // (nv * nvch), (tc // nvch) % nv, tc % nvch
 
 
 @traced
-def gdn_stage_verify(c, req, h, ch, t_tokens, tl):
+def gdn_stage_verify(c, req, h, ch, t_tokens, tl, vch):
     """A verify task's per-request setup, read once (no per-token hand-off):
     the conv-state slot (``spec_state_indices[req, 0]``), the checkpoint
     recurrent-state slot (``spec_state_indices[req, num_accepted[req] - 1]``),
@@ -687,11 +717,11 @@ def gdn_stage_verify(c, req, h, ch, t_tokens, tl):
     k["idx_base"] = idx_base
     kh = h // (g.nv // g.nk)
     k["owner"] = (h % (g.nv // g.nk)) == 0
-    ct = fx.min(tid, 3 * VCH - 1)
-    part = ct // VCH
-    i = ct % VCH
-    qk_chan = part * (g.nk * HD) + kh * HD + ch * VCH + i
-    v_chan = 2 * g.nk * HD + h * HD + ch * VCH + i
+    ct = fx.min(tid, 3 * vch - 1)
+    part = ct // vch
+    i = ct % vch
+    qk_chan = part * (g.nk * HD) + kh * HD + ch * vch + i
+    v_chan = 2 * g.nk * HD + h * HD + ch * vch + i
     chan = (part < 2).select(qk_chan, v_chan)
     k["part"], k["i"], k["chan"] = part, i, chan
     cs = a["conv_st"] + fx.Int64(fx.max(conv_slot, 0)) * fx.Int64(a["cs_seq"]) * 2
@@ -705,19 +735,22 @@ def gdn_stage_verify(c, req, h, ch, t_tokens, tl):
         bo.buffer_load(rsrc(a["conv_w"]), chan * 2, vec_width=2, dtype=T.i32)
     )
     k["cw"] = [bf_lo(cw[0]), bf_hi(cw[0]), bf_lo(cw[1]), bf_hi(cw[1])]
-    vr = ch * VCH + tid // 32
-    k["head_off"] = (h * HD + vr) * HD + (tid % 32) * 4
+    # recurrence: ``THREADS // vch`` threads share a state row, each owning
+    # ``HD // (THREADS // vch)`` K columns (vch=16: 32 threads x 4 cols;
+    # vch=32: 16 threads x 8 cols, two dwordx4 loads/stores a row)
+    rows_per_group = THREADS // vch
+    kperthread = HD // rows_per_group
+    vr = ch * vch + tid // rows_per_group
+    k["head_off"] = (h * HD + vr) * HD + (tid % rows_per_group) * kperthread
     k["sbase"] = a["rstate"] + fx.Int64(fx.max(ssm_src, 0)) * fx.Int64(a["rs_seq"]) * 4
-    k["st"] = fx.Vector(
-        bo.buffer_load(rsrc(k["sbase"]), k["head_off"], vec_width=4, dtype=T.f32)
-    )
+    k["st"] = _load_rows(k["sbase"], k["head_off"], kperthread)
     k["a_log"] = ld_f32(a["a_log"], h)
     k["dtb"] = ld_bf(a["dt_bias"], h)
     return k
 
 
 @traced
-def gdn_conv_verify(c, k, req, h, ch, row):
+def gdn_conv_verify(c, k, req, h, ch, row, vch):
     """One token's width-4 conv update, in registers only: the FIR over
     ``k['win']`` (each product and the SiLU output rounded to bf16, as
     ``gdn_conv``), then the window shifted in place for the next token (the
@@ -740,62 +773,84 @@ def gdn_conv_verify(c, k, req, h, ch, row):
     k["win"] = [win[1], win[2], x]
     k["raw"].append(x)
     tl = k["tl"]
-    if (tid < 3 * VCH) & tl:
+    if (tid < 3 * vch) & tl:
         if (part < 2) & owner:
             kh = h // (g.nv // g.nk)
-            at = ((row * g.nk + kh) * 2 + part) * HD + ch * VCH + k["i"]
+            at = ((row * g.nk + kh) * 2 + part) * HD + ch * vch + k["i"]
             c["put"](c["qk"], at, o)
         if part == 2:
             fx.ptr_store(o, c["vloc"] + k["i"])
     gpu.barrier()
 
 
+def _butterfly_offsets(rows_per_group):
+    """Descending powers of two from ``rows_per_group // 2`` to 1: the xor
+    offsets that reduce exactly the ``rows_per_group`` lanes a state row's
+    K-column partials are split across (16-lane sub-blocks stay 16-lane
+    aligned under xor with an offset < 16, so this nests inside a 64-lane
+    wave whatever ``rows_per_group`` -- 32 or 16 -- is)."""
+    offsets = []
+    off = rows_per_group // 2
+    while off >= 1:
+        offsets.append(off)
+        off //= 2
+    return tuple(offsets)
+
+
 @traced
-def gdn_recur_verify(c, k, row, h, ch, tok):
+def gdn_recur_verify(c, k, row, h, ch, tok, vch):
     """One token's delta-rule update: ``gdn_recur``'s math, but the state
     (``k['st']``) is carried across tokens instead of re-read from global
     memory, and the updated state is written to *this token's own* slot
     (``spec_state_indices[req, tok]``), not the slot it was read from --
     the per-draft-position snapshot a verify step needs to roll back
-    rejected drafts (``gather/gdn_verify.md`` §2.4)."""
+    rejected drafts (``gather/gdn_verify.md`` §2.4). ``vch``: the verify
+    build's state-row chunk size (``gdn_stage_verify``'s ``rows_per_group`` /
+    ``kperthread``, re-derived identically here)."""
     tid, lane = c["tid"], c["lane"]
     a = c["args"]
-    v = tid // 32
-    k0 = (tid % 32) * 4
+    rows_per_group = THREADS // vch
+    kperthread = HD // rows_per_group
+    v = tid // rows_per_group
+    k0 = (tid % rows_per_group) * kperthread
     live = k["live"]
     decay = fx.ptr_load(c["scal"] + 0)
     beta = fx.ptr_load(c["scal"] + 1)
-    qv = [fx.ptr_load(c["qkl"] + (k0 + e)) for e in range(4)]
-    kv = [fx.ptr_load(c["qkl"] + (HD + k0 + e)) for e in range(4)]
-    stv = [live.select(k["st"][e], fx.Float32(0.0)) * decay for e in range(4)]
-    p = stv[0] * kv[0] + stv[1] * kv[1] + stv[2] * kv[2] + stv[3] * kv[3]
-    p = butterfly(p, (16, 8, 4, 2, 1))
+    qv = [fx.ptr_load(c["qkl"] + (k0 + e)) for e in range(kperthread)]
+    kv = [fx.ptr_load(c["qkl"] + (HD + k0 + e)) for e in range(kperthread)]
+    stv = [live.select(k["st"][e], fx.Float32(0.0)) * decay for e in range(kperthread)]
+    p = stv[0] * kv[0]
+    for e in range_constexpr(1, kperthread):
+        p = p + stv[e] * kv[e]
+    offsets = _butterfly_offsets(rows_per_group)
+    p = butterfly(p, offsets)
     vn = (fx.ptr_load(c["vloc"] + v) - p) * beta
-    stv = [stv[e] + vn * kv[e] for e in range(4)]
-    o = stv[0] * qv[0] + stv[1] * qv[1] + stv[2] * qv[2] + stv[3] * qv[3]
-    o = bf16_round(butterfly(o, (16, 8, 4, 2, 1)))
+    stv = [stv[e] + vn * kv[e] for e in range(kperthread)]
+    o = stv[0] * qv[0]
+    for e in range_constexpr(1, kperthread):
+        o = o + stv[e] * qv[e]
+    o = bf16_round(butterfly(o, offsets))
     o = live.select(o, fx.Float32(0.0))
-    stv_vec = fx.Vector.from_elements(stv, fx.Float32)
-    k["st"] = stv_vec
+    k["st"] = stv
     dst = uniform(ld_i32w(k["idx_base"], tok))
     if live & (dst > 0):
         dbase = a["rstate"] + fx.Int64(fx.max(dst, 0)) * fx.Int64(a["rs_seq"]) * 4
-        bo.buffer_store(stv_vec, rsrc(dbase), k["head_off"])
-    if lane % 32 == 0:
+        _store_rows(dbase, k["head_off"], stv)
+    if lane % rows_per_group == 0:
         fx.ptr_store(o, c["ol"] + v)
     gpu.barrier()
     tl = k["tl"]
     if (tid == 0) & tl:
         ss = fx.Float32(0.0)
-        for e in range_constexpr(VCH):
+        for e in range_constexpr(vch):
             x = fx.ptr_load(c["ol"] + e)
             ss = ss + x * x
-        c["put"](c["onrm"], (row * c["gdn"].nv + h) * NVCH + ch, ss)
+        c["put"](c["onrm"], (row * c["gdn"].nv + h) * (HD // vch) + ch, ss)
     gpu.barrier()
 
 
 @traced
-def gdn_conv_writeback_verify(c, k):
+def gdn_conv_writeback_verify(c, k, vch):
     """After every token: writes the kept window taps (``k['hist']``, the
     newest ``SL - 1`` pre-loop samples, the oldest dropped) followed by this
     task's ``t_tokens`` raw (pre-conv) samples (``k['raw']``) to the owned
@@ -804,7 +859,7 @@ def gdn_conv_writeback_verify(c, k):
     tid = c["tid"]
     a = c["args"]
     part, owner = k["part"], k["owner"]
-    if tid < 3 * VCH:
+    if tid < 3 * vch:
         owned = (part == 2) | owner
         if k["live"] & owned:
             rs = rsrc(k["cs"])
@@ -817,34 +872,41 @@ def gdn_conv_writeback_verify(c, k):
 
 
 @traced
-def gdn_tasks_verify(c, rounds, n_req, t_tokens):
+def gdn_tasks_verify(c, rounds, n_req, t_tokens, vch):
     """This CTA's GDN verify tasks (``rounds`` of them): one request's whole
     ``t_tokens``-token cycle a task, run token by token so a task still only
     waits on this round's own earlier phases of other tasks (as
     ``gdn_tasks`` does for one token) -- the per-request setup happens once
     (``gdn_stage_verify``), the conv-window and recurrence registers carried
     from one token to the next in ``ks``, and the conv-state write-back
-    happens once, after the last token."""
-    tasks = [gdn_round_verify(c, r, n_req) for r in range(rounds)]
+    happens once, after the last token. ``vch``: the GDN task's state-row
+    chunk size (``K1Build.vch``) -- bigger chunks mean fewer tasks a request
+    (``HD // vch``), fitting more requests in one task round."""
+    tasks = [gdn_round_verify(c, r, n_req, vch) for r in range(rounds)]
     ks = [
-        gdn_stage_verify(cr, req, h, ch, t_tokens, live)
+        gdn_stage_verify(cr, req, h, ch, t_tokens, live, vch)
         for cr, live, req, h, ch in tasks
     ]
     phases = (
-        lambda cr, k, req, row, h, ch, tok: gdn_conv_verify(cr, k, req, h, ch, row),
+        lambda cr, k, req, row, h, ch, tok: gdn_conv_verify(
+            cr, k, req, h, ch, row, vch
+        ),
         lambda cr, k, req, row, h, ch, tok: gdn_gates(cr, k, row, h),
-        lambda cr, k, req, row, h, ch, tok: gdn_recur_verify(cr, k, row, h, ch, tok),
-        lambda cr, k, req, row, h, ch, tok: gdn_norm_verify(cr, k, row, h, ch),
+        lambda cr, k, req, row, h, ch, tok: gdn_recur_verify(
+            cr, k, row, h, ch, tok, vch
+        ),
+        lambda cr, k, req, row, h, ch, tok: gdn_norm_verify(cr, k, row, h, ch, vch),
     )
+
     # Phase-major: conv for every token, then gates, then the recurrence,
     # then the gated norm. Only the recurrence carries state token to token;
     # conv's outputs (and the norm's sums of squares) cross CTAs through
     # mailboxes, so ordering by phase pays each hand-off once a cycle instead
     # of once a token (S=4: 32.1 vs 37.1 us token-major). Each (round, token)
-    # has its own LDS slot (K1 sizes GdnLds for rounds x t_tokens).
+    # has its own LDS slot (K1 sizes GdnLds for rounds x t_tokens x vch).
     def tok_cr(cr, r, tok):
         ct = dict(cr)
-        for name, m in (("qkl", 2 * HD), ("vloc", VCH), ("ol", VCH), ("scal", 4)):
+        for name, m in (("qkl", 2 * HD), ("vloc", vch), ("ol", vch), ("scal", 4)):
             ct[name] = c[name] + (r * t_tokens + tok) * m
         return ct
 
@@ -853,7 +915,7 @@ def gdn_tasks_verify(c, rounds, n_req, t_tokens):
             for r, ((cr, _, req, h, ch), k) in enumerate(zip(tasks, ks)):
                 phase(tok_cr(cr, r, tok), k, req, req * t_tokens + tok, h, ch, tok)
     for (cr, _, req, h, ch), k in zip(tasks, ks):
-        gdn_conv_writeback_verify(cr, k)
+        gdn_conv_writeback_verify(cr, k, vch)
 
 
 # ---------------------------------------------------------------- kernel

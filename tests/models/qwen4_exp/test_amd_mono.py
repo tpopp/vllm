@@ -633,6 +633,7 @@ def _verify_reference(w, lay, live_n_req: int, qkvz=None, ba=None):
     }
 
 
+@pytest.mark.parametrize("vch", [16, 32])
 @pytest.mark.parametrize(
     "accepted,pad_last",
     [
@@ -646,14 +647,17 @@ def _verify_reference(w, lay, live_n_req: int, qkvz=None, ba=None):
 )
 @torch.inference_mode()
 def test_k1_verify_matches_stock_spec_decode_chain(
-    accepted: list, pad_last: bool
+    accepted: list, pad_last: bool, vch: int
 ) -> None:
     """P3: K1's ``verify`` build against the stock spec-decode chain
     (``causal_conv1d_update`` + FLA's non-AITER
     ``fused_sigmoid_gating_delta_rule_update`` + ``RMSNormGated``) that a
     pure, uniform verify step runs today (P1b / ``B._gdn_core_planar``),
     across ``n_req in {1, 2}``, every accepted-count in ``1..VERIFY_WINDOW``,
-    and a whole padding request (``pad_last``)."""
+    a whole padding request (``pad_last``), and both GDN task chunk sizes
+    (``vch``: 16 is the 8-chunk layout P3 originally shipped with, 32 the
+    4-chunk layout that halves the task count a request so a 2-request
+    batch still fits one task round -- INTEGRATION_LEDGER.md §C2)."""
     from vllm.models.qwen4_exp.amd.mono import k1
     from vllm.models.qwen4_exp.amd.mono.layout import HC, HIDDEN
 
@@ -662,7 +666,7 @@ def test_k1_verify_matches_stock_spec_decode_chain(
     live_s = live_n_req * k1.VERIFY_WINDOW
     ref = _verify_reference(w, lay, live_n_req)
 
-    key = k1.K1Build(tokens=s, tp=TP, self_msq=True, verify=True)
+    key = k1.K1Build(tokens=s, tp=TP, self_msq=True, verify=True, vch=vch)
     conv_state, rstate = w["conv_state"].clone(), w["rstate"].clone()
     core = torch.full((s, lay.CORE), float("nan"), dtype=bf, device="cuda")
     inj = torch.full((s, HC), float("nan"), dtype=bf, device="cuda")
