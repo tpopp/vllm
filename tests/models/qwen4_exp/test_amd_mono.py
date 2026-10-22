@@ -1233,6 +1233,9 @@ def _head_worker_body(
     rank: int,
     distributed_init_port: str,
     reduce: str = "all",
+    fast_addr: bool = False,
+    unroll: bool = False,
+    mfma: bool = False,
 ) -> None:
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     device = torch.device(f"cuda:{rank}")
@@ -1269,14 +1272,30 @@ def _head_worker_body(
     slot = 0
     scratch = torch.zeros(
         head.scratch_bytes(
-            head.HeadBuild(tokens=MAX_TOKENS, tp=TP, rows=v_r, reduce=reduce)
+            head.HeadBuild(
+                tokens=MAX_TOKENS,
+                tp=TP,
+                rows=v_r,
+                reduce=reduce,
+                fast_addr=fast_addr,
+                unroll=unroll,
+                mfma=mfma,
+            )
         ),
         dtype=torch.uint8,
         device=device,
     )
     for s in (1, 3, 8, 3, 1):
         epoch.add_(1)
-        key = head.HeadBuild(tokens=s, tp=TP, rows=v_r, reduce=reduce)
+        key = head.HeadBuild(
+            tokens=s,
+            tp=TP,
+            rows=v_r,
+            reduce=reduce,
+            fast_addr=fast_addr,
+            unroll=unroll,
+            mfma=mfma,
+        )
         g = torch.Generator(device=device).manual_seed(900 + s)
         x = _randn(g, s, HIDDEN, scale=0.3)
         out = torch.full((s,), -1, dtype=torch.int64, device=device)
@@ -1356,7 +1375,15 @@ def _head_worker_body(
     pq, psc, _, _ = _lmhead_weights(rank, device, pv_r)
     _plant(pq, psc, rank)
     pw, pws = _reshuffle_lmhead(pq, psc)
-    key = head.HeadBuild(tokens=s, tp=TP, rows=pv_r, reduce=reduce)
+    key = head.HeadBuild(
+        tokens=s,
+        tp=TP,
+        rows=pv_r,
+        reduce=reduce,
+        fast_addr=fast_addr,
+        unroll=unroll,
+        mfma=mfma,
+    )
     out = torch.full((s,), -1, dtype=torch.int64, device=device)
     pscratch = torch.zeros(head.scratch_bytes(key), dtype=torch.uint8, device=device)
     head.draft_head(
@@ -1441,12 +1468,45 @@ def test_draft_head_w0_matches_vllm_ops(monkeypatch: pytest.MonkeyPatch) -> None
 
 
 @ray.remote(num_gpus=1, max_calls=1)
-def _head_worker_full_vocab(
+def _head_worker_fast_unroll(
     monkeypatch: pytest.MonkeyPatch,
     tp_size: int,
     pp_size: int,
     rank: int,
     distributed_init_port: str,
+) -> None:
+    _head_worker_body(
+        monkeypatch,
+        tp_size,
+        pp_size,
+        rank,
+        distributed_init_port,
+        reduce="w0",
+        fast_addr=True,
+        unroll=True,
+    )
+
+
+@multi_gpu_test(num_gpus=2)
+def test_draft_head_fast_unroll_matches_vllm_ops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """As ``test_draft_head_matches_vllm_ops``, but ``HeadBuild(fast_addr=
+    True, unroll=True)`` (WAVESCOPE_FINDINGS.md H2 #1 and #3): unsigned
+    shift/mask address math + ``ahead``-wide modulo variable expansion,
+    both a pure address/loop-structure change -- same per-row math, same
+    exact oracle (including the planted-tie / padding-row / cross-rank-tie
+    scenarios, which a changed accumulation order would not survive)."""
+    multi_process_parallel(monkeypatch, 2, 1, _head_worker_fast_unroll)
+
+
+def _full_vocab_body(
+    monkeypatch: pytest.MonkeyPatch,
+    tp_size: int,
+    pp_size: int,
+    rank: int,
+    distributed_init_port: str,
+    key_kwargs: dict | None = None,
 ) -> None:
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     device = torch.device(f"cuda:{rank}")
@@ -1469,7 +1529,7 @@ def _head_worker_full_vocab(
     v_r = 124160  # Qwen3.8-Flash-Next draft head's real per-rank vocab shard
     _, _, w, ws = _lmhead_weights(rank, device, v_r)
     s = 8
-    key = head.HeadBuild(tokens=s, tp=TP, rows=v_r)
+    key = head.HeadBuild(tokens=s, tp=TP, rows=v_r, **(key_kwargs or {}))
     g = torch.Generator(device=device).manual_seed(902)
     x = _randn(g, s, HIDDEN, scale=0.3)
     out = torch.full((s,), -1, dtype=torch.int64, device=device)
@@ -1531,6 +1591,35 @@ def _head_worker_full_vocab(
     peers.close()
 
 
+@ray.remote(num_gpus=1, max_calls=1)
+def _head_worker_full_vocab(
+    monkeypatch: pytest.MonkeyPatch,
+    tp_size: int,
+    pp_size: int,
+    rank: int,
+    distributed_init_port: str,
+) -> None:
+    _full_vocab_body(monkeypatch, tp_size, pp_size, rank, distributed_init_port)
+
+
+@ray.remote(num_gpus=1, max_calls=1)
+def _head_worker_mfma_full_vocab(
+    monkeypatch: pytest.MonkeyPatch,
+    tp_size: int,
+    pp_size: int,
+    rank: int,
+    distributed_init_port: str,
+) -> None:
+    _full_vocab_body(
+        monkeypatch,
+        tp_size,
+        pp_size,
+        rank,
+        distributed_init_port,
+        key_kwargs={"fast_addr": True, "unroll": True, "mfma": True},
+    )
+
+
 @pytest.mark.slow_test
 @multi_gpu_test(num_gpus=2)
 def test_draft_head_matches_vllm_ops_full_vocab(
@@ -1545,3 +1634,17 @@ def test_draft_head_matches_vllm_ops_full_vocab(
     summation order can differ between the kernel's MFMA tree and torch's
     enough to flip an exact near-tie."""
     multi_process_parallel(monkeypatch, 2, 1, _head_worker_full_vocab)
+
+
+@pytest.mark.slow_test
+@multi_gpu_test(num_gpus=2)
+def test_draft_head_mfma_matches_vllm_ops_full_vocab(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """As ``test_draft_head_matches_vllm_ops_full_vocab``, but ``HeadBuild
+    (fast_addr=True, unroll=True, mfma=True)`` (WAVESCOPE_FINDINGS.md H2
+    #2): the GEMV applies gfx950's native scaled FP4 MFMA to x's fp4 codes +
+    e8m0 scale instead of cvt-to-bf16 + bf16 MFMA -- a different
+    accumulation order, so this is the same bf16-ulp-tolerant oracle as the
+    unmodified kernel's full-vocab test, not an exact match."""
+    multi_process_parallel(monkeypatch, 2, 1, _head_worker_mfma_full_vocab)
