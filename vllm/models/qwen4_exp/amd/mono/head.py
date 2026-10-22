@@ -127,22 +127,36 @@ class HeadBuild:
     # the one_barrier=True, reduce="w0" loop (`_run_head_1barrier_w0_rot` /
     # `_run_head_1barrier_w0_unroll`); each is independently selectable, so
     # A/B/combined builds share a cache/name per the (fast_addr, unroll,
-    # mfma) tuple. All False (the default) traces the exact, unmodified
-    # `_run_head_1barrier_w0` -- zero risk to the production path.
-    fast_addr: bool = False  # unsigned shift/mask address math (every index
+    # mfma) tuple. Graph-replayed, 3 runs (2 alternating the cases' order),
+    # S in 1,2,4,8 (see NOTES.md 2026-10-22): `mfma` alone is ~5.1-5.2 us
+    # better at S=1/2 and ~2.7-2.9 us better at S=4/8 than all-False; `unroll`
+    # alone *regresses* at every S (worse than `fast_addr` alone always,
+    # worse than all-False at S=4/8) -- refuted as a standalone change, kept
+    # only as a build option. Combined with `mfma`, though, `unroll` helps:
+    # fast_addr+unroll+mfma beat mfma-alone by 0.5-1.9 us at every S, every
+    # run. All three default True (this combination): it beats all-False by
+    # 5.8-5.9 us at S=1/2 and 3.9-4.3 us at S=4/8, passes the existing
+    # tolerance tests unmodified (`test_draft_head_mfma_matches_vllm_ops_
+    # full_vocab`) and 100% argmax-agrees with all-False over 2640 random
+    # trials across both shard scales (`../mono-draft/mfma_agreement.py`).
+    # All-False still traces the exact, unmodified `_run_head_1barrier_w0`
+    # (reachable by passing all three explicitly False) -- zero risk to that
+    # path, now a secondary one.
+    fast_addr: bool = True  # unsigned shift/mask address math (every index
     # here is non-negative: a row-group index, a lane-derived column/K-step)
     # instead of Python `//` `%` on signed Int32 (`arith.floordivsi`/`remsi`,
     # ~7 instructions each), the per-lane terms hoisted out of the per-group
     # call. Bit-identical.
-    unroll: bool = False  # `ahead`-wide modulo variable expansion: `ahead`
+    unroll: bool = True  # `ahead`-wide modulo variable expansion: `ahead`
     # groups a while-iteration at fixed operand slots (refreshed in place, as
     # `moe.py`'s `stage_down`/`down_loads` already do for their own DB-wide
     # batches), instead of `ahead` rotating-list iterations (`ops = ops[1:] +
     # [ops_n]`, real `v_mov_b64`s per WAVESCOPE_FINDINGS, not free phi-node
     # renaming). A CTA's groups past its last whole `ahead`-chunk are
     # over-processed and masked the same way any not-yet-reached prefetch
-    # already is. Bit-identical.
-    mfma: bool = False  # the GEMV applies gfx950's native scaled FP4 MFMA
+    # already is. Bit-identical. Regresses alone (see above); default True
+    # only because it helps once `mfma` is also on.
+    mfma: bool = True  # the GEMV applies gfx950's native scaled FP4 MFMA
     # (`v_mfma_scale_f32_16x16x128_f8f6f4`, as K2's routed-expert GEMV
     # already does) to x's fp4 codes + e8m0 scale in LDS (`quant_x_fp4`,
     # instead of `quant_x`'s MXFP4-exact bf16) and the already-loaded fp4

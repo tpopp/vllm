@@ -1235,6 +1235,7 @@ def _head_worker_body(
     reduce: str = "all",
     fast_addr: bool = False,
     unroll: bool = False,
+    mfma: bool = False,
 ) -> None:
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     device = torch.device(f"cuda:{rank}")
@@ -1278,6 +1279,7 @@ def _head_worker_body(
                 reduce=reduce,
                 fast_addr=fast_addr,
                 unroll=unroll,
+                mfma=mfma,
             )
         ),
         dtype=torch.uint8,
@@ -1286,7 +1288,13 @@ def _head_worker_body(
     for s in (1, 3, 8, 3, 1):
         epoch.add_(1)
         key = head.HeadBuild(
-            tokens=s, tp=TP, rows=v_r, reduce=reduce, fast_addr=fast_addr, unroll=unroll
+            tokens=s,
+            tp=TP,
+            rows=v_r,
+            reduce=reduce,
+            fast_addr=fast_addr,
+            unroll=unroll,
+            mfma=mfma,
         )
         g = torch.Generator(device=device).manual_seed(900 + s)
         x = _randn(g, s, HIDDEN, scale=0.3)
@@ -1368,7 +1376,13 @@ def _head_worker_body(
     _plant(pq, psc, rank)
     pw, pws = _reshuffle_lmhead(pq, psc)
     key = head.HeadBuild(
-        tokens=s, tp=TP, rows=pv_r, reduce=reduce, fast_addr=fast_addr, unroll=unroll
+        tokens=s,
+        tp=TP,
+        rows=pv_r,
+        reduce=reduce,
+        fast_addr=fast_addr,
+        unroll=unroll,
+        mfma=mfma,
     )
     out = torch.full((s,), -1, dtype=torch.int64, device=device)
     pscratch = torch.zeros(head.scratch_bytes(key), dtype=torch.uint8, device=device)

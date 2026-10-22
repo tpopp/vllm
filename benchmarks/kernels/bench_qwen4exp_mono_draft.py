@@ -135,21 +135,39 @@ def bench_draft_head(s, device, rank, world_size, epoch, iters, peers):
         _pick(lv, li + vocab_start)
 
     out = torch.full((s,), -1, dtype=torch.int64, device=device)
-    key_all = head.HeadBuild(tokens=s, tp=TP, rows=v_r, reduce="all")
-    key_w0 = head.HeadBuild(tokens=s, tp=TP, rows=v_r)  # reduce="w0", default
+    # NB: HeadBuild.fast_addr/unroll/mfma now default True (the current
+    # default, see HeadBuild's docstring / NOTES.md 2026-10-22) -- every case
+    # below except `key_default` passes all three explicitly, so each is
+    # exactly the combination its label says regardless of HeadBuild's
+    # current defaults.
+    key_all = head.HeadBuild(
+        tokens=s,
+        tp=TP,
+        rows=v_r,
+        reduce="all",
+        fast_addr=False,
+        unroll=False,
+        mfma=False,
+    )
+    key_w0_baseline = head.HeadBuild(
+        tokens=s, tp=TP, rows=v_r, fast_addr=False, unroll=False, mfma=False
+    )
     # WAVESCOPE_FINDINGS.md H2: the GEMV-issue changes, each alone and
     # combined (bench_qwen4exp_mono_draft.py's own docstring: measure each
     # step separately and combined)
-    key_fast = head.HeadBuild(tokens=s, tp=TP, rows=v_r, fast_addr=True)
+    key_fast = head.HeadBuild(
+        tokens=s, tp=TP, rows=v_r, fast_addr=True, unroll=False, mfma=False
+    )
     key_fast_unroll = head.HeadBuild(
-        tokens=s, tp=TP, rows=v_r, fast_addr=True, unroll=True
+        tokens=s, tp=TP, rows=v_r, fast_addr=True, unroll=True, mfma=False
     )
-    key_mfma_only = head.HeadBuild(tokens=s, tp=TP, rows=v_r, mfma=True)
-    key_fast_unroll_mfma = head.HeadBuild(
-        tokens=s, tp=TP, rows=v_r, fast_addr=True, unroll=True, mfma=True
+    key_mfma_only = head.HeadBuild(
+        tokens=s, tp=TP, rows=v_r, fast_addr=False, unroll=False, mfma=True
     )
+    key_default = head.HeadBuild(tokens=s, tp=TP, rows=v_r)  # fast_addr=
+    # unroll=mfma=True, the current default
     scratch = torch.zeros(
-        head.scratch_bytes(key_w0), dtype=torch.uint8, device=device
+        head.scratch_bytes(key_w0_baseline), dtype=torch.uint8, device=device
     )
 
     def _make_fused(this_key):
@@ -163,19 +181,27 @@ def bench_draft_head(s, device, rank, world_size, epoch, iters, peers):
 
         return _fused
 
-    cases = (
-        ("stock: bf16 F.linear + argmax + all_gather", _stock_bf16),
-        ("stock: MXFP4 a4w4 GEMM + argmax + all_gather", _stock_mxfp4),
+    variant_cases = (
         ("draft_head (fused, reduce=all)", _make_fused(key_all)),
-        ("draft_head (fused, reduce=w0, default)", _make_fused(key_w0)),
+        ("draft_head (fused, reduce=w0, no H2 opts)", _make_fused(key_w0_baseline)),
         ("draft_head (fused, +fast_addr)", _make_fused(key_fast)),
         ("draft_head (fused, +fast_addr+unroll)", _make_fused(key_fast_unroll)),
         ("draft_head (fused, +mfma only)", _make_fused(key_mfma_only)),
         (
-            "draft_head (fused, +fast_addr+unroll+mfma)",
-            _make_fused(key_fast_unroll_mfma),
+            "draft_head (fused, +fast_addr+unroll+mfma, default)",
+            _make_fused(key_default),
         ),
     )
+    # BENCH_REVERSE=1: run the draft_head variants in reverse order (the two
+    # stock reference rows always go first) -- lets a repeated run check for
+    # order-dependent bias (GPU clock ramp-up, thermal drift) instead of
+    # trusting the same fixed order every time.
+    if os.environ.get("BENCH_REVERSE"):
+        variant_cases = tuple(reversed(variant_cases))
+    cases = (
+        ("stock: bf16 F.linear + argmax + all_gather", _stock_bf16),
+        ("stock: MXFP4 a4w4 GEMM + argmax + all_gather", _stock_mxfp4),
+    ) + variant_cases
     return [
         (name, _time_eager(fn, iters), _time_graph(fn, iters)) for name, fn in cases
     ]
