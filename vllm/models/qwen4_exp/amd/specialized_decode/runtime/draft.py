@@ -279,6 +279,7 @@ class DraftDecode:
         self.model, self.config = mtp, config
         self.tp, self.rank = tp.world_size, tp.rank_in_group
         self.layer = mtp.model.layers[0]
+        self._probe = self.layer.self_attn.indexer.raw_key_cache.prefix
         dev = mtp.model.embed_tokens.weight.device
 
         self.epoch = torch.zeros(1, dtype=torch.int32, device=dev)
@@ -429,16 +430,31 @@ class DraftDecode:
 
     # ------------------------------------------------------------ step
     def eligible(self, input_ids, intermediate_tensors) -> bool:
-        """A pure decode draft step of 1 .. ``config.max_tokens`` rows: unlike
-        the target's verify steps, the drafter is bound to the MTP draft
-        model alone, so every step it sees is one decode token a request."""
+        """A pure decode draft step of 1 .. ``config.max_tokens`` rows: a
+        plain one-decode-token-a-request step, or (POS0) each request's draft
+        position 0 -- the whole ``num_speculative_tokens + 1``-row verify
+        chain run as this one draft step, spec-as-decode -- whichever shape
+        the engine hands the drafter; the kernels are request-shape-agnostic
+        (unlike the target's verify steps, which must know the request
+        boundaries for the GDN state indices), so the only question here is
+        whether this is a pure decode-shaped step at all: no prefill rows
+        mixed in. ``self._probe``: the QSA indexer's side-cache metadata key
+        (``self_attn.layer_name``'s own metadata has no ``num_prefills``;
+        the indexer's does, the same key ``qsa.py`` itself reads the request
+        counts from)."""
         if intermediate_tensors is not None or input_ids is None:
             return False
-        from vllm.forward_context import in_piecewise_cudagraph
+        from vllm.forward_context import get_forward_context, in_piecewise_cudagraph
 
         if in_piecewise_cudagraph():
             return False
-        return 1 <= input_ids.size(0) <= self.config.max_tokens
+        if not 1 <= input_ids.size(0) <= self.config.max_tokens:
+            return False
+        md = get_forward_context().attn_metadata
+        if not isinstance(md, dict):
+            return False
+        m = md.get(self._probe)
+        return m is not None and m.num_prefills == 0
 
     def run(
         self,

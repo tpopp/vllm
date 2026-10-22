@@ -377,3 +377,119 @@ def test_draft_needs_one_mtp_layer(supported_platform):
         mtp_num_hidden_layers=2
     )
     assert "2 MTP layers (needs exactly 1)" in draft.draft_unsupported(config)
+
+
+# -------------------------------------------------------- the drafter: POS0
+
+
+def _fake_draft_decode(max_tokens=16, probe="model.layers.40.self_attn.indexer"):
+    """A ``DraftDecode`` with no model / kernels: just enough state for
+    ``eligible`` (``config``, ``_probe``)."""
+    draft_mod = draft  # the module under test, imported at file top
+    decode = object.__new__(draft_mod.DraftDecode)
+    decode.config = draft_mod.DraftConfig(max_tokens=max_tokens)
+    decode._probe = probe
+    return decode
+
+
+def _qsa_metadata(*, num_prefills=0, num_decodes=3, num_decode_tokens=None):
+    """A real ``QSAForwardMetadata`` (the type ``self_attn.indexer.raw_key_
+    cache.prefix`` actually keys in ``attn_metadata``): every field but the
+    two ``eligible`` reads is an empty placeholder. ``num_decode_tokens``
+    defaults to ``num_decodes`` (a 1-row-a-request decode step); pass it
+    explicitly > ``num_decodes`` for a draft-position-0-shaped step
+    (query_len k + 1, spec-as-decode -- the kernels don't care either way,
+    only ``eligible`` asks)."""
+    from vllm.models.qwen4_exp.common.qsa_cache import QSAForwardMetadata
+
+    if num_decode_tokens is None:
+        num_decode_tokens = num_decodes
+    empty = torch.empty(0, dtype=torch.int32)
+    return QSAForwardMetadata(
+        block_table=empty,
+        slot_mapping=empty,
+        seq_lens=empty,
+        query_start_loc=empty,
+        token_to_req=empty,
+        logical_positions=empty,
+        visible_blocks=empty,
+        k_work_metadata=empty,
+        num_actual_tokens=num_decode_tokens,
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decode_tokens,
+        num_prefills=num_prefills,
+        num_prefill_tokens=0,
+        max_query_len=1,
+        decode_query_len=1,
+        max_seq_len=1,
+        storage_block_size=1,
+        compress_ratio=1,
+    )
+
+
+def _patch_forward_context(monkeypatch, *, piecewise: bool, metadata):
+    import types
+
+    ctx = types.SimpleNamespace(attn_metadata=metadata)
+    monkeypatch.setattr("vllm.forward_context.get_forward_context", lambda: ctx)
+    monkeypatch.setattr(
+        "vllm.forward_context.in_piecewise_cudagraph", lambda: piecewise
+    )
+
+
+def test_draft_eligible_pos0(monkeypatch: pytest.MonkeyPatch):
+    """POS0: each request's whole draft chain (query_len k + 1, so
+    ``num_decode_tokens != num_decodes``) as one draft step -- eligible with
+    no feature flag (the drafter follows the target's --monokernel switch,
+    it adds none of its own)."""
+    decode = _fake_draft_decode()
+    md = {decode._probe: _qsa_metadata(num_decodes=3, num_decode_tokens=12)}
+    _patch_forward_context(monkeypatch, piecewise=False, metadata=md)
+    input_ids = torch.zeros(12, dtype=torch.int64)
+    assert decode.eligible(input_ids, None) is True
+
+
+def test_draft_eligible_plain_decode(monkeypatch: pytest.MonkeyPatch):
+    decode = _fake_draft_decode()
+    md = {decode._probe: _qsa_metadata(num_decodes=3)}
+    _patch_forward_context(monkeypatch, piecewise=False, metadata=md)
+    input_ids = torch.zeros(3, dtype=torch.int64)
+    assert decode.eligible(input_ids, None) is True
+
+
+@pytest.mark.parametrize(
+    "setup",
+    [
+        "intermediate_tensors",
+        "piecewise",
+        "no_input_ids",
+        "too_many_rows",
+        "no_metadata_dict",
+        "missing_probe",
+        "has_prefills",
+    ],
+)
+def test_draft_eligible_rejects(monkeypatch: pytest.MonkeyPatch, setup: str):
+    decode = _fake_draft_decode()
+    input_ids = torch.zeros(3, dtype=torch.int64)
+    intermediate_tensors = None
+    piecewise = False
+    md: object = {decode._probe: _qsa_metadata()}
+
+    if setup == "intermediate_tensors":
+        intermediate_tensors = object()
+    elif setup == "piecewise":
+        piecewise = True
+    elif setup == "no_input_ids":
+        input_ids = None
+    elif setup == "too_many_rows":
+        input_ids = torch.zeros(decode.config.max_tokens + 1, dtype=torch.int64)
+    elif setup == "no_metadata_dict":
+        md = None
+    elif setup == "missing_probe":
+        md = {}
+    elif setup == "has_prefills":
+        md = {decode._probe: _qsa_metadata(num_prefills=1)}
+
+    _patch_forward_context(monkeypatch, piecewise=piecewise, metadata=md)
+    assert decode.eligible(input_ids, intermediate_tensors) is False
