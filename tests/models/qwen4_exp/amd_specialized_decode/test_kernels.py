@@ -117,6 +117,65 @@ def test_hc_front_matches_vllm_ops(s: int, self_msq: bool) -> None:
     torch.testing.assert_close(x, want_x, atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.parametrize("s", (1, 3, 8))
+@torch.inference_mode()
+def test_draft_front_matches_reference(s: int) -> None:
+    """``mono.draft_front`` (the fc_embedding / fc_hidden projections fused
+    with the attention HC's mix) against the MTP draft step's stock
+    embedding branch (``_draft_front_ref``) followed by ``GatedResidual.mix``
+    (``_mix_ref``): the materialized state, the block input and the
+    injection logits."""
+    from tests.models.qwen4_exp.amd_specialized_decode.reference import (
+        _draft_front_ref,
+    )
+    from vllm.models.qwen4_exp.amd.specialized_decode.mono import draft_front as DF
+    from vllm.models.qwen4_exp.amd.specialized_decode.mono.layout import HC, HH, HIDDEN
+
+    g = torch.Generator(device="cuda").manual_seed(s + 100)
+    emb = _randn(g, s, HIDDEN, scale=1.5)
+    prev = _randn(g, s, HH, scale=2.0)
+    w_ne = _randn(g, HIDDEN, scale=0.1)
+    w_nh = _randn(g, HH, scale=0.1)
+    w_fe = _randn(g, HIDDEN, HIDDEN, scale=0.05)
+    w_fh = _randn(g, HIDDEN, HIDDEN, scale=0.05)
+    hw = _hc_weights(g)
+
+    want_state = _draft_front_ref(emb, prev, w_ne, w_nh, w_fe, w_fh, 1e-6)
+    want_x, want_inj, _ = _mix_ref(want_state, hw)
+
+    key = DF.FrontBuild(tokens=s, tp=TP)
+    state_out = torch.full((s, HH), float("nan"), dtype=bf, device="cuda")
+    x = torch.full((s, HIDDEN), float("nan"), dtype=bf, device="cuda")
+    inj = torch.full((s, HC), float("nan"), dtype=bf, device="cuda")
+    scratch = torch.zeros(DF.scratch_bytes(key), dtype=torch.uint8, device="cuda")
+    hl = _health()
+    DF.draft_front(
+        key,
+        emb=emb.contiguous(),
+        prev=prev.contiguous(),
+        w_ne=w_ne,
+        w_nh=w_nh,
+        w_fe=w_fe,
+        w_fh=w_fh,
+        **hw,
+        state_out=state_out,
+        bin_out=x,
+        inj_out=inj,
+        scratch=scratch,
+        epoch=torch.ones(1, dtype=torch.int32, device="cuda"),
+        **hl,
+        layer=0,
+    )
+    torch.accelerator.synchronize()
+    assert not hl["health"].any()
+    assert _cos(state_out, want_state) > COS_MIN
+    torch.testing.assert_close(state_out, want_state, atol=2e-2, rtol=2e-2)
+    assert _cos(inj, want_inj) > COS_MIN
+    torch.testing.assert_close(inj, want_inj, atol=2e-2, rtol=2e-2)
+    assert _cos(x, want_x) > COS_MIN
+    torch.testing.assert_close(x, want_x, atol=2e-2, rtol=2e-2)
+
+
 # (1, 1) twice: a width again after others compiled (the JIT globals check)
 @pytest.mark.parametrize(
     "s,n_real", [(1, 1), (5, 4), (8, 8), (1, 1), (9, 9), (16, 15), (16, 16)]
@@ -510,3 +569,86 @@ def test_stalled_rank_fails_stop(monkeypatch: pytest.MonkeyPatch) -> None:
     instead of hanging: FAILED, a record naming the peer region, its flag on
     the output rank, and its later launches return at once."""
     multi_process_parallel(monkeypatch, 2, 1, _stall_worker)
+
+
+@ray.remote(num_gpus=1, max_calls=1)
+def _draft_head_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    tp_size: int,
+    pp_size: int,
+    rank: int,
+    distributed_init_port: str,
+) -> None:
+    """``mono.draft_head`` (the MTP draft's fused MXFP4 lm_head GEMV + TP
+    greedy argmax) against a dequantized full-vocab reference: each rank
+    holds its own vocab shard (as a vocab-parallel ``ParallelLMHead`` would),
+    the global argmax must agree with ``torch.argmax`` over every rank's
+    shard concatenated, and every rank must agree with each other."""
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    device = torch.device(f"cuda:{rank}")
+    torch.accelerator.set_device_index(device)
+    init_test_distributed_environment(tp_size, pp_size, rank, distributed_init_port)
+
+    from vllm.distributed import get_tp_group
+    from vllm.models.kimi_k3.amd.specialized_decode.runtime.peer import PeerBuffer
+    from vllm.models.qwen4_exp.amd.specialized_decode.mono import draft_head as DH
+    from vllm.models.qwen4_exp.amd.specialized_decode.mono.layout import HIDDEN
+
+    rows = 256  # a small shard: a multiple of 32, several row groups
+    valid = 251  # some padding rows, never win
+    health = _health(device)["health"]
+    peers = PeerBuffer(
+        DH.peer_bytes(tp_size), get_tp_group().cpu_group, rank, tp_size, device
+    )
+    peers.bytes.zero_()
+    alarm = int(peers.addresses[0].item()) + 4 * rank
+
+    gr = torch.Generator(device=device).manual_seed(300 + rank)
+    gc = torch.Generator(device=device).manual_seed(42)  # the replicated x
+    q, sc, w, ws = _mxfp4_linear(gr, rows, HIDDEN)
+    w_ref = _mxfp4_dequant(q, sc).to(bf)
+    epoch = torch.zeros(1, dtype=torch.int32, device=device)
+
+    for s in (1, 2, 4, 8):
+        x = _randn(gc, s, HIDDEN, scale=1.2)
+        key = DH.HeadBuild(tokens=s, tp=tp_size, rows=rows)
+        scratch = torch.zeros(DH.scratch_bytes(key), dtype=torch.uint8, device=device)
+        out = torch.full((s,), -1, dtype=torch.int64, device=device)
+        epoch.add_(1)
+        DH.draft_head(
+            key,
+            x=x.contiguous(),
+            w=w,
+            ws=ws,
+            valid=valid,
+            vocab_start=rank * rows,
+            out=out,
+            scratch=scratch,
+            peers=peers.addresses,
+            rank=rank,
+            epoch=epoch,
+            health=health,
+            alarm=alarm,
+            layer=0,
+        )
+        torch.accelerator.synchronize()
+        assert not health.any()
+
+        # every rank's dequantized shard, masked to its valid rows
+        logits = F.linear(_mxfp4_qdq(x).to(bf), w_ref).to(bf).float()
+        logits[:, valid:] = float("-inf")
+        all_logits = [torch.empty_like(logits) for _ in range(tp_size)]
+        dist.all_gather(all_logits, logits)
+        full = torch.cat(all_logits, dim=-1)
+        want = full.argmax(dim=-1)
+        assert torch.equal(out, want), (s, rank, out.tolist(), want.tolist())
+
+        outs = [torch.empty_like(out) for _ in range(tp_size)]
+        dist.all_gather(outs, out)
+        assert all(torch.equal(outs[0], o) for o in outs), (s, "ranks disagree")
+    peers.close()
+
+
+@multi_gpu_test(num_gpus=2)
+def test_draft_head_matches_reference(monkeypatch: pytest.MonkeyPatch) -> None:
+    multi_process_parallel(monkeypatch, 2, 1, _draft_head_worker)

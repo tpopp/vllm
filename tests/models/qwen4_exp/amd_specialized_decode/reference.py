@@ -57,6 +57,35 @@ def _mix_ref(state, hw):
     return hc_gate_mix(xn, gate, HC), d[:, LORA : LORA + HC].contiguous(), xn
 
 
+def _gemma_norm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
+    """``GemmaRMSNorm``: x rrms (1 + w) (fp32), rounded to bf16 -- the mono
+    kernels' ``hc.gemma`` elementwise."""
+    xf = x.float()
+    r = torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
+    xn = xf * r
+    return (xn + xn * w.float()).to(bf)
+
+
+def _draft_front_ref(emb, prev, w_ne, w_nh, w_fe, w_fh, eps: float):
+    """The MTP draft step's embedding branch
+    (``Qwen4ExpMultiTokenPredictor.forward``'s first branch): the two
+    pre-norms (``pre_fc_norm_hidden``: one norm over every HC stream
+    together), ``fc_embedding`` / ``fc_hidden``, the embedding residual ->
+    the materialized multi-stream state [S, HC H] bf16 -- what
+    ``mono.draft_front`` fuses with the attention HC's mix into one launch."""
+    from vllm.models.qwen4_exp.amd.specialized_decode.mono.layout import HC
+
+    s, h = emb.shape
+    en = _gemma_norm(emb, w_ne, eps)
+    fe = F.linear(en, w_fe).to(bf)
+    hn = _gemma_norm(prev, w_nh, eps).view(s, HC, h)
+    state = torch.empty(s, HC, h, dtype=bf, device=emb.device)
+    for k in range(HC):
+        fh_k = F.linear(hn[:, k].contiguous(), w_fh).to(bf)
+        state[:, k] = (fe.float() + fh_k.float()).to(bf)
+    return state.view(s, HC * h)
+
+
 def _gdn_inputs(s: int, n_real: int, slots: int = 16, shuffled: bool = True):
     from vllm.models.qwen4_exp.amd.specialized_decode.mono.layout import (
         HD,
