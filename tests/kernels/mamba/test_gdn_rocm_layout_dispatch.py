@@ -41,7 +41,9 @@ def _make_metadata(
     *,
     num_prefills: int = 0,
     num_decodes: int = 2,
+    num_spec_decodes: int = 0,
     spec_sequence_masks: torch.Tensor | None = None,
+    spec_rows_prefix: bool = False,
 ):
     """Only the fields the dispatch condition reads carry meaningful values."""
     return GDNAttentionMetadata(
@@ -49,22 +51,33 @@ def _make_metadata(
         num_prefill_tokens=num_prefills,
         num_decodes=num_decodes,
         num_decode_tokens=num_decodes,
-        num_spec_decodes=0,
-        num_spec_decode_tokens=0,
-        num_actual_tokens=num_prefills + num_decodes,
+        num_spec_decodes=num_spec_decodes,
+        num_spec_decode_tokens=4 * num_spec_decodes,
+        num_actual_tokens=num_prefills + num_decodes + 4 * num_spec_decodes,
         spec_sequence_masks=spec_sequence_masks,
+        spec_rows_prefix=spec_rows_prefix,
     )
 
 
-def _make_layer(gqa_interleaved_layout: bool):
+def _make_layer(gqa_interleaved_layout: bool, spec_fast_path: bool = True):
     """Stub layer running the real ``_forward_core_rocm``, recording dispatch."""
     layer = types.SimpleNamespace()
     layer.prefix = PREFIX
     layer.gqa_interleaved_layout = gqa_interleaved_layout
     layer.qkvz_layout = "interleaved" if gqa_interleaved_layout else "flat"
+    # Mirrors __init__: the spec fast path is flat-layout only.
+    layer.enable_rocm_spec_fast_path = spec_fast_path and not gqa_interleaved_layout
+    layer._is_pure_spec_decode = QwenGatedDeltaNetAttention._is_pure_spec_decode
+    layer._is_spec_prefix_mixed = QwenGatedDeltaNetAttention._is_spec_prefix_mixed
 
     layer.calls = []
     layer._forward_core_decode_aiter = lambda **kw: layer.calls.append("aiter")
+    layer._forward_core_spec_decode_aiter = lambda **kw: layer.calls.append(
+        "aiter_spec"
+    )
+    layer._forward_core_spec_mixed_aiter = lambda **kw: layer.calls.append(
+        "aiter_spec_mixed"
+    )
     layer._forward_core = lambda **kw: layer.calls.append("generic")
     layer.prepare_gdn_attention_core_inputs = lambda qkvz, ba, n: (
         torch.zeros(n, H * K * 2 + HV * V),
@@ -122,6 +135,42 @@ def test_non_pure_decode_batches_use_the_generic_path(
 ) -> None:
     layer = _make_layer(gqa_interleaved_layout)
     assert _run(layer, _make_metadata(**meta_kwargs)) == "generic"
+
+
+def _pure_spec_metadata(**kwargs):
+    return _make_metadata(
+        num_decodes=0,
+        num_spec_decodes=2,
+        spec_sequence_masks=torch.ones(2, dtype=torch.bool),
+        **kwargs,
+    )
+
+
+def test_pure_spec_decode_takes_the_spec_fast_path() -> None:
+    assert _run(_make_layer(False), _pure_spec_metadata()) == "aiter_spec"
+
+
+@pytest.mark.parametrize(
+    "gqa_interleaved_layout,spec_fast_path",
+    [(True, True), (False, False)],
+    ids=["interleaved", "disabled"],
+)
+def test_pure_spec_decode_falls_back_when_ineligible(
+    gqa_interleaved_layout: bool, spec_fast_path: bool
+) -> None:
+    layer = _make_layer(gqa_interleaved_layout, spec_fast_path)
+    assert _run(layer, _pure_spec_metadata()) == "generic"
+
+
+def test_spec_with_prefill_uses_the_generic_path() -> None:
+    """Mixed batches without spec-prefix metadata (incl. 1-token decodes
+    reclassified as prefills)."""
+    assert _run(_make_layer(False), _pure_spec_metadata(num_prefills=1)) == "generic"
+
+
+def test_spec_prefix_mixed_takes_the_mixed_fast_path() -> None:
+    meta = _pure_spec_metadata(num_prefills=1, spec_rows_prefix=True)
+    assert _run(_make_layer(False), meta) == "aiter_spec_mixed"
 
 
 def _prefill_reference(q, k, v, g, beta, initial_state, lengths):
