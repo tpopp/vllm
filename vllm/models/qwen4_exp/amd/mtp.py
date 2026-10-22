@@ -546,6 +546,17 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
             spec_step_idx=spec_step_idx,
         )
 
+    def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Greedy draft tokens via a vocab-parallel local argmax reduction
+        (``use_local_argmax_reduction``), from the fused MXFP4 draft head
+        when eligible, else ``LogitsProcessor``'s own reduction."""
+        sd = self.specialized_decode
+        if sd is not None and sd.head_eligible(
+            self.lm_head, self.logits_processor, hidden_states
+        ):
+            return sd.top_tokens(self.lm_head, hidden_states)
+        return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
+
     def compute_logits(
         self, hidden_states: torch.Tensor, spec_step_idx: int = 0
     ) -> torch.Tensor | None:

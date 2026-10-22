@@ -17,8 +17,11 @@ very same launches, not a draft variant of them), then the final mixer's
 front (``front.hc_front`` again, ``use_combine=False`` so its down
 projection has no injection rows -- the kernel always wants a
 ``layout.DOWN_ROWS``-row down, so the mixer's is zero-padded once at
-weight-check time, ``prepare_weights``). Greedy draft tokens go through the
-proposer's own ``LogitsProcessor.get_top_tokens`` reduction.
+weight-check time, ``prepare_weights``). Greedy draft tokens are read
+straight from a fused MXFP4 lm_head GEMV + TP argmax (``mono.draft_head``)
+when the draft's lm_head is an online-MXFP4 copy (``get_top_tokens``);
+otherwise the proposer's own ``LogitsProcessor.get_top_tokens`` reduction
+runs.
 
 Its own epoch, scratch and peer buffers (DSv4.1's drafter precedent, #62131):
 a mailbox word must never be a tag to one launch and data to another, so the
@@ -59,6 +62,7 @@ NAME = "Qwen3.8-Flash-Next MTP draft (--monokernel)"
 ATTN_LAYER = 0
 MLP_LAYER = 1
 MIXER_LAYER = 2
+HEAD_LAYER = 0  # the head has its own peer buffer too
 
 
 @dataclass(frozen=True)
@@ -267,6 +271,7 @@ class DraftDecode:
         from vllm.models.kimi_k3.amd.specialized_decode.runtime.peer import PeerBuffer
         from vllm.models.qwen4_exp.amd.specialized_decode.mono import blocks
         from vllm.models.qwen4_exp.amd.specialized_decode.mono import draft_front as DF
+        from vllm.models.qwen4_exp.amd.specialized_decode.mono import draft_head as DH
         from vllm.models.qwen4_exp.amd.specialized_decode.mono import front
 
         tp = get_tp_group()
@@ -307,6 +312,19 @@ class DraftDecode:
 
         self.prepare_weights()
 
+        self._head = None
+        if self._head_rows is not None:
+            self.head_peers = PeerBuffer(
+                DH.peer_bytes(self.tp), tp.cpu_group, self.rank, self.tp, dev
+            )
+            self.head_peers.bytes.zero_()
+            self.head_epoch = torch.zeros(1, dtype=torch.int32, device=dev)
+            self.head_scratch = {
+                s: _buf(DH.scratch_bytes(DH.HeadBuild(tokens=s, tp=self.tp)), dev)
+                for s in config.widths
+            }
+            self._head = True
+
         for build, key, abi in self._builds():
             compile_build(build, key, abi)
 
@@ -319,11 +337,12 @@ class DraftDecode:
             "without --monokernel, the stock draft step runs",
         )
         logger.info(
-            "%s: widths 1-%d, front %s, the stock head; other steps run the "
-            "stock draft step",
+            "%s: widths 1-%d, front %s, head %s; other steps run the stock "
+            "draft step",
             NAME,
             config.max_tokens,
             "fused" if self._fc is not None else "stock",
+            "fused" if self._head else "stock",
         )
 
     def _eps(self):
@@ -337,6 +356,7 @@ class DraftDecode:
     def _builds(self):
         from vllm.models.qwen4_exp.amd.specialized_decode.mono import blocks, front
         from vllm.models.qwen4_exp.amd.specialized_decode.mono import draft_front as DF
+        from vllm.models.qwen4_exp.amd.specialized_decode.mono import draft_head as DH
 
         tp = self.tp
         eps_attn, eps_mlp, eps_mixer = self._eps()
@@ -357,6 +377,9 @@ class DraftDecode:
             out.append((blocks.build_oproj, self._oproj_key(s), blocks.OPROJ_ABI))
             out.append((blocks.build_moe, blocks.MoeBuild(tokens=s, tp=tp),
                         blocks.MOE_ABI))  # fmt: skip
+            if self._head:
+                out.append((DH.build, DH.HeadBuild(tokens=s, tp=tp,
+                            rows=self._head_rows), DH.ABI))  # fmt: skip
         return out
 
     def _oproj_key(self, s: int):
@@ -376,9 +399,11 @@ class DraftDecode:
         ``layout.DOWN_ROWS`` rows; the mixer has none, the pad rows are
         zero -- only the low-rank groups ever reach the gate-mix that
         produces ``bin_out``, so the pad cannot perturb it, and the
-        mixer front's own injection output is unused), and the fc
-        projections gathered whole on every rank if they are plain bf16
-        (the fused front needs every rank's full weight)."""
+        mixer front's own injection output is unused), the fc projections
+        gathered whole on every rank if they are plain bf16 (the fused front
+        needs every rank's full weight), and whether the draft's lm_head is
+        an online-MXFP4 copy on the ASM FP4 GEMM's layout (the fused head
+        only ever reads that one layout)."""
         mixer = self.model.model.hyper_connection_mixer
         down = mixer.input_mix_weight_down.weight
         padded = down.new_zeros(L.DOWN_ROWS, L.HH)
@@ -394,6 +419,13 @@ class DraftDecode:
                 tensor_model_parallel_all_gather(lin.weight.data, dim=0).contiguous()
                 for _, lin in lins
             )
+        lm_head = self.model.lm_head
+        self._head_rows = None
+        si = getattr(lm_head, "shard_indices", None)
+        if si is not None and mxfp4_shuffled(lm_head) is True:
+            rows = lm_head.weight.size(0)
+            if rows % 32 == 0:
+                self._head_rows = rows
 
     # ------------------------------------------------------------ step
     def eligible(self, input_ids, intermediate_tensors) -> bool:
@@ -549,6 +581,45 @@ class DraftDecode:
         hidden_states = model.fc_hidden(hidden_states)
         hidden_states = inputs_embeds.unsqueeze(-2) + hidden_states
         return hidden_states.flatten(-2).contiguous()
+
+    # ------------------------------------------------------------ head
+    def head_eligible(self, lm_head, logits_processor, hidden_states) -> bool:
+        """Greedy draft tokens of at most ``config.max_tokens`` rows from the
+        fused MXFP4 draft head (every rank decides alike: shapes and module
+        state, not sampling parameters outside its control)."""
+        from vllm.forward_context import in_piecewise_cudagraph
+
+        if self._head is None or in_piecewise_cudagraph():
+            return False
+        if not 1 <= hidden_states.size(0) <= self.config.max_tokens:
+            return False
+        if logits_processor.soft_cap is not None or logits_processor.scale != 1.0:
+            return False
+        return (
+            mxfp4_shuffled(lm_head) is True
+            and lm_head.tp_size == self.tp
+            and lm_head.weight.size(0) == self._head_rows
+        )
+
+    def top_tokens(self, lm_head, hidden_states) -> torch.Tensor:
+        """Greedy draft tokens: ``LogitsProcessor.get_top_tokens``'s result
+        from one ``mono.draft_head`` launch."""
+        from vllm.models.qwen4_exp.amd.specialized_decode.mono import draft_head as DH
+
+        s = hidden_states.size(0)
+        self.head_epoch.add_(1)
+        si = lm_head.shard_indices
+        out = torch.empty(s, dtype=torch.int64, device=hidden_states.device)
+        DH.draft_head(
+            DH.HeadBuild(tokens=s, tp=self.tp, rows=lm_head.weight.size(0)),
+            x=hidden_states.contiguous(), w=lm_head.weight, ws=lm_head.weight_scale,
+            valid=si.org_vocab_end_index - si.org_vocab_start_index,
+            vocab_start=si.org_vocab_start_index, out=out,
+            scratch=self.head_scratch[s], peers=self.head_peers.addresses,
+            rank=self.rank, epoch=self.head_epoch, health=self.health,
+            alarm=self.alarm, layer=HEAD_LAYER,
+        )  # fmt: skip
+        return out
 
     def after_step(self) -> None:
         """Once per executed draft step. Raises on every rank once a rank
