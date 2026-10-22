@@ -1226,13 +1226,13 @@ def _reshuffle_lmhead(q, sc):
     return w, ws.contiguous().view(sm, sn)
 
 
-@ray.remote(num_gpus=1, max_calls=1)
-def _head_worker(
+def _head_worker_body(
     monkeypatch: pytest.MonkeyPatch,
     tp_size: int,
     pp_size: int,
     rank: int,
     distributed_init_port: str,
+    reduce: str = "all",
 ) -> None:
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     device = torch.device(f"cuda:{rank}")
@@ -1268,13 +1268,15 @@ def _head_worker(
     # every launch) keeps the mailbox tags apart
     slot = 0
     scratch = torch.zeros(
-        head.scratch_bytes(head.HeadBuild(tokens=MAX_TOKENS, tp=TP, rows=v_r)),
+        head.scratch_bytes(
+            head.HeadBuild(tokens=MAX_TOKENS, tp=TP, rows=v_r, reduce=reduce)
+        ),
         dtype=torch.uint8,
         device=device,
     )
     for s in (1, 3, 8, 3, 1):
         epoch.add_(1)
-        key = head.HeadBuild(tokens=s, tp=TP, rows=v_r)
+        key = head.HeadBuild(tokens=s, tp=TP, rows=v_r, reduce=reduce)
         g = torch.Generator(device=device).manual_seed(900 + s)
         x = _randn(g, s, HIDDEN, scale=0.3)
         out = torch.full((s,), -1, dtype=torch.int64, device=device)
@@ -1354,7 +1356,7 @@ def _head_worker(
     pq, psc, _, _ = _lmhead_weights(rank, device, pv_r)
     _plant(pq, psc, rank)
     pw, pws = _reshuffle_lmhead(pq, psc)
-    key = head.HeadBuild(tokens=s, tp=TP, rows=pv_r)
+    key = head.HeadBuild(tokens=s, tp=TP, rows=pv_r, reduce=reduce)
     out = torch.full((s,), -1, dtype=torch.int64, device=device)
     pscratch = torch.zeros(head.scratch_bytes(key), dtype=torch.uint8, device=device)
     head.draft_head(
@@ -1392,6 +1394,32 @@ def _head_worker(
     peers.close()
 
 
+@ray.remote(num_gpus=1, max_calls=1)
+def _head_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    tp_size: int,
+    pp_size: int,
+    rank: int,
+    distributed_init_port: str,
+) -> None:
+    _head_worker_body(
+        monkeypatch, tp_size, pp_size, rank, distributed_init_port, reduce="all"
+    )
+
+
+@ray.remote(num_gpus=1, max_calls=1)
+def _head_worker_w0(
+    monkeypatch: pytest.MonkeyPatch,
+    tp_size: int,
+    pp_size: int,
+    rank: int,
+    distributed_init_port: str,
+) -> None:
+    _head_worker_body(
+        monkeypatch, tp_size, pp_size, rank, distributed_init_port, reduce="w0"
+    )
+
+
 @multi_gpu_test(num_gpus=2)
 def test_draft_head_matches_vllm_ops(monkeypatch: pytest.MonkeyPatch) -> None:
     """``draft_head``'s MXFP4 lm_head GEMV + greedy argmax across the vocab
@@ -1402,6 +1430,14 @@ def test_draft_head_matches_vllm_ops(monkeypatch: pytest.MonkeyPatch) -> None:
     independent planted ties / a planted padding-row max (must be ignored) /
     a cross-rank tie."""
     multi_process_parallel(monkeypatch, 2, 1, _head_worker)
+
+
+@multi_gpu_test(num_gpus=2)
+def test_draft_head_w0_matches_vllm_ops(monkeypatch: pytest.MonkeyPatch) -> None:
+    """As ``test_draft_head_matches_vllm_ops``, but ``HeadBuild(reduce="w0")``:
+    only wave 0 does the per-group row_sum + fold instead of every wave
+    redoing it -- same per-row math, same oracle."""
+    multi_process_parallel(monkeypatch, 2, 1, _head_worker_w0)
 
 
 @ray.remote(num_gpus=1, max_calls=1)
