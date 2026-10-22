@@ -47,3 +47,11 @@ def _verify_reason(m, width: int, q: int) -> str | None:
     ):
         return "not uniform"
     return None
+
+
+def verify_widths(q: int) -> tuple[int, int]:
+    """The spec-aware GDN block's widths (P3): one or two whole requests, the
+    only request counts whose GDN verify task-chunk size (``vch`` 16, 32) fits
+    a single task round on 256 CTAs. A wider verify step (more whole requests)
+    falls back to the stock GDN core (``gdn_verify_core``)."""
+    return (q, 2 * q)

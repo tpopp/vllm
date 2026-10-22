@@ -31,12 +31,15 @@ Supported:
   faster;
 - MTP (`--speculative-config '{"method": "mtp", "num_speculative_tokens": N}'`,
   N <= 15): verify steps of whole requests, N + 1 rows each, up to 16 rows
-  (at N = 3, up to 4 requests). A request's rows are consecutive tokens, so the
-  GDN layers of a verify step run vLLM's in_proj, GDN core (on the spec-decode
-  metadata) and gated norm in place of the GDN block; the HC fronts, the QSA
-  layers and the o_proj and MoE blocks run as on a decode step. The drafter
-  reads the state before the final mixer, which the step leaves where the
-  stock forward does;
+  (at N = 3, up to 4 requests). A request's rows are consecutive tokens; at
+  one or two whole requests the GDN layers run the GDN block's spec-aware
+  verify core (conv rewound by `num_accepted_tokens`, the delta rule with
+  per-draft-position state writes, the gated norm, all in-kernel) in place of
+  the plain decode GDN block, at more requests they run vLLM's in_proj, GDN
+  core (on the spec-decode metadata) and gated norm instead. The HC fronts,
+  the QSA layers and the o_proj and MoE blocks run as on a decode step. The
+  drafter reads the state before the final mixer, which the step leaves
+  where the stock forward does;
 - the checkpoint's shapes (`mono/layout.py`, `SHAPES`) and formats: online
   MXFP4 GDN projections in the layout of whichever AITER FP4 GEMM vLLM picked
   for the shape (ASM or Triton), quantizing their inputs as that GEMM does,

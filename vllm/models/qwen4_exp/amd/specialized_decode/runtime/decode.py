@@ -29,9 +29,12 @@ each HC combine to the next mix; the blocks materialize it with the same bf16
 rounding, so the PLE layers and the final mixer read a plain state.
 
 With MTP every planned step is a verify step: a request's rows are its
-consecutive tokens, so a GDN layer runs vLLM's in_proj, GDN core (on the
-spec-decode metadata) and gated norm in place of the GDN block
-(``gdn_verify_core``); the rest is as above. The drafter's input, the state
+consecutive tokens. At one or two whole requests (``routing.verify_widths``)
+a GDN layer runs the GDN block's spec-aware verify core (P3: in_proj, the
+conv update and gated delta rule rewound by ``num_accepted_tokens``, the
+gated norm, all in-kernel); at a wider verify step it falls back to vLLM's
+in_proj, GDN core (on the spec-decode metadata) and gated norm
+(``gdn_verify_core``). The rest is as above. The drafter's input, the state
 before the final mixer, goes to the buffer the stock forward fills."""
 
 import os
@@ -60,7 +63,10 @@ from vllm.models.qwen4_exp.amd.specialized_decode.runtime.layers import (
     gdn_verify_core,
     qsa_core,
 )
-from vllm.models.qwen4_exp.amd.specialized_decode.runtime.routing import step_reason
+from vllm.models.qwen4_exp.amd.specialized_decode.runtime.routing import (
+    step_reason,
+    verify_widths,
+)
 
 logger = init_logger(__name__)
 
@@ -169,6 +175,21 @@ class SpecializedDecode:
                 if layer.layer_type == "linear_attention" and self.config.q == 1:
                     keys.add((blocks.build_gdn, la.gdn_key(layer, s)))
                 keys.add((blocks.build_oproj, la.oproj_key(layer, s)))
+        if self.config.q > 1:
+            # P3: the spec-aware GDN block, at the verify widths it covers
+            # (one or two whole requests); wider verify steps run the stock
+            # GDN core (``routing.verify_widths``).
+            for layer in self.model.layers:
+                if layer.layer_type != "linear_attention":
+                    continue
+                for s in verify_widths(self.config.q):
+                    if s in self.config.widths:
+                        keys.add(
+                            (
+                                blocks.build_gdn,
+                                la.gdn_key(layer, s, verify=True, q=self.config.q),
+                            )
+                        )
         return sorted(keys, key=lambda bk: repr(bk[1]))
 
     def _kv_key(self) -> tuple[int, int] | None:
@@ -268,7 +289,15 @@ class SpecializedDecode:
                 layer, layer.attn_hyper_connection, state, msq, la.attn_scratch
             )
             gate = None
-            if layer.layer_type == "linear_attention" and step.verify:
+            if (
+                layer.layer_type == "linear_attention"
+                and step.verify
+                and step.width in verify_widths(self.config.q)
+            ):
+                # P3: the GDN block's spec-aware verify core, in place of the
+                # stock in_proj + AITER GDN core + gated norm call below.
+                core = la.gdn_verify(layer, md, x, self.config.q)
+            elif layer.layer_type == "linear_attention" and step.verify:
                 core = gdn_verify_core(layer.linear_attn, x)
             elif layer.layer_type == "linear_attention":
                 core = la.gdn(layer, md, x)

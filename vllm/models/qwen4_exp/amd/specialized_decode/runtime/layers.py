@@ -7,6 +7,7 @@ of each width, the peer buffer, the step epoch and the health words."""
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.models.qwen4_exp.amd.specialized_decode.mono import blocks, front
 from vllm.models.qwen4_exp.amd.specialized_decode.mono import layout as L
 from vllm.models.qwen4_exp.amd.specialized_decode.runtime.guards import (
@@ -15,6 +16,8 @@ from vllm.models.qwen4_exp.amd.specialized_decode.runtime.guards import (
     o_proj,
 )
 from vllm.platforms import current_platform
+
+logger = init_logger(__name__)
 
 
 def _buf(n: int, dev) -> torch.Tensor:
@@ -121,6 +124,46 @@ class Launcher:
         )
         return core
 
+    def gdn_verify(self, layer, md, x, q: int) -> torch.Tensor:
+        """P3: the GDN block's spec-aware verify core (conv rewound by
+        ``num_accepted_tokens``, the delta rule with per-draft-position state
+        writes, the gated norm) in-kernel, in place of the stock
+        ``gdn_verify_core`` call. Only called on a pure, uniform MTP verify
+        step of one or two whole requests (``routing.verify_widths``)."""
+        a = layer.linear_attn
+        conv_state, rstate = gdn_conv_state(a)
+        m = md[a.prefix]
+        s = x.size(0)
+        n_req = s // q
+        core = x.new_empty(s, L.Layout(self.tp).CORE)
+        blocks.gdn_block(
+            self.gdn_key(layer, s, verify=True, q=q),
+            x=x,
+            w_qkvz=a.in_proj_qkvz.weight,
+            w_qkvzs=a.in_proj_qkvz.weight_scale,
+            w_ba=a.in_proj_ba.weight,
+            conv_w=a.conv1d.weight,
+            conv_state=conv_state,
+            a_log=a.A_log,
+            dt_bias=a.dt_bias,
+            norm_w=a.norm.weight,
+            rstate=rstate,
+            core=core,
+            scratch=self.attn_scratch[s],
+            epoch=self.epoch,
+            health=self.health,
+            alarm=self.alarm,
+            layer=layer.layer_idx,
+            spec_idx=m.spec_state_indices_tensor[:n_req].contiguous(),
+            num_accepted=m.num_accepted_tokens[:n_req].contiguous(),
+        )
+        logger.info_once(
+            "Qwen3.8-Flash-Next specialized decode: first spec-aware GDN "
+            "verify step (%d rows)",
+            s,
+        )
+        return core
+
     def oproj(self, layer, core, gate, state, inj):
         """o_proj, its all-reduce and the attention HC's combine -> (the next
         state, its sums of squares)."""
@@ -181,13 +224,23 @@ class Launcher:
             tokens=s, tp=self.tp, self_msq=self_msq, eps=hc.config.rms_norm_eps
         )
 
-    def gdn_key(self, layer, s: int) -> blocks.GdnBuild:
+    def gdn_key(
+        self, layer, s: int, verify: bool = False, q: int = 1
+    ) -> blocks.GdnBuild:
         a = layer.linear_attn
+        shuffled = bool(mxfp4_shuffled(a.in_proj_qkvz))
+        if not verify:
+            return blocks.GdnBuild(
+                tokens=s, tp=self.tp, norm_eps=a.norm.eps, shuffled=shuffled
+            )
         return blocks.GdnBuild(
             tokens=s,
             tp=self.tp,
             norm_eps=a.norm.eps,
-            shuffled=bool(mxfp4_shuffled(a.in_proj_qkvz)),
+            shuffled=shuffled,
+            verify=True,
+            q=q,
+            vch=16 if s == q else 32,
         )
 
     def oproj_key(self, layer, s: int) -> blocks.OprojBuild:
