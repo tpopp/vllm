@@ -460,10 +460,10 @@ def build(key: K1Build):
             "bin_out": bin_out if key.proj_only else None,
             "inj_out": lambda t, r, vs: _put_inj(c, t, r, vs),
         }
-        # ---- the HC front: a CTA's whole sequence in one branch, its weights
-        # (and its in_proj_qkvz ones) in flight first
-        if const_expr(not key.front_only):
-            qops = [qkvz_loads(c, bid + BLOCKS * j) for j in range(2)]
+        # ---- the HC front: a CTA's whole sequence in one branch; load_rrms
+        # (the critical poll on msq_in / the msq mailbox, ready at kernel
+        # entry) is issued before in_proj_qkvz's weight loads so its own
+        # vmcnt wait does not queue behind them (WAVESCOPE_FINDINGS.md V1)
         if const_expr(key.self_msq):  # noqa: SIM102 (traced: `and` does not combine traced values)
             if bid < hc.NRED:
                 hc.stage_msq(c, bid)
@@ -497,9 +497,11 @@ def build(key: K1Build):
                 hc.stage_down(c, bid - D0, dops)
             # ---- in_proj on the block input, then the GDN tasks (proj_only:
             # just the projections, finalizing in_proj_ba's K-split partials
-            # to ``ba_out`` in place of reading them)
+            # to ``ba_out`` in place of reading them); in_proj_qkvz's weight
+            # loads issued here, past every branch's load_rrms above
             if ~is_ba:
                 hc.bin_to_lds(c, XROW)
+            qops = [qkvz_loads(c, bid + BLOCKS * j) for j in range(2)]
             quant_x(c, H)
             for j in range_constexpr(2):
                 stage_qkvz(c, bid + BLOCKS * j, qops[j])
