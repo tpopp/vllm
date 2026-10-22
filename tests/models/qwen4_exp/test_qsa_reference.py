@@ -299,6 +299,98 @@ def test_qsa_side_metadata_marks_cudagraph_padding_inert() -> None:
     assert metadata.visible_blocks.tolist() == [65, 66, 67, 68] * 3 + [0] * 4
 
 
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike() or not HAS_TRITON,
+    reason="QSA metadata kernel requires a GPU and Triton",
+)
+@pytest.mark.parametrize("cache_kind", ["plain", "circular", "compressed"])
+def test_qsa_draft_decode_metadata_update_matches_rebuild(cache_kind: str) -> None:
+    """A fused draft-decode graph builds QSA metadata once at capture and then
+    refreshes it in place; the refresh must equal an eager rebuild, including
+    keeping zero-length padding requests (stale block-table rows) inert."""
+    device = torch.device("cuda")
+    num_reqs, num_tokens = 4, 4
+    builder = QSAMetadataBuilder.__new__(QSAMetadataBuilder)
+    builder.reorder_batch_threshold = 1
+    builder.is_circular_buffer = cache_kind == "circular"
+    builder.compress_ratio = 4 if cache_kind == "compressed" else 1
+    builder.storage_block_size = 2 if cache_kind == "compressed" else 64
+    builder.kv_cache_spec = SimpleNamespace(block_size=8)
+    builder.request_capacity = num_reqs
+    builder.token_to_req_buffer = torch.empty(16, dtype=torch.int32, device=device)
+    builder.slot_mapping_buffer = torch.empty(16, dtype=torch.int64, device=device)
+    builder.logical_positions_buffer = torch.empty(16, dtype=torch.int64, device=device)
+    builder.visible_blocks_buffer = torch.empty(16, dtype=torch.int32, device=device)
+    max_num_work = (num_tokens + 3 * num_reqs) // 4
+    builder.k_work_metadata_buffer = torch.empty(
+        max_num_work if cache_kind == "compressed" else 0,
+        2,
+        dtype=torch.int32,
+        device=device,
+    )
+
+    # Capture-time state: every padded request owns one decode token.
+    query_start_loc = torch.arange(num_reqs + 1, dtype=torch.int32, device=device)
+    seq_lens = torch.full((num_reqs,), 5, dtype=torch.int32, device=device)
+    slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=device)
+    # Padding rows hold stale, valid-looking blocks of other requests.
+    block_table = torch.tensor(
+        [[3, 4, 5, 6], [7, 8, 9, 10], [11, 12, 13, 14], [15, 16, 17, 18]],
+        dtype=torch.int32,
+        device=device,
+    )
+    capture = SimpleNamespace(
+        num_actual_tokens=num_tokens,
+        num_reqs=num_reqs,
+        max_query_len=1,
+        max_seq_len=64,
+        query_start_loc=query_start_loc,
+        query_start_loc_cpu=query_start_loc.cpu(),
+        seq_lens=seq_lens,
+        slot_mapping=slot_mapping,
+        block_table_tensor=block_table,
+    )
+    metadata = builder.build(0, capture)
+
+    # Replay-time state: two live requests, two zero-length padding requests.
+    query_start_loc.copy_(torch.tensor([0, 1, 2, 2, 2]))
+    seq_lens.copy_(torch.tensor([10, 16, 0, 0]))
+    slot_mapping.copy_(torch.tensor([33, 61, -1, -1]))
+    builder.update_draft_decode_metadata(metadata)
+
+    runtime = SimpleNamespace(**vars(capture))
+    runtime.query_start_loc_cpu = query_start_loc.cpu()
+    expected_k_work = (
+        torch.empty(max_num_work, 2, dtype=torch.int32, device=device)
+        if cache_kind == "compressed"
+        else None
+    )
+    expected = qsa_cache.build_qsa_metadata_triton(
+        runtime,
+        torch.empty(num_tokens, dtype=torch.int32, device=device),
+        torch.empty(num_tokens, dtype=torch.int64, device=device),
+        torch.empty(num_tokens, dtype=torch.int32, device=device),
+        torch.empty(num_tokens, dtype=torch.int64, device=device),
+        storage_block_size=builder.storage_block_size,
+        compress_ratio=builder.compress_ratio,
+        circular_buffer_size=8 if cache_kind == "circular" else 0,
+        k_work_metadata_buffer=expected_k_work,
+        request_capacity=num_reqs,
+    )
+    actual = (
+        metadata.token_to_req,
+        metadata.logical_positions,
+        metadata.visible_blocks,
+        metadata.slot_mapping,
+    )
+    for actual_tensor, expected_tensor in zip(actual, expected):
+        torch.testing.assert_close(actual_tensor, expected_tensor)
+    assert metadata.logical_positions.tolist() == [9, 15, -1, -1]
+    assert metadata.slot_mapping[2:].tolist() == [-1, -1]
+    if expected_k_work is not None:
+        torch.testing.assert_close(metadata.k_work_metadata, expected_k_work)
+
+
 @requires_qsa_kernels
 def test_qsa_circular_buffer_metadata_keeps_only_each_requests_suffix() -> None:
     device = torch.device("cuda")
