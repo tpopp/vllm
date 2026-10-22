@@ -14,12 +14,16 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Draft architectures that apply `draft_moe_online_quant`.
+_DRAFT_MOE_ONLINE_QUANT_ARCHITECTURES = frozenset({"Qwen4ExpMTP"})
+
 
 class MTPSpeculatorConfig(EagleSpeculatorConfig):
     base_method = "mtp"
     speculator_class = "vllm.v1.worker.gpu.spec_decode.mtp.speculator.MTPSpeculator"
     supported_options = EagleSpeculatorConfig.supported_options | {
-        "index_share_for_mtp_iteration"
+        "draft_moe_online_quant",
+        "index_share_for_mtp_iteration",
     }
     supports_pcp = True
 
@@ -109,6 +113,8 @@ class MTPSpeculatorConfig(EagleSpeculatorConfig):
     @classmethod
     def apply_options(cls, spec: "SpeculativeConfig") -> None:
         super().apply_options(spec)
+        if spec.draft_moe_online_quant is not None:
+            check_draft_moe_online_quant(spec)
         if spec.index_share_for_mtp_iteration is None:
             return
         if spec.draft_model_config is None:
@@ -123,4 +129,24 @@ class MTPSpeculatorConfig(EagleSpeculatorConfig):
         draft = self.spec_config.draft_model_config
         if draft is None:
             return []
-        return [getattr(draft.hf_config, "index_share_for_mtp_iteration", False)]
+        factors: list[Any] = [
+            getattr(draft.hf_config, "index_share_for_mtp_iteration", False)
+        ]
+        if self.spec_config.draft_moe_online_quant is not None:
+            # The quantized draft experts change the draft's MoE kernels.
+            factors.append(self.spec_config.draft_moe_online_quant)
+        return factors
+
+
+def check_draft_moe_online_quant(spec: "SpeculativeConfig") -> None:
+    from vllm.platforms import current_platform
+
+    draft = spec.draft_model_config
+    architectures = draft.architectures if draft is not None else []
+    if not _DRAFT_MOE_ONLINE_QUANT_ARCHITECTURES.intersection(architectures):
+        raise ValueError(
+            "draft_moe_online_quant is only supported for draft architectures "
+            f"{sorted(_DRAFT_MOE_ONLINE_QUANT_ARCHITECTURES)}, got {architectures}."
+        )
+    if not current_platform.is_rocm():
+        raise ValueError("draft_moe_online_quant is only supported on ROCm.")

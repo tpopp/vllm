@@ -93,6 +93,7 @@ SpeculativeMethod = Literal[
 ]
 RejectionSampleMethod = Literal["standard", "synthetic", "block", "fly"]
 DraftSampleMethod = Literal["greedy", "probabilistic"]
+DraftMoEOnlineQuant = Literal["mxfp4"]
 
 _QWEN3_OMNI_TARGET_ARCHITECTURES = frozenset(
     {
@@ -105,6 +106,7 @@ _QWEN3_OMNI_DSPARK_ARCHITECTURE = "Qwen3OmniDSparkModel"
 _METHOD_SPECIFIC_OPTIONS = (
     "dspark_draft_topk",
     "draft_lm_head_quantization",
+    "draft_moe_online_quant",
     "index_share_for_mtp_iteration",
     "xpress_topc",
     "speculator_options",
@@ -513,6 +515,12 @@ class SpeculativeConfig:
     index_share_for_mtp_iteration: bool | None = None
     """Override whether MTP iterations reuse the first step's sparse indices.
     If `None`, use the value from the draft model's Hugging Face config."""
+    draft_moe_online_quant: DraftMoEOnlineQuant | None = None
+    """Quantize the draft model's unquantized MoE routed experts at load time
+    with this scheme (e.g. BF16 MTP experts next to an MXFP4 target). The rest
+    of the draft and the target model are unchanged. This changes draft
+    numerics, so check the acceptance rate. Currently supported for
+    method='mtp' with Qwen4Exp on ROCm."""
 
     # Advanced control
     disable_padded_drafter_batch: bool = False

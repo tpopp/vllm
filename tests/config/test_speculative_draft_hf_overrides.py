@@ -318,9 +318,11 @@ def test_composed_override_is_picklable():
 def _make_mtp_speculative_config(
     override: bool | None,
     checkpoint_value: bool,
+    architecture: str = "Qwen4ExpMTP",
+    **speculative_kwargs,
 ) -> SpeculativeConfig:
     draft_hf_config = _make_hf_config(
-        architectures=["Qwen4ExpMTP"],
+        architectures=[architecture],
         model_type="qwen4_exp_mtp",
         n_predict=1,
         index_share_for_mtp_iteration=checkpoint_value,
@@ -332,6 +334,7 @@ def _make_mtp_speculative_config(
         max_model_len=128,
         speculator_config_class=None,
     )
+    draft_model_config.compute_hash.return_value = "draft"
     target_model_config = MagicMock(
         model="target",
         max_model_len=128,
@@ -346,6 +349,7 @@ def _make_mtp_speculative_config(
             method="mtp",
             num_speculative_tokens=1,
             index_share_for_mtp_iteration=override,
+            **speculative_kwargs,
             target_model_config=target_model_config,
             target_parallel_config=ParallelConfig(),
         )
@@ -364,6 +368,30 @@ def test_mtp_index_share_override(
         speculative_config.draft_model_config.hf_config.index_share_for_mtp_iteration
         is expected
     )
+
+
+@pytest.mark.cpu_test
+def test_draft_moe_online_quant(monkeypatch: pytest.MonkeyPatch):
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(current_platform, "is_rocm", lambda: True)
+    plain = _make_mtp_speculative_config(None, False)
+    quantized = _make_mtp_speculative_config(
+        None, False, draft_moe_online_quant="mxfp4"
+    )
+    assert quantized.draft_moe_online_quant == "mxfp4"
+    assert quantized.compute_hash() != plain.compute_hash()
+
+    with pytest.raises(ValueError, match="draft architectures"):
+        _make_mtp_speculative_config(
+            None, False, "DeepSeekMTPModel", draft_moe_online_quant="mxfp4"
+        )
+    with pytest.raises(ValueError, match="draft_moe_online_quant"):
+        _make_mtp_speculative_config(None, False, draft_moe_online_quant="int4")
+
+    monkeypatch.setattr(current_platform, "is_rocm", lambda: False)
+    with pytest.raises(ValueError, match="only supported on ROCm"):
+        _make_mtp_speculative_config(None, False, draft_moe_online_quant="mxfp4")
 
 
 @pytest.mark.cpu_test

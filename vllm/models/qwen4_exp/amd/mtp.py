@@ -22,10 +22,13 @@ from transformers import Qwen4ExpTextConfig
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig, replace, set_current_vllm_config
+from vllm.config.speculative import DraftMoEOnlineQuant
 from vllm.distributed import get_pp_group
+from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -57,6 +60,8 @@ from .model import (
     Qwen4ExpMixtureOfExperts,
     Qwen4ExpSparseMoeBlock,
 )
+
+logger = init_logger(__name__)
 
 
 def _remap_ignored_layers(
@@ -196,6 +201,45 @@ def _make_draft_vllm_config(
     return draft_vllm_config
 
 
+def _quantize_draft_experts_online(
+    draft_quant_config: QuantizationConfig | None,
+    expert_prefixes: list[str],
+    scheme: DraftMoEOnlineQuant,
+) -> None:
+    """Quantize the draft layers' unquantized routed experts at load time
+    (``speculative_config.draft_moe_online_quant``).
+
+    Quantized checkpoints may ship ``mtp.*`` unquantized (and excluded), and
+    ``--quantization-config`` does not reach the draft model config, so this
+    composes an online ``targets`` config naming only these expert layers onto
+    the draft's own quant config. The target model is untouched.
+    """
+    if draft_quant_config is None:
+        raise ValueError(
+            "draft_moe_online_quant requires a quantized checkpoint; the "
+            "Qwen4Exp MTP draft has no quantization config."
+        )
+    if draft_quant_config.online_quantization_config is not None:
+        raise ValueError(
+            "draft_moe_online_quant cannot be combined with an existing online "
+            "quantization config for the Qwen4Exp MTP draft."
+        )
+
+    from vllm.config.quantization import QuantizationConfigArgs
+    from vllm.model_executor.layers.quantization.online.base import (
+        OnlineQuantizationConfig,
+    )
+
+    draft_quant_config.online_quantization_config = OnlineQuantizationConfig(
+        QuantizationConfigArgs(targets=dict.fromkeys(expert_prefixes, scheme))
+    )
+    logger.info_once(
+        "Quantizing the Qwen4Exp MTP draft routed experts (%s) to %s at load time.",
+        ", ".join(expert_prefixes),
+        scheme,
+    )
+
+
 @support_torch_compile(
     dynamic_arg_dims={
         "input_ids": 0,
@@ -230,6 +274,17 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             vllm_config,
             self.mtp_start_layer_idx,
         )
+        layer_prefixes = [
+            f"{prefix}.layers.{self.mtp_start_layer_idx + idx}"
+            for idx in range(self.num_mtp_layers)
+        ]
+        spec_config = vllm_config.speculative_config
+        if spec_config is not None and spec_config.draft_moe_online_quant is not None:
+            _quantize_draft_experts_online(
+                draft_vllm_config.quant_config,
+                [f"{layer_prefix}.mlp.experts" for layer_prefix in layer_prefixes],
+                spec_config.draft_moe_online_quant,
+            )
         with set_current_vllm_config(draft_vllm_config, prefix=prefix):
             # residual_linear_shared fusion: fc_embedding projects the token
             # embedding, fc_hidden (shared across HC branches) projects the
@@ -257,9 +312,9 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
                 Qwen4ExpDecoderLayer(
                     draft_vllm_config,
                     layer_type="qwen_sparse_attention",
-                    prefix=f"{prefix}.layers.{self.mtp_start_layer_idx + idx}",
+                    prefix=layer_prefix,
                 )
-                for idx in range(self.num_mtp_layers)
+                for layer_prefix in layer_prefixes
             )
         self.fused_shared_expert_layers = get_fused_shared_expert_layers(
             self,
