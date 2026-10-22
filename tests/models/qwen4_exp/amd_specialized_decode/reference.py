@@ -118,6 +118,146 @@ def _gdn_reference(w, n: int, qkvz=None, ba=None):
     }
 
 
+def _verify_inputs(accepted: list, pad_last: bool, q: int = 4):
+    """A uniform verify batch: ``len(accepted)`` requests, ``q`` rows each,
+    request-major (row ``req * q + t``). Every live request gets ``1 + q``
+    distinct state slots (slot 0 is never assigned: vLLM's null block);
+    ``accepted[r]`` is this request's num_accepted_tokens (picks the conv
+    rewind offset and the checkpoint recurrent-state column, ``accepted -
+    1``). ``pad_last``: the last request's conv slot (column 0) is 0, a
+    whole padding row-group."""
+    from vllm.models.qwen4_exp.amd.specialized_decode.mono.layout import (
+        CONV_W,
+        HD,
+        HH,
+        HIDDEN,
+        Layout,
+    )
+
+    lay = Layout(TP)
+    n_req = len(accepted)
+    s = n_req * q
+    verify_sl = CONV_W - 1 + q - 1
+    g = torch.Generator(device="cuda").manual_seed(0)
+    w = {
+        "state": _randn(g, s, HH, scale=2.0),
+        **_hc_weights(g),
+        "w_ba": _randn(g, lay.BA, HIDDEN, scale=0.05),
+        "conv_w": _randn(g, lay.CONV, 1, 4, scale=0.4),
+        "a_log": _randn(g, lay.NV, scale=0.5, dtype=torch.float32),
+        "dt_bias": _randn(g, lay.NV, scale=0.5),
+        "norm_w": (1 + _randn(g, HD, scale=0.1, dtype=torch.float32)).to(bf),
+    }
+    q_, sc, w["w_qkvz"], w["w_qkvzs"] = _mxfp4_linear(g, lay.QKVZ, HIDDEN)
+    w["w_qkvz_ref"] = _mxfp4_dequant(q_, sc).to(bf)
+    w["shuffled"] = True
+
+    slots = 1 + n_req * (1 + q)
+    n = lay.NV * HD * HD
+    pad_t = _randn(g, slots, n + 8192, scale=0.05, dtype=torch.float32)
+    rstate = pad_t[:, :n].view(slots, lay.NV, HD, HD)
+    conv = _randn(g, slots, lay.CONV * verify_sl + 1024)[:, : lay.CONV * verify_sl]
+    w["conv_state"] = conv.view(slots, verify_sl, lay.CONV).transpose(-1, -2)
+    w["rstate"] = rstate
+
+    idx = torch.zeros(n_req, q, dtype=torch.int32, device="cuda")
+    for r in range(n_req):
+        if pad_last and r == n_req - 1:
+            continue  # column 0 (and every column) stays 0: a null row-group
+        base = 1 + r * (1 + q)
+        idx[r] = torch.arange(base, base + q, device="cuda")
+    w["spec_state_indices"] = idx
+    w["num_accepted_tokens"] = torch.tensor(accepted, dtype=torch.int32, device="cuda")
+    return w, lay, s, n_req
+
+
+def _verify_reference(w, lay, live_n_req: int, q: int = 4, qkvz=None, ba=None):
+    """The stock verify chain (``causal_conv1d_update`` rewound by
+    ``num_accepted_tokens``, FLA's ``fused_sigmoid_gating_delta_rule_update``
+    checkpointed/written the same way, ``RMSNormGated``) on cloned
+    conv/recurrent state -- the semantics the GDN block's ``verify`` build
+    reimplements in-kernel.
+
+    Only the first ``live_n_req`` requests (the GDN block's own padding-
+    request slot<=0 guard aside, the stock FLA kernel's grid comes straight
+    from ``len(cu_seqlens) - 1`` with no such guard -- a whole padding
+    row-group must not be handed to it)."""
+    from vllm.model_executor.layers.layernorm import RMSNormGated
+    from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
+        causal_conv1d_update,
+    )
+    from vllm.models.qwen4_exp.amd.specialized_decode.mono.layout import HD
+    from vllm.third_party.flash_linear_attention.ops import (
+        fused_sigmoid_gating_delta_rule_update,
+    )
+
+    nk, nv = lay.NK, lay.NV
+    key_dim, value_dim = nk * HD, nv * HD
+    qkv_size = 2 * key_dim + value_dim
+    live_s = live_n_req * q
+    x, inj, _ = _mix_ref(w["state"], w)
+    if qkvz is None:
+        qkvz = F.linear(_mxfp4_qdq(x, w["shuffled"]).to(bf), w["w_qkvz_ref"])
+        ba = F.linear(x, w["w_ba"])
+    qkvz, ba = qkvz[:live_s], ba[:live_s]
+    mixed_qkv, z = qkvz.split([qkv_size, value_dim], dim=-1)
+    b, a = ba.chunk(2, dim=-1)
+    idx = w["spec_state_indices"][:live_n_req]
+    nacc = w["num_accepted_tokens"][:live_n_req]
+    qsl = torch.arange(0, live_s + 1, q, dtype=torch.int32, device="cuda")
+
+    conv_state = w["conv_state"].clone()
+    rstate = w["rstate"].clone()
+    mixed_qkv = causal_conv1d_update(
+        mixed_qkv.clone(),
+        conv_state,
+        w["conv_w"].view(w["conv_w"].size(0), w["conv_w"].size(2)),
+        None,
+        "silu",
+        conv_state_indices=idx[:, 0],
+        num_accepted_tokens=nacc,
+        query_start_loc=qsl,
+        max_query_len=idx.size(-1),
+        validate_data=False,
+    )
+    qv, kv, vv = mixed_qkv.split([key_dim, key_dim, value_dim], dim=-1)
+    o, _ = fused_sigmoid_gating_delta_rule_update(
+        A_log=w["a_log"],
+        a=a,
+        b=b,
+        dt_bias=w["dt_bias"],
+        q=qv.contiguous().view(1, live_s, nk, HD),
+        k=kv.contiguous().view(1, live_s, nk, HD),
+        v=vv.contiguous().view(1, live_s, nv, HD),
+        initial_state=rstate,
+        inplace_final_state=True,
+        cu_seqlens=qsl,
+        ssm_state_indices=idx,
+        num_accepted_tokens=nacc,
+        use_qk_l2norm_in_kernel=True,
+    )
+    core = o.squeeze(0)
+    core = RMSNormGated.forward_static(
+        core,
+        z.view(live_s, nv, HD),
+        w["norm_w"],
+        1e-6,
+        core.dtype,
+        group_size=None,
+        norm_before_gate=True,
+        activation="sigmoid",
+    ).reshape(live_s, -1)
+    return {
+        "x": x,
+        "inj": inj,
+        "qkvz": qkvz,
+        "ba": ba,
+        "conv_state": conv_state,
+        "rstate": rstate,
+        "core": core,
+    }
+
+
 def _pad_halves(x, ri, rip, fill):
     """[ne, 2 ri, ...] [gate; up] rows -> [ne, 2 rip, ...], each half padded."""
     ne = x.shape[0]

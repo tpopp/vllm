@@ -177,6 +177,96 @@ def test_gdn_block_matches_vllm_ops(s: int, n_real: int, shuffled: bool) -> None
     torch.testing.assert_close(conv_state[0], w["conv_state"][0], atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("vch", [16, 32])
+@pytest.mark.parametrize(
+    "accepted,pad_last",
+    [
+        ([1], False),
+        ([2], False),
+        ([4], False),
+        ([1, 4], False),
+        ([2, 3], False),
+        ([3, 1], True),
+    ],
+)
+@torch.inference_mode()
+def test_gdn_block_verify_matches_stock_chain(
+    accepted: list, pad_last: bool, vch: int
+) -> None:
+    """P3: the GDN block's ``verify`` build against the stock spec-decode
+    chain (``causal_conv1d_update`` + FLA's non-AITER
+    ``fused_sigmoid_gating_delta_rule_update`` + ``RMSNormGated``) that a
+    pure, uniform verify step otherwise runs (``gdn_verify_core``), across
+    ``n_req in {1, 2}``, every accepted-count in ``1..q``, a whole padding
+    request (``pad_last``), and both GDN task chunk sizes (``vch``: 16 is the
+    8-chunk layout at one request, 32 the 4-chunk layout that halves the task
+    count a request so a 2-request batch still fits one task round)."""
+    from tests.models.qwen4_exp.amd_specialized_decode.reference import (
+        _verify_inputs,
+        _verify_reference,
+    )
+    from vllm.models.qwen4_exp.amd.specialized_decode.mono import blocks
+
+    q = 4
+    w, lay, s, n_req = _verify_inputs(accepted, pad_last, q=q)
+    live_n_req = n_req - 1 if pad_last else n_req
+    live_s = live_n_req * q
+    ref = _verify_reference(w, lay, live_n_req, q=q)
+
+    key = blocks.GdnBuild(tokens=s, tp=TP, verify=True, q=q, vch=vch)
+    conv_state, rstate = w["conv_state"].clone(), w["rstate"].clone()
+    core = torch.full((s, lay.CORE), float("nan"), dtype=bf, device="cuda")
+    scratch = torch.zeros(
+        blocks.scratch_bytes(blocks.gdn_scratch_layout(key)),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    hl = _health()
+    blocks.gdn_block(
+        key,
+        x=ref["x"].contiguous(),
+        w_qkvz=w["w_qkvz"],
+        w_qkvzs=w["w_qkvzs"],
+        w_ba=w["w_ba"],
+        conv_w=w["conv_w"],
+        conv_state=conv_state,
+        a_log=w["a_log"],
+        dt_bias=w["dt_bias"],
+        norm_w=w["norm_w"],
+        rstate=rstate,
+        core=core,
+        scratch=scratch,
+        epoch=torch.ones(1, dtype=torch.int32, device="cuda"),
+        **hl,
+        layer=0,
+        spec_idx=w["spec_state_indices"],
+        num_accepted=w["num_accepted_tokens"],
+    )
+    torch.accelerator.synchronize()
+    assert not hl["health"].any()
+
+    live_slots = []
+    for r in range(live_n_req):
+        acc = accepted[r]
+        live_slots += [w["spec_state_indices"][r, 0].item()]
+        live_slots += [w["spec_state_indices"][r, t].item() for t in range(acc)]
+    live_slots = sorted(set(live_slots))
+    errs = {
+        "conv_state": _rel_l2(conv_state[live_slots], ref["conv_state"][live_slots]),
+        "rstate": _rel_l2(rstate[live_slots], ref["rstate"][live_slots]),
+        "core": _rel_l2(core[:live_s], ref["core"]),
+    }
+    assert errs["conv_state"] < 5e-3 and errs["rstate"] < 5e-3, errs
+    assert _cos(core[:live_s], ref["core"]) > COS_MIN, errs
+    if pad_last:
+        pr = n_req - 1
+        rows = slice(pr * q, (pr + 1) * q)
+        assert torch.equal(core[rows], torch.zeros_like(core[rows]))
+        # an all-zero padding row-group's slot 0 is never touched
+        torch.testing.assert_close(conv_state[0], w["conv_state"][0], atol=0, rtol=0)
+        torch.testing.assert_close(rstate[0], w["rstate"][0], atol=0, rtol=0)
+
+
 def _tp_state(rank: int, tp_size: int, device) -> dict:
     """A rank's launch state as ``Launcher`` builds it: the peer buffer (the
     output rank's flags in its head), the health words, the alarm word."""

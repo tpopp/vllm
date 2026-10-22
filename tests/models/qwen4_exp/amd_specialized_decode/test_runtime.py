@@ -11,7 +11,10 @@ import torch
 from vllm.config import CompilationMode, CUDAGraphMode
 from vllm.models.qwen4_exp.amd.specialized_decode import runtime
 from vllm.models.qwen4_exp.amd.specialized_decode.mono import layout as L
-from vllm.models.qwen4_exp.amd.specialized_decode.runtime.routing import step_reason
+from vllm.models.qwen4_exp.amd.specialized_decode.runtime.routing import (
+    step_reason,
+    verify_widths,
+)
 
 
 def _text_config(**over):
@@ -280,3 +283,12 @@ def _verify_metadata(reqs=2, q=4, uniform=True, decodes=0, prefills=0):
 )
 def test_verify_step_reason(md, width, why):
     assert step_reason(md, "gdn", width, q=4) == why
+
+
+@pytest.mark.parametrize("q,widths", [(4, (4, 8)), (1, (1, 2)), (16, (16, 32))])
+def test_verify_widths(q, widths):
+    """P3's spec-aware GDN block covers one or two whole requests; a verify
+    step of more requests (e.g. N=3 at q=4, width 12 or 16) is not among
+    them, so ``SpecializedDecode.run`` falls back to the stock GDN core."""
+    assert verify_widths(q) == widths
+    assert 3 * q not in verify_widths(q)
