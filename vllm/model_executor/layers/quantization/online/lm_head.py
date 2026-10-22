@@ -16,6 +16,9 @@ from vllm.model_executor.layers.quantization.online.fp8 import (
     Fp8PtpcOnlineLinearMethod,
     OnlineLinearBase,
 )
+from vllm.model_executor.layers.quantization.online.mxfp4 import (
+    Mxfp4OnlineLinearMethod,
+)
 from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
     FLOAT4_E2M1_MAX,
     ref_nvfp4_quant,
@@ -83,6 +86,7 @@ class _LMHeadNvfp4Method(OnlineLinearBase):
 _LM_HEAD_METHODS: dict[str, type[OnlineLinearBase]] = {
     "fp8": Fp8PtpcOnlineLinearMethod,
     "nvfp4": _LMHeadNvfp4Method,
+    "mxfp4": Mxfp4OnlineLinearMethod,
 }
 
 
@@ -129,13 +133,14 @@ _SOURCES: WeakKeyDictionary[Module, tuple[ParallelLMHead, str]] = WeakKeyDiction
 
 
 def quantized_lm_head_copy(
-    lm_head: ParallelLMHead, quantization: Literal["fp8", "nvfp4"]
+    lm_head: ParallelLMHead, quantization: Literal["fp8", "nvfp4", "mxfp4"]
 ) -> ParallelLMHead:
     """A ParallelLMHead holding this rank's shard of `lm_head`, quantized.
 
     "fp8" uses per-row weight and per-token activation scales on the platform's
     FP8 linear kernel; "nvfp4" is weight-only on the
-    platform's W4A16 kernel. `lm_head` is left
+    platform's W4A16 kernel; "mxfp4" is W4A4 MXFP4 on the platform's MXFP4
+    linear kernel (ROCm only). `lm_head` is left
     unchanged and no bf16 copy of its weight is made. The copy is derived state:
     `refresh_quantized_lm_heads` re-derives it after `lm_head` changes.
     """

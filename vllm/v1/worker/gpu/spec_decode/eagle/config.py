@@ -19,6 +19,14 @@ def wrap_eagle_hf_config(spec: SpeculativeConfig, method: str) -> None:
 
 
 def check_draft_lm_head_quantization(spec: SpeculativeConfig) -> None:
+    if spec.draft_lm_head_quantization == "mxfp4":
+        from vllm.platforms import current_platform
+
+        if not current_platform.is_rocm():
+            raise ValueError(
+                "draft_lm_head_quantization='mxfp4' is only supported on ROCm; "
+                "use 'fp8' or 'nvfp4' on other platforms."
+            )
     draft = spec.draft_model_config
     if (
         spec.draft_lm_head_quantization is not None

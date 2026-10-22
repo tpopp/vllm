@@ -27,11 +27,16 @@ VOCAB, HIDDEN = 4000, 512
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="Marlin needs CUDA"
 )
-# NVFP4 needs a CUDA W4A16 kernel; ROCm only runs the fp8 cases.
+# NVFP4 needs a CUDA W4A16 kernel.
 requires_nvfp4 = pytest.mark.skipif(
     not current_platform.is_cuda(), reason="nvfp4 needs a CUDA W4A16 kernel"
 )
 NVFP4 = pytest.param("nvfp4", marks=requires_nvfp4)
+# MXFP4 needs the ROCm (AITER) MXFP4 GEMM kernel.
+requires_mxfp4 = pytest.mark.skipif(
+    not current_platform.is_rocm(), reason="mxfp4 needs a ROCm MXFP4 GEMM kernel"
+)
+MXFP4 = pytest.param("mxfp4", marks=requires_mxfp4)
 
 
 def _target_head(monkeypatch, seed: int = 0) -> ParallelLMHead:
@@ -54,7 +59,12 @@ def _tensors(module: torch.nn.Module) -> dict[str, torch.Tensor]:
 @requires_cuda
 @pytest.mark.parametrize(
     ("quantization", "max_rel_err", "min_top1"),
-    [("fp8", 0.05, 0.9), pytest.param("nvfp4", 0.15, 0.75, marks=requires_nvfp4)],
+    [
+        ("fp8", 0.05, 0.9),
+        pytest.param("nvfp4", 0.15, 0.75, marks=requires_nvfp4),
+        # W4A4 with block-32 e8m0 scales: looser than weight-only nvfp4.
+        pytest.param("mxfp4", 0.25, 0.6, marks=requires_mxfp4),
+    ],
 )
 def test_tracks_bf16_head_through_logits_processor(
     default_vllm_config, dist_init, monkeypatch, quantization, max_rel_err, min_top1
@@ -80,7 +90,7 @@ def test_tracks_bf16_head_through_logits_processor(
 
 
 @requires_cuda
-@pytest.mark.parametrize("quantization", ["fp8", NVFP4])
+@pytest.mark.parametrize("quantization", ["fp8", NVFP4, MXFP4])
 def test_refresh_follows_target_update(
     default_vllm_config, dist_init, monkeypatch, quantization
 ):
@@ -152,7 +162,7 @@ def test_draft_weight_update_refreshes_copy(
 
 
 @requires_cuda
-@pytest.mark.parametrize("quantization", ["fp8", NVFP4])
+@pytest.mark.parametrize("quantization", ["fp8", NVFP4, MXFP4])
 def test_draft_weight_update_loads_lm_head(
     default_vllm_config, dist_init, monkeypatch, quantization
 ):
