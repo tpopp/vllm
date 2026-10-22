@@ -17,7 +17,12 @@ launch a draft step, ``BLOCKS`` x ``THREADS``, S <= 8 rows:
              happen once every thread has passed this iteration's barrier,
              and every thread's own read of the current half precedes its
              own next store in program order, so that barrier already
-             implies the current half's reads are done.
+             implies the current half's reads are done. ``key.reduce``: with
+             ``one_barrier``, every group's fold is only ever consumed from
+             wave 0's lanes (RP * tokens <= 64), so ``'w0'`` has only wave 0
+             do the row_sum + fold (the other 7 waves skip straight to the
+             next group's GEMV) instead of every wave redoing it (``'all'``,
+             the default).
     cta      (every CTA): the running best reduced to one a token (a
              4/2/1-lane xor-shuffle window: the 8 row-pair threads of a
              token) -> every CTA's (value, local row) to a scratch mailbox
@@ -98,6 +103,12 @@ class HeadBuild:
     rows: int = 124160  # this rank's vocab shard, padding included: a multiple of 32
     ahead: int = 3  # row groups' weights kept in flight (swept 2..5, see NOTES)
     one_barrier: bool = True  # double-buffered reduction: 1 barrier a group
+    reduce: str = "w0"  # "w0": only wave 0 does the row_sum+fold a group, the
+    # rest skip straight to the next group's GEMV (RP * tokens <= 64 = one
+    # wave's lanes, so the other 7 waves' fold was always discarded, see
+    # WAVESCOPE_FINDINGS H1); confirmed -9..-13 us vs "all" (every wave
+    # redoes it) at every S in 1,2,4,8, graph-replayed, 2 runs (see NOTES).
+    # "w0" needs one_barrier=True.
 
 
 ABI = KernelAbi(
@@ -178,17 +189,21 @@ def _store_i64(ptr, i, v):
 
 
 # ---------------------------------------------------------------- stages
-def run_head(c, groups, ahead, one_barrier):
+def run_head(c, groups, ahead, one_barrier, reduce):
     """Dispatches to the one- or two-``gpu.barrier()``-a-group loop (a
-    build-time choice, ``one_barrier``): both walk this rank's vocab shard,
-    16-row groups ``bid, bid + 256, ...`` (a dynamic loop: a CTA whose first
-    group is already past ``groups`` never runs its body, as a non-live round
-    used to be masked), ``ahead`` groups' online-MXFP4 operands kept in
-    flight (``run_ug``'s union-task pipelining), each group's bf16-rounded
-    logits folded into a running (max, global row) a token. Returns
-    (best_val, best_idx); the per-row math is identical either way."""
+    build-time choice, ``one_barrier``) and, within the one-barrier loop, to
+    the all-waves or wave-0-only reduce (``reduce``): all walk this rank's
+    vocab shard, 16-row groups ``bid, bid + 256, ...`` (a dynamic loop: a CTA
+    whose first group is already past ``groups`` never runs its body, as a
+    non-live round used to be masked), ``ahead`` groups' online-MXFP4
+    operands kept in flight (``run_ug``'s union-task pipelining), each
+    group's bf16-rounded logits folded into a running (max, global row) a
+    token. Returns (best_val, best_idx); the per-row math is identical
+    across every (one_barrier, reduce) combination."""
     if one_barrier:
-        return _run_head_1barrier(c, groups, ahead)
+        if reduce == "all":
+            return _run_head_1barrier(c, groups, ahead)
+        return _run_head_1barrier_w0(c, groups, ahead)
     return _run_head_2barrier(c, groups, ahead)
 
 
@@ -265,6 +280,56 @@ def _run_head_1barrier(c, groups, ahead):
 
 
 @traced
+def _run_head_1barrier_w0(c, groups, ahead):
+    """As ``_run_head_1barrier``, but only wave 0 runs the row_sum + fold for
+    a group; the other 7 waves' store the same as before, then skip straight
+    to the next group's GEMV. ``mine`` (and so every thread whose fold result
+    ever reaches ``stage_cta``) is confined to tid < RP * S <= 64, i.e. wave
+    0's lanes, so waves 1..7 redoing the identical 8-wave row_sum in
+    ``_run_head_1barrier`` only adds LDS read traffic nobody reads back --
+    WAVESCOPE_FINDINGS.md H1 found that traffic service-limited (queued
+    behind itself across all 8 waves), not latency-limited, so cutting it to
+    1/8 should cut wave 0's own read latency too. The double buffering's
+    safety argument is unchanged: a thread that never reads ``buf`` has
+    nothing to order against its own next store, and wave 0 (the only
+    reader) still reads-before-its-own-next-store in program order, with
+    every thread (incl. wave 0) passing the barrier only after its own
+    store -- the same invariant ``_run_head_1barrier`` relies on, now
+    trivially satisfied by the non-reading waves. Per-row math for wave 0 is
+    bit-identical to ``_run_head_1barrier``."""
+    lane, wave, tid, s, red = c["lane"], c["wave"], c["tid"], c["S"], c["red"]
+    xl, valid, bid = c["xl"], c["valid"], c["bid"]
+    last = groups - 1
+    g = bid
+    ops = [_group_ops(c, fx.min(g + BLOCKS * j, last)) for j in range(ahead)]
+    best_val = fx.Float32(NEG_INF)
+    best_idx = fx.Int32(0)
+    mine = tid < RP * s
+    r = 2 * (tid % RP)
+    t = fx.min(tid // RP, s - 1)
+    par = fx.Int32(0)
+    while g < groups:
+        ops_n = _group_ops(c, fx.min(g + BLOCKS * ahead, last))
+        acc = fp4_gemv(lane, wave, xl, XROW, H, s, g, ops[0])
+        buf = red + par * RED_BUF
+        fx.ptr_store(acc, buf + (wave * 64 + lane) * 4)
+        gpu.barrier()
+        if wave == 0:
+            v0 = _safe(bf16_round(row_sum(buf, r, t)))
+            v1 = _safe(bf16_round(row_sum(buf, r + 1, t)))
+            idx0 = g * ROWS + r
+            idx1 = idx0 + 1
+            cv0 = (mine & (idx0 < valid)).select(v0, fx.Float32(NEG_INF))
+            cv1 = (mine & (idx1 < valid)).select(v1, fx.Float32(NEG_INF))
+            best_val, best_idx = _better(cv0, idx0, best_val, best_idx)
+            best_val, best_idx = _better(cv1, idx1, best_val, best_idx)
+        g = g + BLOCKS
+        ops = ops[1:] + [ops_n]
+        par = fx.Int32(1) - par
+    return best_val, best_idx
+
+
+@traced
 def stage_cta(c):
     """Every CTA: the running best (``c["best"]``) xor-shuffled (4, 2, 1: the
     8 row-pair threads of a token share that window) to one (max, local row);
@@ -332,12 +397,15 @@ def build(key: HeadBuild):
     tp = key.tp
     ahead = key.ahead
     one_barrier = key.one_barrier
+    reduce = key.reduce
     need(1 <= s <= L.MAX_TOKENS, f"{s} rows, the kernel takes 1..{L.MAX_TOKENS}")
     need(
         key.rows % 32 == 0,
         "rows: the ASM FP4 GEMM's scale shuffle needs a 32-row shard",
     )
     need(ahead >= 1, "ahead: at least this group's own operands must be in flight")
+    need(reduce in ("all", "w0"), "reduce: 'all' or 'w0'")
+    need(one_barrier or reduce == "all", "reduce='w0' needs one_barrier=True")
     L.Layout(tp)  # validates tp against L.TPS
     groups = key.rows // ROWS
     scr = scratch_layout(key)
@@ -355,7 +423,10 @@ def build(key: HeadBuild):
         xl: fx.Array[fx.Int32, xwords, 16]
 
     keyed = key_tuple(key, digest())
-    name = f"flashnext_mono_head_s{s}_t{tp}_a{ahead}_b{1 if one_barrier else 2}"
+    name = (
+        f"flashnext_mono_head_s{s}_t{tp}_a{ahead}"
+        f"_b{1 if one_barrier else 2}_r{reduce}"
+    )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def head(
@@ -415,7 +486,7 @@ def build(key: HeadBuild):
         quant_x(c, H)
 
         # ---- the shard's row groups -> one (max, local row) a token a CTA
-        c["best"] = run_head(c, groups, ahead, one_barrier)
+        c["best"] = run_head(c, groups, ahead, one_barrier, reduce)
         stage_cta(c)
 
         # ---- CTA 0, a token a wave: every CTA's winner, then every rank's

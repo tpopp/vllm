@@ -135,20 +135,28 @@ def bench_draft_head(s, device, rank, world_size, epoch, iters, peers):
         _pick(lv, li + vocab_start)
 
     out = torch.full((s,), -1, dtype=torch.int64, device=device)
-    key = head.HeadBuild(tokens=s, tp=TP, rows=v_r)
-    scratch = torch.zeros(head.scratch_bytes(key), dtype=torch.uint8, device=device)
+    key_all = head.HeadBuild(tokens=s, tp=TP, rows=v_r, reduce="all")
+    key_w0 = head.HeadBuild(tokens=s, tp=TP, rows=v_r)  # reduce="w0", default
+    scratch = torch.zeros(
+        head.scratch_bytes(key_w0), dtype=torch.uint8, device=device
+    )
 
-    def _fused():
-        epoch.add_(1)
-        head.draft_head(
-            key, x=x, w=w, ws=ws, valid=v_r, vocab_start=vocab_start, out=out,
-            scratch=scratch, peers=peers.addresses, rank=rank, epoch=epoch, slot=0,
-        )
+    def _make_fused(this_key):
+        def _fused():
+            epoch.add_(1)
+            head.draft_head(
+                this_key, x=x, w=w, ws=ws, valid=v_r, vocab_start=vocab_start,
+                out=out, scratch=scratch, peers=peers.addresses, rank=rank,
+                epoch=epoch, slot=0,
+            )
+
+        return _fused
 
     cases = (
         ("stock: bf16 F.linear + argmax + all_gather", _stock_bf16),
         ("stock: MXFP4 a4w4 GEMM + argmax + all_gather", _stock_mxfp4),
-        ("draft_head (fused)", _fused),
+        ("draft_head (fused, reduce=all)", _make_fused(key_all)),
+        ("draft_head (fused, reduce=w0, default)", _make_fused(key_w0)),
     )
     return [
         (name, _time_eager(fn, iters), _time_graph(fn, iters)) for name, fn in cases
