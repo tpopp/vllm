@@ -57,7 +57,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import gpu, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int32, Int64
 
 from vllm.models.kimi_k3.amd.mono.common.ops import (
@@ -81,7 +81,21 @@ from vllm.models.kimi_k3.amd.mono.common.plan import (
 from vllm.models.kimi_k3.amd.mono.common.ranks import peer_bases
 from vllm.models.kimi_k3.amd.mono.common.sync import Mailbox, preg, shift, sreg
 from vllm.models.kimi_k3.amd.mono.stages import gemv
-from vllm.models.qwen3_5.amd.mono.moe import fp4_gemv, fp4_gemv_loads, quant_x, step_tag
+from vllm.models.qwen3_5.amd.mono import layout as QL
+from vllm.models.qwen3_5.amd.mono.moe import (
+    fp4_gemv,
+    fp4_gemv_loads,
+    fp4_mfmas,
+    fp4_tile,
+    mfma_f4,
+    pow2,
+    quant_x,
+    quant_x_fp4,
+    scale_word,
+    step_tag,
+    xq_row,
+    xq_scales,
+)
 from vllm.models.qwen4_exp.amd.mono import layout as L
 from vllm.models.qwen4_exp.amd.mono.layout import need
 from vllm.models.qwen4_exp.amd.mono.sources import digest
@@ -109,6 +123,32 @@ class HeadBuild:
     # WAVESCOPE_FINDINGS H1); confirmed -9..-13 us vs "all" (every wave
     # redoes it) at every S in 1,2,4,8, graph-replayed, 2 runs (see NOTES).
     # "w0" needs one_barrier=True.
+    # ---- WAVESCOPE_FINDINGS H2 (the GEMV body): any of these three forces
+    # the one_barrier=True, reduce="w0" loop (`_run_head_1barrier_w0_rot` /
+    # `_run_head_1barrier_w0_unroll`); each is independently selectable, so
+    # A/B/combined builds share a cache/name per the (fast_addr, unroll,
+    # mfma) tuple. All False (the default) traces the exact, unmodified
+    # `_run_head_1barrier_w0` -- zero risk to the production path.
+    fast_addr: bool = False  # unsigned shift/mask address math (every index
+    # here is non-negative: a row-group index, a lane-derived column/K-step)
+    # instead of Python `//` `%` on signed Int32 (`arith.floordivsi`/`remsi`,
+    # ~7 instructions each), the per-lane terms hoisted out of the per-group
+    # call. Bit-identical.
+    unroll: bool = False  # `ahead`-wide modulo variable expansion: `ahead`
+    # groups a while-iteration at fixed operand slots (refreshed in place, as
+    # `moe.py`'s `stage_down`/`down_loads` already do for their own DB-wide
+    # batches), instead of `ahead` rotating-list iterations (`ops = ops[1:] +
+    # [ops_n]`, real `v_mov_b64`s per WAVESCOPE_FINDINGS, not free phi-node
+    # renaming). A CTA's groups past its last whole `ahead`-chunk are
+    # over-processed and masked the same way any not-yet-reached prefetch
+    # already is. Bit-identical.
+    mfma: bool = False  # the GEMV applies gfx950's native scaled FP4 MFMA
+    # (`v_mfma_scale_f32_16x16x128_f8f6f4`, as K2's routed-expert GEMV
+    # already does) to x's fp4 codes + e8m0 scale in LDS (`quant_x_fp4`,
+    # instead of `quant_x`'s MXFP4-exact bf16) and the already-loaded fp4
+    # weight tiles, instead of cvt-to-bf16 + bf16 MFMA: 3/4 fewer x LDS reads
+    # and no `v_cvt_scalef32_pk_bf16_fp4` / bf16 MFMA. A different
+    # accumulation order -- NOT bit-identical, see `test_draft_head_mfma_*`.
 
 
 ABI = KernelAbi(
@@ -180,6 +220,108 @@ def _group_ops(c, gi):
     return fp4_gemv_loads(c["lane"], c["wave"], a["w"], a["ws"], gi, H)
 
 
+# ---- WAVESCOPE_FINDINGS H2: fast_addr / unroll / mfma (see HeadBuild) ----
+_N_STEPS = H // L.FP4_STEP  # 20: K steps of an online-MXFP4 GEMV row group
+_PER_WAVE = (_N_STEPS + WAVES - 1) // WAVES  # 3: a wave's steps (head's K
+# never pairs two waves a step, see ``moe._paired``)
+_PAD_STEP = _PER_WAVE * WAVES != _N_STEPS  # some waves' last step is past K
+_SCALE_COLS = QL.scale_cols(H)  # a host constant: the shuffled scale's cols
+
+
+def _scale_index_fast(row, col):
+    """``QL.scale_index(row, col, _SCALE_COLS)``, pure unsigned shift/mask:
+    ``row`` (a row-group index) and ``col`` (a lane/K-step-derived column)
+    are always non-negative here, so the power-of-two floor-div/mod it uses
+    (``row // 32``, ``(row // 16) % 2``, ... ``arith.floordivsi``/``remsi``,
+    signed, ~7 instructions each) can become a plain shift/and."""
+    cols = _SCALE_COLS
+    r32, a, b = row >> 5, (row >> 4) & 1, row & 15
+    c8, d, f = col >> 3, (col >> 2) & 1, col & 3
+    return ((((r32 * (cols // 8) + c8) * 4 + f) * 16 + b) * 2 + d) * 2 + a
+
+
+def _scale_code_shift_fast(st, rg):
+    """``QL.scale_code_shift``, pure unsigned mask (``st``, ``rg``: a K-step
+    and row-group index, always non-negative)."""
+    return (st & 1) * 16 + (rg & 1) * 8
+
+
+def _group_ops_opt(c, gi, fast_addr):
+    """``_group_ops``, optionally (``fast_addr``) ``fp4_gemv_loads``'s
+    address math as unsigned shift/mask with the per-lane terms (``lane %
+    ROWS``, ``lane // 16``) hoisted to ``c["lane_row"]`` / ``c["lane_hi4"]``
+    -- only ``gi`` varies call to call, so these are otherwise recomputed
+    every one of the ``ahead + (loop iterations)`` calls for nothing. A pure
+    address change: the same dwords, same order, bit-identical to
+    ``_group_ops`` either way."""
+    a = c["args"]
+    if not fast_addr:
+        return fp4_gemv_loads(c["lane"], c["wave"], a["w"], a["ws"], gi, H)
+    lane, wave = c["lane"], c["wave"]
+    r_w, r_s = rsrc(a["w"]), rsrc(a["ws"])
+    row = gi * ROWS + c["lane_row"]
+    sts = [fx.min(wave + WAVES * i, _N_STEPS - 1) for i in range(_PER_WAVE)]
+    tiles = [fp4_tile(r_w, QL.fp4_tile_dword(0, gi, H, st, lane)) for st in sts]
+    words = [
+        scale_word(r_s, _scale_index_fast(row, 4 * st + c["lane_hi4"])) for st in sts
+    ]
+    return tiles + words
+
+
+def _apply_group(lane, wave, xl, s, rg, ops, fast_addr, mfma):
+    """This wave's fp32 partial accumulator for row group ``rg``'s online-
+    MXFP4 GEMV (``ops``: ``_group_ops_opt(.., fast_addr)``) against the
+    ``s`` token rows in LDS. ``mfma``: gfx950's native scaled FP4 MFMA
+    against x's fp4 codes + e8m0 scale (``quant_x_fp4``'s layout) and the
+    already-loaded fp4 weight tiles -- no cvt, a different accumulation
+    order than the ``fp4_mfmas`` cvt-to-bf16 tree (NOT bit-identical, see
+    ``HeadBuild.mfma``). ``fast_addr``: unsigned shift/mask address math
+    (every index here is non-negative) instead of Python ``//`` ``%`` on
+    signed Int32 -- a pure address change either way (bit-identical)."""
+    if fast_addr:
+        t, hi4 = fx.min(lane & 15, s - 1), lane >> 4
+    else:
+        t, hi4 = fx.min(lane % 16, s - 1), lane // 16
+    acc = fx.Vector.filled(4, 0.0, fx.Float32)
+    if mfma:
+        for i in range_constexpr(_PER_WAVE):
+            raw = wave + WAVES * i
+            st = fx.min(raw, _N_STEPS - 1)
+            shift = (
+                _scale_code_shift_fast(st, rg)
+                if fast_addr
+                else QL.scale_code_shift(st, rg)
+            )
+            code = (ops[_PER_WAVE + i] >> shift) & 0xFF
+            tile = ops[i]
+            if const_expr(_PAD_STEP):
+                live = raw < _N_STEPS
+                tile = fx.Vector.from_elements(
+                    [live.select(tile[q], fx.Int32(0)) for q in range(4)],
+                    fx.Int32,
+                )
+            xq = (t * xq_row(H) + st * (L.FP4_STEP // 2)) // 4 + 4 * hi4
+            xb = fx.Vector(
+                fx.ptr_load(xl + xq, result_type=fx.Vector.make_type(4, fx.Int32))
+            )
+            sb = fx.ptr_load(xl + (xq_scales(s, H) + t * (H // 32) + 4 * st + hi4))
+            acc = mfma_f4(tile, xb, acc, code, sb)
+        return acc
+    for i in range_constexpr(_PER_WAVE):
+        raw = wave + WAVES * i
+        st = fx.min(raw, _N_STEPS - 1)
+        shift = (
+            _scale_code_shift_fast(st, rg) if fast_addr else QL.scale_code_shift(st, rg)
+        )
+        code = (ops[_PER_WAVE + i] >> shift) & 0xFF
+        scale = pow2(code)
+        if const_expr(_PAD_STEP):
+            scale = (raw < _N_STEPS).select(scale, fx.Float32(0.0))
+        xoff = t * XROW + st * L.FP4_STEP + 32 * hi4
+        acc = fp4_mfmas(ops[i], scale, xl, xoff, acc)
+    return acc
+
+
 def _store_i64(ptr, i, v):
     """``ptr`` (an int64 array) element ``i`` := a non-negative Int32 ``v``
     (low dword ``v``, high dword 0): ``load_ptr64``'s word layout, inverted."""
@@ -189,7 +331,7 @@ def _store_i64(ptr, i, v):
 
 
 # ---------------------------------------------------------------- stages
-def run_head(c, groups, ahead, one_barrier, reduce):
+def run_head(c, groups, ahead, one_barrier, reduce, fast_addr, unroll, mfma):
     """Dispatches to the one- or two-``gpu.barrier()``-a-group loop (a
     build-time choice, ``one_barrier``) and, within the one-barrier loop, to
     the all-waves or wave-0-only reduce (``reduce``): all walk this rank's
@@ -199,7 +341,16 @@ def run_head(c, groups, ahead, one_barrier, reduce):
     operands kept in flight (``run_ug``'s union-task pipelining), each
     group's bf16-rounded logits folded into a running (max, global row) a
     token. Returns (best_val, best_idx); the per-row math is identical
-    across every (one_barrier, reduce) combination."""
+    across every (one_barrier, reduce) combination, and across (fast_addr,
+    unroll) at fixed mfma (both are pure performance changes). Any of
+    (fast_addr, unroll, mfma) forces the one_barrier=True, reduce="w0" loop
+    (``HeadBuild`` validates this in ``build()``): the other three combos
+    (two-barrier, all-wave reduce) are legacy / dead-end paths this file
+    doesn't carry the H2 changes into."""
+    if fast_addr or unroll or mfma:
+        if unroll:
+            return _run_head_1barrier_w0_unroll(c, groups, ahead, fast_addr, mfma)
+        return _run_head_1barrier_w0_rot(c, groups, ahead, fast_addr, mfma)
     if one_barrier:
         if reduce == "all":
             return _run_head_1barrier(c, groups, ahead)
@@ -330,6 +481,109 @@ def _run_head_1barrier_w0(c, groups, ahead):
 
 
 @traced
+def _run_head_1barrier_w0_rot(c, groups, ahead, fast_addr, mfma):
+    """As ``_run_head_1barrier_w0``, with ``fast_addr`` and/or ``mfma``
+    (``HeadBuild``): the same rotating-``ops`` loop structure, the per-group
+    load (``_group_ops_opt``) and apply (``_apply_group``) parametrized."""
+    lane, wave, tid, s, red = c["lane"], c["wave"], c["tid"], c["S"], c["red"]
+    xl, valid, bid = c["xl"], c["valid"], c["bid"]
+    last = groups - 1
+    g = bid
+    ops = [
+        _group_ops_opt(c, fx.min(g + BLOCKS * j, last), fast_addr) for j in range(ahead)
+    ]
+    best_val = fx.Float32(NEG_INF)
+    best_idx = fx.Int32(0)
+    mine = tid < RP * s
+    if const_expr(fast_addr):
+        r, t = 2 * (tid & (RP - 1)), fx.min(tid >> 3, s - 1)  # RP == 8
+    else:
+        r, t = 2 * (tid % RP), fx.min(tid // RP, s - 1)
+    par = fx.Int32(0)
+    while g < groups:
+        ops_n = _group_ops_opt(c, fx.min(g + BLOCKS * ahead, last), fast_addr)
+        acc = _apply_group(lane, wave, xl, s, g, ops[0], fast_addr, mfma)
+        buf = red + par * RED_BUF
+        fx.ptr_store(acc, buf + (wave * 64 + lane) * 4)
+        gpu.barrier()
+        if wave == 0:
+            v0 = _safe(bf16_round(row_sum(buf, r, t)))
+            v1 = _safe(bf16_round(row_sum(buf, r + 1, t)))
+            idx0 = g * ROWS + r
+            idx1 = idx0 + 1
+            cv0 = (mine & (idx0 < valid)).select(v0, fx.Float32(NEG_INF))
+            cv1 = (mine & (idx1 < valid)).select(v1, fx.Float32(NEG_INF))
+            best_val, best_idx = _better(cv0, idx0, best_val, best_idx)
+            best_val, best_idx = _better(cv1, idx1, best_val, best_idx)
+        g = g + BLOCKS
+        ops = ops[1:] + [ops_n]
+        par = fx.Int32(1) - par
+    return best_val, best_idx
+
+
+@traced
+def _run_head_1barrier_w0_unroll(c, groups, ahead, fast_addr, mfma):
+    """As ``_run_head_1barrier_w0_rot``, but with ``ahead``-wide modulo
+    variable expansion (``HeadBuild.unroll``, WAVESCOPE_FINDINGS.md H2 #3):
+    one while-iteration processes ``ahead`` groups at fixed operand slots --
+    slot j always means "this iteration's j-th group", refreshed in place --
+    instead of ``ahead`` rotating-list iterations (``ops = ops[1:] +
+    [ops_n]``, which the compiler turns into real ``v_mov_b64``s, not free
+    phi-node renaming: WAVESCOPE_FINDINGS.md counted 24/group).
+    ``moe.py``'s ``stage_down``/``down_loads`` already use this shape for
+    their own DB-wide batches, over-processing their last (possibly partial)
+    batch the same way: a CTA's groups past its last whole ``ahead``-chunk
+    (``groups - bid`` need not be a multiple of ``BLOCKS * ahead``) are
+    over-processed and masked exactly as any not-yet-reached prefetch
+    already is elsewhere in this file -- the load is a real (clamped-to-
+    last-group, so in-bounds) group's weights, safe to read, and the fold is
+    masked out by ``idx < valid`` (an over-run index is always >= rows >=
+    valid). Bit-identical to ``_run_head_1barrier_w0`` (same per-row math,
+    same oracle); not necessarily the same number of barriers -- a CTA whose
+    groups aren't a multiple of ``ahead`` issues up to ``ahead - 1`` extra,
+    all-masked barrier/reduce rounds."""
+    lane, wave, tid, s, red = c["lane"], c["wave"], c["tid"], c["S"], c["red"]
+    xl, valid, bid = c["xl"], c["valid"], c["bid"]
+    last = groups - 1
+    g = bid
+    ops = [
+        _group_ops_opt(c, fx.min(g + BLOCKS * j, last), fast_addr) for j in range(ahead)
+    ]
+    best_val = fx.Float32(NEG_INF)
+    best_idx = fx.Int32(0)
+    mine = tid < RP * s
+    if const_expr(fast_addr):
+        r, t = 2 * (tid & (RP - 1)), fx.min(tid >> 3, s - 1)  # RP == 8
+    else:
+        r, t = 2 * (tid % RP), fx.min(tid // RP, s - 1)
+    par = fx.Int32(0)
+    while g < groups:
+        new_ops = [None] * ahead
+        for j in range_constexpr(ahead):
+            gi = fx.min(g + BLOCKS * j, last)
+            acc = _apply_group(lane, wave, xl, s, gi, ops[j], fast_addr, mfma)
+            buf = red + par * RED_BUF
+            fx.ptr_store(acc, buf + (wave * 64 + lane) * 4)
+            gpu.barrier()
+            if wave == 0:
+                v0 = _safe(bf16_round(row_sum(buf, r, t)))
+                v1 = _safe(bf16_round(row_sum(buf, r + 1, t)))
+                idx0 = (g + BLOCKS * j) * ROWS + r
+                idx1 = idx0 + 1
+                cv0 = (mine & (idx0 < valid)).select(v0, fx.Float32(NEG_INF))
+                cv1 = (mine & (idx1 < valid)).select(v1, fx.Float32(NEG_INF))
+                best_val, best_idx = _better(cv0, idx0, best_val, best_idx)
+                best_val, best_idx = _better(cv1, idx1, best_val, best_idx)
+            new_ops[j] = _group_ops_opt(
+                c, fx.min(g + BLOCKS * (ahead + j), last), fast_addr
+            )
+            par = fx.Int32(1) - par
+        ops = new_ops
+        g = g + BLOCKS * ahead
+    return best_val, best_idx
+
+
+@traced
 def stage_cta(c):
     """Every CTA: the running best (``c["best"]``) xor-shuffled (4, 2, 1: the
     8 row-pair threads of a token share that window) to one (max, local row);
@@ -398,6 +652,9 @@ def build(key: HeadBuild):
     ahead = key.ahead
     one_barrier = key.one_barrier
     reduce = key.reduce
+    fast_addr = key.fast_addr
+    unroll = key.unroll
+    mfma = key.mfma
     need(1 <= s <= L.MAX_TOKENS, f"{s} rows, the kernel takes 1..{L.MAX_TOKENS}")
     need(
         key.rows % 32 == 0,
@@ -406,6 +663,10 @@ def build(key: HeadBuild):
     need(ahead >= 1, "ahead: at least this group's own operands must be in flight")
     need(reduce in ("all", "w0"), "reduce: 'all' or 'w0'")
     need(one_barrier or reduce == "all", "reduce='w0' needs one_barrier=True")
+    need(
+        not (fast_addr or unroll or mfma) or (one_barrier and reduce == "w0"),
+        "fast_addr/unroll/mfma: only implemented for one_barrier=True, reduce='w0'",
+    )
     L.Layout(tp)  # validates tp against L.TPS
     groups = key.rows // ROWS
     scr = scratch_layout(key)
@@ -426,6 +687,7 @@ def build(key: HeadBuild):
     name = (
         f"flashnext_mono_head_s{s}_t{tp}_a{ahead}"
         f"_b{1 if one_barrier else 2}_r{reduce}"
+        f"_fa{int(fast_addr)}_ur{int(unroll)}_mf{int(mfma)}"
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -479,14 +741,24 @@ def build(key: HeadBuild):
             "peer_head": peer_head,
             "peer_head_own": peer_head_own,
             "args": {"w": w, "ws": ws, "out": out},
+            # hoisted for HeadBuild.fast_addr (unused, harmless otherwise):
+            # only the row group varies call to call in the GEMV loop, not
+            # these per-lane terms (WAVESCOPE_FINDINGS H2 #1)
+            "lane_row": lane & (ROWS - 1),
+            "lane_hi4": lane >> 4,
         }
 
         # ---- every CTA: x into LDS, MXFP4-exact (as the ASM GEMM reads it)
         gemv.rows_to_lds(tid, x, H, s, xl, XROW)
-        quant_x(c, H)
+        if const_expr(mfma):
+            quant_x_fp4(c, H)
+        else:
+            quant_x(c, H)
 
         # ---- the shard's row groups -> one (max, local row) a token a CTA
-        c["best"] = run_head(c, groups, ahead, one_barrier, reduce)
+        c["best"] = run_head(
+            c, groups, ahead, one_barrier, reduce, fast_addr, unroll, mfma
+        )
         stage_cta(c)
 
         # ---- CTA 0, a token a wave: every CTA's winner, then every rank's
