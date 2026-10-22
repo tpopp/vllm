@@ -5,11 +5,13 @@ enabled the same way the target's is (``--monokernel``; the drafter follows
 the target's switch, it adds none of its own).
 
 ``DraftDecode`` runs the MTP draft model's single decoder layer as persistent
-launches: the attention hyper-connection's front (``mono.front.hc_front``,
-over the stock embedding branch's output -- the fc_embedding / fc_hidden
-projections run as plain ``torch`` ops here), QSA attention (vLLM's,
-unchanged), the o_proj block, the MLP hyper-connection's front and the MoE
-block (``mono.blocks.oproj_block`` / ``mono.blocks.moe_block`` -- the draft
+launches: the attention hyper-connection's front and the fc_embedding /
+fc_hidden projections fused (``mono.draft_front``, one launch, replacing the
+stock embedding branch's plain ``torch`` ops -- optional: falls back to
+them + ``front.hc_front`` when the fc weights are not a plain gatherable
+bf16 linear, ``prepare_weights``), QSA attention (vLLM's, unchanged), the
+o_proj block, the MLP hyper-connection's front and the MoE block
+(``mono.blocks.oproj_block`` / ``mono.blocks.moe_block`` -- the draft
 layer's shapes match the target's decoder layer exactly, so these are the
 very same launches, not a draft variant of them), then the final mixer's
 front (``front.hc_front`` again, ``use_combine=False`` so its down
@@ -263,7 +265,9 @@ class DraftDecode:
         )
         from vllm.models.kimi_k3.amd.specialized_decode.runtime.guards import FailStop
         from vllm.models.kimi_k3.amd.specialized_decode.runtime.peer import PeerBuffer
-        from vllm.models.qwen4_exp.amd.specialized_decode.mono import blocks, front
+        from vllm.models.qwen4_exp.amd.specialized_decode.mono import blocks
+        from vllm.models.qwen4_exp.amd.specialized_decode.mono import draft_front as DF
+        from vllm.models.qwen4_exp.amd.specialized_decode.mono import front
 
         tp = get_tp_group()
         agree(model_reasons(mtp, tp.world_size), tp.cpu_group)
@@ -286,7 +290,10 @@ class DraftDecode:
         self.alarm = int(self.peers.addresses[0].item()) + 4 * self.rank
 
         def attn_bytes(s):
-            return front.scratch_bytes(front.FrontBuild(tokens=s, tp=self.tp))
+            return max(
+                front.scratch_bytes(front.FrontBuild(tokens=s, tp=self.tp)),
+                DF.scratch_bytes(DF.FrontBuild(tokens=s, tp=self.tp)),
+            )
 
         def mlp_bytes(s):
             moe = blocks.moe_scratch_layout(blocks.MoeBuild(tokens=s, tp=self.tp))
@@ -312,10 +319,11 @@ class DraftDecode:
             "without --monokernel, the stock draft step runs",
         )
         logger.info(
-            "%s: widths 1-%d, the stock front and head; other steps run the "
+            "%s: widths 1-%d, front %s, the stock head; other steps run the "
             "stock draft step",
             NAME,
             config.max_tokens,
+            "fused" if self._fc is not None else "stock",
         )
 
     def _eps(self):
@@ -328,9 +336,11 @@ class DraftDecode:
 
     def _builds(self):
         from vllm.models.qwen4_exp.amd.specialized_decode.mono import blocks, front
+        from vllm.models.qwen4_exp.amd.specialized_decode.mono import draft_front as DF
 
         tp = self.tp
         eps_attn, eps_mlp, eps_mixer = self._eps()
+        model = self.model.model
         out = []
         for s in self.config.widths:
             out.append((front.build, front.FrontBuild(tokens=s, tp=tp, self_msq=True,
@@ -339,6 +349,11 @@ class DraftDecode:
                         eps=eps_mlp), front.ABI))  # fmt: skip
             out.append((front.build, front.FrontBuild(tokens=s, tp=tp, self_msq=False,
                         eps=eps_mixer), front.ABI))  # fmt: skip
+            if self._fc is not None:
+                out.append((DF.build, DF.FrontBuild(tokens=s, tp=tp, eps=eps_attn,
+                            ne_eps=model.pre_fc_norm_embedding.variance_epsilon,
+                            nh_eps=model.pre_fc_norm_hidden.variance_epsilon),
+                            DF.ABI))  # fmt: skip
             out.append((blocks.build_oproj, self._oproj_key(s), blocks.OPROJ_ABI))
             out.append((blocks.build_moe, blocks.MoeBuild(tokens=s, tp=tp),
                         blocks.MOE_ABI))  # fmt: skip
@@ -357,16 +372,28 @@ class DraftDecode:
     # ------------------------------------------------------------ weights
     def prepare_weights(self) -> None:
         """After the weights are loaded, outside any graph capture: the
-        mixer's down as the kernel reads it. The down GEMM always reads
+        mixer's down as the kernel reads it (the down GEMM always reads
         ``layout.DOWN_ROWS`` rows; the mixer has none, the pad rows are
         zero -- only the low-rank groups ever reach the gate-mix that
         produces ``bin_out``, so the pad cannot perturb it, and the
-        mixer front's own injection output is unused."""
+        mixer front's own injection output is unused), and the fc
+        projections gathered whole on every rank if they are plain bf16
+        (the fused front needs every rank's full weight)."""
         mixer = self.model.model.hyper_connection_mixer
         down = mixer.input_mix_weight_down.weight
         padded = down.new_zeros(L.DOWN_ROWS, L.HH)
         padded[: down.size(0)].copy_(down)
         self._mixer_w_down = padded
+        self._fc: tuple[torch.Tensor, torch.Tensor] | None = None
+        model = self.model.model
+        lins = (("fc_embedding", model.fc_embedding), ("fc_hidden", model.fc_hidden))
+        if all(_fc_error(name, lin, self.tp) is None for name, lin in lins):
+            from vllm.distributed import tensor_model_parallel_all_gather
+
+            self._fc = tuple(
+                tensor_model_parallel_all_gather(lin.weight.data, dim=0).contiguous()
+                for _, lin in lins
+            )
 
     # ------------------------------------------------------------ step
     def eligible(self, input_ids, intermediate_tensors) -> bool:
@@ -404,17 +431,20 @@ class DraftDecode:
         attn_hc = layer.attn_hyper_connection
         x = torch.empty(s, L.HIDDEN, dtype=hidden_states.dtype, device=self.epoch.device)
         inj = torch.empty(s, L.HC, dtype=x.dtype, device=x.device)
-        state = self._stock_front(input_ids, hidden_states, inputs_embeds)
-        front.hc_front(
-            front.FrontBuild(tokens=s, tp=self.tp, self_msq=True,
-                              eps=attn_hc.config.rms_norm_eps),  # fmt: skip
-            state=state, msq_in=None, hc_w=attn_hc.hc_norm.weight,
-            w_down=attn_hc.input_mix_weight_down_block_inject.weight,
-            w_up=attn_hc.input_mix_weight_up.weight,
-            inj_out=inj, bin_out=x, scratch=self.attn_scratch[s],
-            epoch=self.epoch, health=self.health, alarm=self.alarm,
-            layer=ATTN_LAYER,
-        )  # fmt: skip
+        if self._fc is not None:
+            state = self._fused_front(input_ids, hidden_states, inputs_embeds, x, inj)
+        else:
+            state = self._stock_front(input_ids, hidden_states, inputs_embeds)
+            front.hc_front(
+                front.FrontBuild(tokens=s, tp=self.tp, self_msq=True,
+                                  eps=attn_hc.config.rms_norm_eps),  # fmt: skip
+                state=state, msq_in=None, hc_w=attn_hc.hc_norm.weight,
+                w_down=attn_hc.input_mix_weight_down_block_inject.weight,
+                w_up=attn_hc.input_mix_weight_up.weight,
+                inj_out=inj, bin_out=x, scratch=self.attn_scratch[s],
+                epoch=self.epoch, health=self.health, alarm=self.alarm,
+                layer=ATTN_LAYER,
+            )  # fmt: skip
 
         core, gate = qsa_core(layer.self_attn, x, positions)
 
@@ -471,6 +501,36 @@ class DraftDecode:
             layer=MIXER_LAYER,
         )  # fmt: skip
         return h, state3
+
+    def _fused_front(self, input_ids, hidden_states, inputs_embeds, x, inj):
+        """``mono.draft_front``: the fc projections and the attention HC
+        front in one launch -> ``state`` [S, HC H]; ``x`` / ``inj`` written."""
+        from vllm.models.qwen4_exp.amd.specialized_decode.mono import draft_front as DF
+
+        model = self.model.model
+        layer = self.layer
+        attn_hc = layer.attn_hyper_connection
+        s = x.size(0)
+        if inputs_embeds is None:
+            inputs_embeds = model.embed_input_ids(input_ids)
+        state = torch.empty(s, L.HH, dtype=x.dtype, device=x.device)
+        DF.draft_front(
+            DF.FrontBuild(
+                tokens=s, tp=self.tp, eps=attn_hc.config.rms_norm_eps,
+                ne_eps=model.pre_fc_norm_embedding.variance_epsilon,
+                nh_eps=model.pre_fc_norm_hidden.variance_epsilon,
+            ),  # fmt: skip
+            emb=inputs_embeds.contiguous(), prev=hidden_states.contiguous(),
+            w_ne=model.pre_fc_norm_embedding.weight,
+            w_nh=model.pre_fc_norm_hidden.weight,
+            w_fe=self._fc[0], w_fh=self._fc[1], hc_w=attn_hc.hc_norm.weight,
+            w_down=attn_hc.input_mix_weight_down_block_inject.weight,
+            w_up=attn_hc.input_mix_weight_up.weight,
+            state_out=state, bin_out=x, inj_out=inj,
+            scratch=self.attn_scratch[s], epoch=self.epoch, health=self.health,
+            alarm=self.alarm, layer=ATTN_LAYER,
+        )  # fmt: skip
+        return state
 
     def _stock_front(self, input_ids, hidden_states, inputs_embeds) -> torch.Tensor:
         """``Qwen4ExpMultiTokenPredictor.forward``'s embedding branch, eager:
