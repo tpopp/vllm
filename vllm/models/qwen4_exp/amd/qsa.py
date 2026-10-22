@@ -15,6 +15,7 @@ from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import (
     set_default_quant_scales,
 )
@@ -56,6 +57,56 @@ from ..common.qsa import Qwen4ExpQSAMetadata, Qwen4ExpQSAMetadataBuilder
 from ..common.qsa_indexer import QSAIndexerMetadata, qsa_kv_cache_dtype
 from . import model
 from .qsa_indexer import QSAIndexer
+
+logger = init_logger(__name__)
+
+
+def kv_only_prefill_tail_rows(
+    query_start_loc: torch.Tensor,
+    num_decodes: int,
+    num_prefills: int,
+    num_tokens: int,
+    rows_per_request: int,
+) -> torch.Tensor:
+    """Last ``rows_per_request`` rows of each request after the decode run.
+
+    Short requests repeat their first row instead; duplicates are harmless
+    because every kept row is computed independently and identically.
+    """
+    starts = query_start_loc[num_decodes : num_decodes + num_prefills].long()
+    ends = query_start_loc[num_decodes + 1 : num_decodes + num_prefills + 1].long()
+    offsets = torch.arange(rows_per_request, device=starts.device)
+    rows = torch.maximum(ends[:, None] - 1 - offsets, starts[:, None])
+    return rows.clamp_(0, num_tokens - 1).flatten()
+
+
+def qsa_sparse_paged_attention_rows(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    logical_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    output: torch.Tensor,
+    rows: torch.Tensor,
+) -> None:
+    """Attend only ``rows`` and scatter them into ``output``.
+
+    The launch profile is chosen for the full row count, so each row is
+    bit-identical to a full-batch call; other rows of ``output`` are untouched.
+    """
+    from .ops.qsa import qsa_sparse_paged_attention
+
+    selected = qsa_sparse_paged_attention(
+        query.index_select(0, rows),
+        key_cache,
+        value_cache,
+        logical_indices.index_select(0, rows),
+        block_table,
+        token_to_req.index_select(0, rows),
+        profile_rows=query.shape[0],
+    )
+    output.index_copy_(0, rows, selected)
 
 
 def _octave_mid_o_capacity(vllm_config: VllmConfig) -> int:
@@ -306,8 +357,11 @@ class Qwen4ExpQSAImpl(AttentionImplBase[Qwen4ExpQSAMetadata]):
         output: torch.Tensor,
         *,
         token_to_req: torch.Tensor,
+        kept_rows: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Run sparse attention over the owner's indexer-selected K/V rows."""
+        """Run sparse attention over the owner's indexer-selected K/V rows:
+        rows ``[0, num_actual_tokens)``, or only ``kept_rows`` (the other rows
+        stay zero)."""
         num_tokens = attn_metadata.num_actual_tokens
         output.zero_()
         if num_tokens == 0:
@@ -319,6 +373,7 @@ class Qwen4ExpQSAImpl(AttentionImplBase[Qwen4ExpQSAMetadata]):
         logical_indices = topk_buffer[:num_tokens]
         token_to_req = token_to_req[:num_tokens]
         if self.octave_fmt is not None:
+            assert kept_rows is None, "Octave QSA attends every row"
             assert self._octave_positions is not None
             signs, mid_o, splits = self._octave_buffers(num_tokens, query.device)
             torch.ops._C.octave_decode_sparse(
@@ -363,6 +418,19 @@ class Qwen4ExpQSAImpl(AttentionImplBase[Qwen4ExpQSAMetadata]):
                 "not yet ported here). Use bf16 KV caches or unit scales."
             )
 
+        if kept_rows is not None:
+            qsa_sparse_paged_attention_rows(
+                query[:num_tokens],
+                key_cache,
+                value_cache,
+                logical_indices,
+                attn_metadata.block_table,
+                token_to_req,
+                output[:num_tokens],
+                kept_rows,
+            )
+            return output
+
         from .ops.qsa import qsa_sparse_paged_attention
 
         qsa_sparse_paged_attention(
@@ -381,6 +449,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
     """Merged Qwen full-attention owner with a QSA indexer branch."""
 
     supports_dcp = False
+    # Set on the MTP draft layer only; see _kv_only_prefill_tail_rows.
+    kv_only_prefill_rows_per_request: int = 0
 
     def __init__(
         self,
@@ -549,6 +619,39 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
         )
 
+    def _kv_only_prefill_tail_rows(
+        self, metadata: QSAIndexerMetadata
+    ) -> torch.Tensor | None:
+        """Prefill rows the MTP draft step 0 can sample, or None for all rows.
+
+        Step 0 samples one row per request, at most ``num_speculative_tokens``
+        rows before its end, so the last ``num_speculative_tokens + 1`` rows of
+        each non-decode request cover it. Host-side: mixed batches run this op
+        outside CUDA graphs; pure-decode batches have no prefills. The Octave
+        cache path always attends every row.
+        """
+        rows_per_request = self.kv_only_prefill_rows_per_request
+        if (
+            rows_per_request <= 0
+            or metadata.num_prefills == 0
+            or self.indexer.skip_topk
+            or self.impl.octave_fmt is not None
+            or metadata.num_prefills * rows_per_request >= metadata.num_prefill_tokens
+        ):
+            return None
+        logger.info_once(
+            "KV-only MTP draft prefill active: draft prefill rows other than "
+            "each request's last %d skip QSA selection and sparse attention.",
+            rows_per_request,
+        )
+        return kv_only_prefill_tail_rows(
+            metadata.query_start_loc,
+            metadata.num_decodes,
+            metadata.num_prefills,
+            metadata.num_actual_tokens,
+            rows_per_request,
+        )
+
     def _run_qsa(
         self,
         hidden_states: torch.Tensor,
@@ -579,6 +682,13 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             QSAIndexerMetadata,
             metadata[self.indexer.raw_key_cache.prefix],
         )
+        kept_tail_rows = self._kv_only_prefill_tail_rows(indexer_metadata)
+        kept_rows = None
+        if kept_tail_rows is not None:
+            decode_rows = torch.arange(
+                indexer_metadata.num_decode_tokens, device=kept_tail_rows.device
+            )
+            kept_rows = torch.cat((decode_rows, kept_tail_rows))
         selected, main_outputs = self.indexer(
             hidden_states,
             positions,
@@ -587,6 +697,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             qkv=qkv,
             slot_mapping=main_metadata.slot_mapping,
             gate_out=gate,
+            kept_tail_rows=kept_tail_rows,
         )
         if selected.shape != (
             num_tokens,
@@ -620,6 +731,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             main_metadata,
             output,
             token_to_req=indexer_metadata.token_to_req,
+            kept_rows=kept_rows,
         )
 
     def forward(
@@ -757,6 +869,8 @@ __all__ = [
     "Qwen4ExpQSAAttention",
     "Qwen4ExpQSABackend",
     "Qwen4ExpQSAImpl",
+    "kv_only_prefill_tail_rows",
+    "qsa_sparse_paged_attention_rows",
     "qwen4_exp_qsa_prepare_with_output",
     "qwen4_exp_qsa_with_output",
 ]
