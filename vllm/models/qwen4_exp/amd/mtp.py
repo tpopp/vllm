@@ -62,6 +62,10 @@ from .model import (
     Qwen4ExpMixtureOfExperts,
     Qwen4ExpSparseMoeBlock,
 )
+from .specialized_decode.runtime.draft import (
+    DraftDecode,
+    draft_specialized_decode_config,
+)
 
 logger = init_logger(__name__)
 
@@ -496,8 +500,30 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
         self.set_moe_parameters(self.model.layers)
         enable_qwen4_exp_low_latency_gemm(self, vllm_config.model_config.dtype)
 
+        # ``--monokernel``: the drafter's own specialized-decode executor
+        # (``specialized_decode/runtime/draft.py``), built after the weights
+        # load (``process_weights_after_loading``). Raises here, before any
+        # weight loads, when the flag is set for an unsupported deployment.
+        self.specialized_decode_config = draft_specialized_decode_config(vllm_config)
+        self.specialized_decode: DraftDecode | None = None
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
+
+    def process_weights_after_loading(self, model_config=None) -> None:
+        """The generic post-load hook the model loader calls on any model
+        that defines it (``model_executor/model_loader/utils.py``): the one
+        point after which the drafter's weights are the checkpoint's, so the
+        executor's model-stage refusals (``runtime.draft.model_reasons``) can
+        run. A refusal here falls back to the stock draft step, as the
+        target's own ``--monokernel`` build-time checks do for its weights
+        (unlike the config-stage check, which raises)."""
+        if self.specialized_decode_config is None:
+            return
+        try:
+            self.specialized_decode = DraftDecode(self, self.specialized_decode_config)
+        except ValueError as e:
+            logger.warning_once("%s Falling back to the stock draft step.", e)
 
     def forward(
         self,
@@ -508,6 +534,9 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | IntermediateTensors:
+        sd = self.specialized_decode
+        if sd is not None and sd.eligible(input_ids, intermediate_tensors):
+            return sd.run(input_ids, positions, hidden_states, inputs_embeds)
         return self.model(
             input_ids,
             positions,
@@ -520,6 +549,8 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
     def compute_logits(
         self, hidden_states: torch.Tensor, spec_step_idx: int = 0
     ) -> torch.Tensor | None:
+        if self.specialized_decode is not None:
+            self.specialized_decode.after_step()
         return self.logits_processor(self.lm_head, hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

@@ -11,6 +11,7 @@ import torch
 from vllm.config import CompilationMode, CUDAGraphMode
 from vllm.models.qwen4_exp.amd.specialized_decode import runtime
 from vllm.models.qwen4_exp.amd.specialized_decode.mono import layout as L
+from vllm.models.qwen4_exp.amd.specialized_decode.runtime import draft
 from vllm.models.qwen4_exp.amd.specialized_decode.runtime.routing import (
     step_reason,
     verify_widths,
@@ -292,3 +293,87 @@ def test_verify_widths(q, widths):
     them, so ``SpecializedDecode.run`` falls back to the stock GDN core."""
     assert verify_widths(q) == widths
     assert 3 * q not in verify_widths(q)
+
+
+# -------------------------------------------------------------- the drafter
+
+
+def _draft_text_config(**over):
+    return _text_config(mtp_num_hidden_layers=1, **over)
+
+
+def _draft_vllm_config(monokernel=True, tokens=3, **parallel):
+    config = _vllm_config(monokernel=monokernel, **parallel)
+    config.speculative_config = _spec_config(tokens=tokens)
+    config.speculative_config.draft_model_config = SimpleNamespace(
+        hf_text_config=_draft_text_config()
+    )
+    return config
+
+
+def test_draft_off_without_monokernel():
+    config = SimpleNamespace(kernel_config=SimpleNamespace(monokernel=False))
+    assert draft.draft_specialized_decode_config(config) is None
+
+
+def test_draft_needs_mtp(supported_platform):
+    config = _vllm_config()
+    config.speculative_config = None
+    assert draft.draft_unsupported(config) == ["needs MTP speculative decoding"]
+    config.speculative_config = _spec_config(method="eagle3")
+    assert draft.draft_unsupported(config) == ["needs MTP speculative decoding"]
+
+
+def test_draft_supported_config(supported_platform):
+    config = _draft_vllm_config()
+    got = draft.draft_specialized_decode_config(config)
+    assert got == draft.DraftConfig()
+    assert got.widths == tuple(range(1, L.MAX_TOKENS + 1))
+
+
+def test_draft_refusals_report_every_reason(supported_platform):
+    config = _draft_vllm_config(tensor_parallel_size=4, tokens=L.MAX_TOKENS)
+    config.lora_config = SimpleNamespace()
+    config.use_v2_model_runner = False
+    with pytest.raises(ValueError) as e:
+        draft.draft_specialized_decode_config(config)
+    msg = str(e.value)
+    for why in (
+        "TP 4 (TP2 only)",
+        "LoRA",
+        "the V1 model runner",
+        f"more than {L.MAX_TOKENS - 1} speculative tokens",
+        "without --monokernel, the stock draft step runs",
+    ):
+        assert why in msg, (why, msg)
+
+
+@pytest.mark.parametrize(
+    "over, why",
+    [
+        (dict(pipeline_parallel_size=2), "pipeline parallelism"),
+        (dict(data_parallel_size=2), "data parallelism"),
+        (dict(enable_eplb=True), "EPLB"),
+    ],
+)
+def test_draft_parallel_refusals(supported_platform, over, why):
+    config = _draft_vllm_config(**over)
+    got = draft.draft_unsupported(config)
+    assert why in got, got
+
+
+def test_draft_shape_mismatch(supported_platform):
+    config = _draft_vllm_config()
+    config.speculative_config.draft_model_config.hf_text_config = _draft_text_config(
+        hidden_size=4096
+    )
+    reasons = draft.draft_unsupported(config)
+    assert any(r.startswith("draft model shapes") for r in reasons), reasons
+
+
+def test_draft_needs_one_mtp_layer(supported_platform):
+    config = _draft_vllm_config()
+    config.speculative_config.draft_model_config.hf_text_config = _text_config(
+        mtp_num_hidden_layers=2
+    )
+    assert "2 MTP layers (needs exactly 1)" in draft.draft_unsupported(config)

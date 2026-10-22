@@ -652,3 +652,166 @@ def _draft_head_worker(
 @multi_gpu_test(num_gpus=2)
 def test_draft_head_matches_reference(monkeypatch: pytest.MonkeyPatch) -> None:
     multi_process_parallel(monkeypatch, 2, 1, _draft_head_worker)
+
+
+@ray.remote(num_gpus=1, max_calls=1)
+def _draft_chain_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    tp_size: int,
+    pp_size: int,
+    rank: int,
+    distributed_init_port: str,
+) -> None:
+    """The drafter's stock-front chain (``runtime.draft.DraftDecode.run``'s
+    launch sequence with the stock front, before the fused front / head are
+    wired in): the attention HC's ``front.hc_front`` -> (a fixed random
+    (core, gate): the real QSA attention is out of scope here, it is
+    unmodified stock code with its own test suite) -> ``blocks.oproj_block``
+    -> the MLP HC's ``front.hc_front`` -> ``blocks.moe_block`` -> the final
+    mixer's ``front.hc_front`` (its down zero-padded from LORA to
+    ``layout.DOWN_ROWS`` rows, as ``DraftDecode.prepare_weights`` builds it),
+    each stage's output checked against the same stock-ops references the
+    individual block tests use (``_mix_ref``, the HC combine math
+    ``_blocks_worker`` checks, ``_moe_emulation`` / ``_check_route``), S in
+    {1, 3, 8}, two ranks -- a port of ``md-int``'s
+    ``test_amd_mono_draft.py::test_draft_step_matches_vllm_ops``."""
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    device = torch.device(f"cuda:{rank}")
+    torch.accelerator.set_device_index(device)
+    init_test_distributed_environment(tp_size, pp_size, rank, distributed_init_port)
+
+    from vllm.models.qwen4_exp.amd.specialized_decode.mono import blocks, front
+    from vllm.models.qwen4_exp.amd.specialized_decode.mono.layout import (
+        DOWN_ROWS,
+        HC,
+        HIDDEN,
+        LORA,
+        MAX_TOKENS,
+        Layout,
+    )
+
+    lay = Layout(TP)
+    tps = _tp_state(rank, tp_size, device)
+    epoch = torch.zeros(1, dtype=torch.int32, device=device)
+
+    gc = torch.Generator(device=device).manual_seed(21)  # replicated weights
+    gr = torch.Generator(device=device).manual_seed(400 + rank)  # TP shards
+    attn_hw = _hc_weights(gc)
+    mlp_hw = _hc_weights(gc)
+    mixer_down = _randn(gc, LORA, HC * HIDDEN, scale=0.01)
+    mixer_padded = torch.zeros(DOWN_ROWS, HC * HIDDEN, dtype=bf, device=device)
+    mixer_padded[:LORA] = mixer_down
+    mixer_hw_unpadded = {
+        "hc_w": _randn(gc, HC * HIDDEN, scale=0.1),
+        "w_down": mixer_down,
+        "w_up": _randn(gc, HC * HIDDEN, LORA, scale=0.05),
+    }
+    mixer_hw = dict(mixer_hw_unpadded, w_down=mixer_padded)
+    w_o = _randn(gr, HIDDEN, lay.CORE, scale=0.02)  # bf16 o_proj: not asm_mxfp4
+    mw = _moe_weights(rank, device)
+    # front.hc_front takes no peers/rank (a single-GPU launch, no all-reduce)
+    fl = {k: v for k, v in tps["launch"].items() if k in ("health", "alarm")}
+
+    for s in (1, 3, 8):
+        epoch.add_(1)
+        state = _randn(gc, s, HC * HIDDEN, scale=2.0)
+
+        # attention HC front (self_msq=True, the step's first front)
+        inj = torch.full((s, HC), float("nan"), dtype=bf, device=device)
+        x = torch.full((s, HIDDEN), float("nan"), dtype=bf, device=device)
+        key1 = front.FrontBuild(tokens=s, tp=TP, self_msq=True)
+        scr1 = torch.zeros(front.scratch_bytes(key1), dtype=torch.uint8, device=device)
+        front.hc_front(
+            key1, state=state, msq_in=None, **attn_hw, inj_out=inj, bin_out=x,
+            scratch=scr1, epoch=epoch, **fl, layer=0,
+        )  # fmt: skip
+        x_ref, inj_ref, _ = _mix_ref(state, attn_hw)
+        assert _cos(x, x_ref) > COS_MIN, ("attn front", s)
+        torch.testing.assert_close(x, x_ref, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(inj, inj_ref, atol=2e-2, rtol=2e-2)
+
+        # a fixed random (core, gate): QSA attention is unmodified stock code
+        core = _randn(gr, s, lay.CORE)
+        gate = _randn(gr, s, lay.CORE, scale=2.0)
+
+        # o_proj block (bf16, gated: the QSA output gate)
+        state2 = torch.empty_like(state)
+        msq = torch.full((blocks.NRED, s, HC), float("nan"), device=device)
+        oproj_key = blocks.OprojBuild(tokens=s, tp=TP, oq=False, og=True)
+        blocks.oproj_block(
+            oproj_key, core=core, gate=gate, w_o=w_o, state=state, inj=inj,
+            out=state2, msq_out=msq, epoch=epoch, **tps["launch"], layer=1,
+        )  # fmt: skip
+        gated = (core.float() * torch.sigmoid(gate.float())).to(bf)
+        attn_out = _all_reduce_fp32(F.linear(gated, w_o))
+        m = 2.0 * torch.sigmoid(inj_ref.float() / HC)
+        want_state2 = (
+            state.float().unflatten(-1, (HC, HIDDEN))
+            + attn_out.float()[:, None] * m[..., None]
+        ).to(bf).flatten(-2)  # fmt: skip
+        assert _cos(state2, want_state2) > COS_MIN, ("oproj", s)
+        torch.testing.assert_close(state2, want_state2, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(msq, _msq(state2), rtol=1e-4, atol=0)
+
+        # MLP HC front (self_msq=False, msq_in from the o_proj block)
+        mlp_x = torch.full((s, HIDDEN), float("nan"), dtype=bf, device=device)
+        mlp_inj = torch.full((s, HC), float("nan"), dtype=bf, device=device)
+        key2 = front.FrontBuild(tokens=s, tp=TP, self_msq=False)
+        scr2 = torch.zeros(front.scratch_bytes(key2), dtype=torch.uint8, device=device)
+        front.hc_front(
+            key2, state=state2, msq_in=msq, **mlp_hw, inj_out=mlp_inj,
+            bin_out=mlp_x, scratch=scr2, epoch=epoch, **fl, layer=2,
+        )  # fmt: skip
+        mlp_x_ref, mlp_inj_ref, _ = _mix_ref(state2, mlp_hw)
+        assert _cos(mlp_x, mlp_x_ref) > COS_MIN, ("mlp front", s)
+        torch.testing.assert_close(mlp_x, mlp_x_ref, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(mlp_inj, mlp_inj_ref, atol=2e-2, rtol=2e-2)
+
+        # MoE block
+        state3 = torch.empty_like(state2)
+        msq2 = torch.full((blocks.NRED, s, HC), float("nan"), device=device)
+        moe_key = blocks.MoeBuild(tokens=s, tp=TP)
+        moe_scr = torch.zeros(
+            blocks.scratch_bytes(blocks.moe_scratch_layout(moe_key)),
+            dtype=torch.uint8,
+            device=device,
+        )
+        blocks.moe_block(
+            moe_key, x=mlp_x, state=state2, inj=mlp_inj, out=state3,
+            msq_out=msq2, scratch=moe_scr, epoch=epoch, **tps["launch"],
+            layer=3, **{k: v for k, v in mw.items() if k != "raw"},
+        )  # fmt: skip
+        ids = _check_route(moe_scr, blocks.moe_scratch_layout(moe_key)["route"],
+                            mlp_x.clone(), mw)  # fmt: skip
+        emu = _moe_emulation(mlp_x.clone(), mw, ids)
+        m2 = 2.0 * torch.sigmoid(mlp_inj_ref.float() / HC)
+        want_state3 = (
+            state2.float().unflatten(-1, (HC, HIDDEN))
+            + emu.float()[:, None] * m2[..., None]
+        ).to(bf).flatten(-2)  # fmt: skip
+        assert _cos(state3, want_state3) > COS_MIN, ("moe", s)
+        torch.testing.assert_close(msq2, _msq(state3), rtol=1e-4, atol=0)
+
+        # the final mixer's front: the padded down must not perturb bin_out
+        h = torch.full((s, HIDDEN), float("nan"), dtype=bf, device=device)
+        mixer_inj = torch.full((s, HC), float("nan"), dtype=bf, device=device)
+        key3 = front.FrontBuild(tokens=s, tp=TP, self_msq=False)
+        scr3 = torch.zeros(front.scratch_bytes(key3), dtype=torch.uint8, device=device)
+        front.hc_front(
+            key3, state=state3, msq_in=msq2, **mixer_hw, inj_out=mixer_inj,
+            bin_out=h, scratch=scr3, epoch=epoch, **fl, layer=4,
+        )  # fmt: skip
+        h_ref, _, _ = _mix_ref(state3, mixer_hw_unpadded)
+        assert _cos(h, h_ref) > COS_MIN, ("mixer front", s)
+        torch.testing.assert_close(h, h_ref, atol=2e-2, rtol=2e-2)
+
+        outs = [torch.empty_like(h) for _ in range(tp_size)]
+        dist.all_gather(outs, h)
+        assert all(torch.equal(outs[0], o) for o in outs), (s, "ranks disagree")
+    assert not tps["launch"]["health"].any() and not tps["flags"].any()
+    tps["buffer"].close()
+
+
+@multi_gpu_test(num_gpus=2)
+def test_draft_chain_matches_stock(monkeypatch: pytest.MonkeyPatch) -> None:
+    multi_process_parallel(monkeypatch, 2, 1, _draft_chain_worker)
