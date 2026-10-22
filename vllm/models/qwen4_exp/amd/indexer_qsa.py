@@ -335,18 +335,62 @@ class QSAIndexer(nn.Module):
         out: torch.Tensor | None,
     ) -> torch.Tensor:
         from .ops.qsa import qsa_select_paged_tokens
+        from .ops.qsa_uniform_indexer import (
+            MAX_UNIFORM_QUERY_LEN,
+            qsa_select_paged_tokens_uniform,
+        )
 
-        return qsa_select_paged_tokens(
-            q,
+        # require_uniform puts requests of exactly decode_query_len rows (or
+        # zero-length padding) first: rows [0, num_decode_tokens) are
+        # request-major.
+        query_len = metadata.decode_query_len
+        num_uniform_rows = metadata.num_decode_tokens
+        if not (1 < query_len <= MAX_UNIFORM_QUERY_LEN and num_uniform_rows > 0):
+            return qsa_select_paged_tokens(
+                q,
+                self.compressed_key_cache.kv_cache,
+                metadata.block_table,
+                metadata.token_to_req,
+                metadata.logical_positions,
+                metadata.seq_lens,
+                self.token_topk,
+                self.compress_ratio,
+                out,
+            )
+        if metadata.num_prefills == 0:
+            # Pure verify batches may carry padding rows past num_decode_tokens.
+            num_uniform_rows = q.shape[0]
+        if out is None:
+            out = torch.empty(
+                (q.shape[0], self.output_width), dtype=torch.int32, device=q.device
+            )
+        uniform_rows = slice(0, num_uniform_rows)
+        qsa_select_paged_tokens_uniform(
+            q[uniform_rows],
             self.compressed_key_cache.kv_cache,
             metadata.block_table,
-            metadata.token_to_req,
-            metadata.logical_positions,
+            metadata.token_to_req[uniform_rows],
+            metadata.logical_positions[uniform_rows],
             metadata.seq_lens,
             self.token_topk,
             self.compress_ratio,
-            out,
+            query_len,
+            out[uniform_rows],
         )
+        if num_uniform_rows < q.shape[0]:
+            tail_rows = slice(num_uniform_rows, q.shape[0])
+            qsa_select_paged_tokens(
+                q[tail_rows],
+                self.compressed_key_cache.kv_cache,
+                metadata.block_table,
+                metadata.token_to_req[tail_rows],
+                metadata.logical_positions[tail_rows],
+                metadata.seq_lens,
+                self.token_topk,
+                self.compress_ratio,
+                out[tail_rows],
+            )
+        return out
 
     def forward(
         self,
