@@ -434,13 +434,10 @@ def gated_rows_to_lds(c, k):
 
 
 @traced
-def oproj_x_to_lds(c, k):
-    """o_proj's input rows (``og``: core x sigmoid(gate), else core directly,
-    the previous launch's plain store) -> LDS, MXFP4-quantized if ``oq``. No
-    weight dependency: split out of ``run_oproj`` so a caller can issue this
-    activation load ahead of the o_proj weight loads (``o_loads``) -- queued
-    behind bulk weight loads, it would otherwise delay a dependent vmcnt wait
-    (WAVESCOPE_FINDINGS.md item 1, "K2")."""
+def run_oproj(c, oops, k):
+    """This CTA's o_proj tasks (rows 16 (bid + 256 j) .., K ``k``) on the core
+    rows (plain loads: the previous launch wrote them), their weights ``oops``
+    already in flight."""
     core = c["args"]["core"]
     if const_expr(c["og"]):
         gated_rows_to_lds(c, k)
@@ -448,23 +445,8 @@ def oproj_x_to_lds(c, k):
         gemv.rows_to_lds(c["tid"], core, k, c["S"], c["xl"], k + gemv.LDS_PAD)
     if const_expr(c["oq"]):
         quant_x(c, k)
-
-
-@traced
-def run_oproj_weighted(c, oops, k):
-    """o_proj's weighted GEMV tasks against the LDS input ``oproj_x_to_lds``
-    already staged, their weights ``oops`` already in flight."""
     for j in range_constexpr(len(oops)):
         stage_o(c, c["bid"] + BLOCKS * j, oops[j], k)
-
-
-@traced
-def run_oproj(c, oops, k):
-    """This CTA's o_proj tasks (rows 16 (bid + 256 j) .., K ``k``) on the core
-    rows (plain loads: the previous launch wrote them), their weights ``oops``
-    already in flight."""
-    oproj_x_to_lds(c, k)
-    run_oproj_weighted(c, oops, k)
 
 
 # ---------------------------------------------------------------- route

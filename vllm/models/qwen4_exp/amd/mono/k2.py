@@ -462,24 +462,19 @@ def build(key: K2Build):
         is_r = (bid >= R0) & (bid < RT0)
         is_g = (bid >= RT0) & (bid < RT0 + s)
         # ---- o_proj, the attention combine, the mlp HC mix, router / sgate:
-        # a CTA's whole sequence in one branch; the core rows (this launch's
-        # activation, ready at entry) are staged to LDS before the o_proj /
-        # hc down weight loads, so their vmcnt wait does not queue behind the
-        # weights (WAVESCOPE_FINDINGS.md item 1, "K2")
+        # a CTA's whole sequence in one branch, its weights in flight first
         if bid < D0:
-            moe.oproj_x_to_lds(c, lay.CORE)
             oops = moe.o_loads(c, bid, lay.CORE)
-            moe.run_oproj_weighted(c, [oops], lay.CORE)
+            moe.run_oproj(c, [oops], lay.CORE)
             if bid < hc.NRED:
                 stage_attn_combine(c, bid)
             uops = hc.up_loads(c, bid)
             hc.load_rrms(c)
             hc.stage_up(c, bid, uops)
         if (bid >= D0) & (bid < OTASKS):
-            moe.oproj_x_to_lds(c, lay.CORE)
             oops = moe.o_loads(c, bid, lay.CORE)
             dops = hc.down_loads(c, bid - D0)
-            moe.run_oproj_weighted(c, [oops], lay.CORE)
+            moe.run_oproj(c, [oops], lay.CORE)
             uops = hc.up_loads(c, bid)
             hc.load_rrms(c)
             hc.stage_down(c, bid - D0, dops)
