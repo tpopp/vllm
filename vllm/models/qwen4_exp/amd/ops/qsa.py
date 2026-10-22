@@ -824,8 +824,14 @@ def qsa_sparse_paged_attention(
     block_table: torch.Tensor,
     token_to_req: torch.Tensor,
     out: torch.Tensor | None = None,
+    profile_rows: int | None = None,
 ) -> torch.Tensor:
-    """Run sparse GQA directly over paged BF16 K/V caches."""
+    """Run sparse GQA directly over paged BF16 K/V caches.
+
+    ``profile_rows`` picks the launch profile as if that many rows were
+    scored. Rows are independent under a fixed profile, so attending a row
+    subset with the full batch's row count reproduces those rows bit-exactly.
+    """
     if not q.is_cuda or not HAS_TRITON:
         raise RuntimeError("paged QSA sparse attention requires a GPU and Triton")
     if q.ndim != 3 or k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
@@ -862,7 +868,8 @@ def qsa_sparse_paged_attention(
 
     group_size = q.shape[1] // k_cache.shape[2]
     block_m = triton.next_power_of_2(group_size)
-    base_programs = q.shape[0] * k_cache.shape[2]
+    rows = q.shape[0] if profile_rows is None else profile_rows
+    base_programs = rows * k_cache.shape[2]
     small_profile_limit = 8 if block_m <= 8 else 4
 
     # Tuned on GB300 for the Qwen-Air TP1, TP2, and TP4 attention shapes.
