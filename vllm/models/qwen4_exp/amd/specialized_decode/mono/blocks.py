@@ -27,7 +27,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import range_constexpr
+from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import Int32, Int64, T
 
 from vllm.models.kimi_k3.amd.specialized_decode.mono.common.debug import region_ids
@@ -69,6 +69,7 @@ from vllm.models.qwen4_exp.amd.specialized_decode.mono.stages.gdn import (
     NVCH,
     VCH,
     gdn_tasks,
+    gdn_tasks_verify,
 )
 from vllm.models.qwen4_exp.amd.specialized_decode.mono.stages.moe import (
     PS_MIN,
@@ -104,6 +105,15 @@ class GdnBuild:
     tp: int = 2
     norm_eps: float = 1e-6
     shuffled: bool = True  # in_proj_qkvz in the ASM FP4 GEMM layout, else Triton's
+    verify: bool = False  # P3: the GDN verify core (MTP), in place of in_proj
+    # + vLLM's GDN core on a decode step's non-spec state indices
+    q: int = 1  # ``verify`` only: rows a request (num_speculative_tokens + 1)
+    vch: int = VCH  # ``verify`` only: a GDN verify task's state-row chunk size
+    # (decode ignores this: its tasks always use ``VCH``). A bigger chunk means
+    # fewer tasks a request (``HD // vch``), so a 2-request verify batch (one
+    # launch's S = 2 q) can still fit one task round on 256 CTAs (vch=32 ->
+    # half the tasks/request of vch=16's) instead of the two rounds vch=16
+    # needs there.
 
 
 @dataclass(frozen=True)
@@ -152,6 +162,8 @@ GDN_ABI = KernelAbi(
         "health",
         "alarm",
         "layer",
+        "spec_idx",
+        "num_accepted",
     )
 )
 OPROJ_ABI = KernelAbi(
@@ -204,11 +216,12 @@ def fp4_scale_shape(rows: int, k: int, shuffled: bool) -> tuple[int, int]:
 
 def gdn_scratch_layout(key: GdnBuild) -> dict:
     s, lay = key.tokens, L.Layout(key.tp)
+    nvch_eff = (HD // key.vch) if key.verify else NVCH
     return pair_layout(
         {
             "proj": s * lay.QKVZ,
             "qk": s * lay.NK * 2 * HD,
-            "onrm": s * lay.NV * NVCH,
+            "onrm": s * lay.NV * nvch_eff,
             "bapart": P.ba_tasks(lay) * s * ROWS,
         }.items()
     )
@@ -296,7 +309,23 @@ def build_gdn(key: GdnBuild):
     need(1 <= s <= MAXT, f"{s} rows, the kernels take 1..{MAXT}")
     lay = L.Layout(key.tp)
     scr = gdn_scratch_layout(key)
-    nr = -(-s * P.gdn_tasks_of(lay) // BLOCKS)
+    n_req = 0
+    if key.verify:
+        need(s % key.q == 0, f"verify needs a multiple of {key.q} rows")
+        need(
+            HD % key.vch == 0 and THREADS % key.vch == 0,
+            f"vch={key.vch} must divide HD={HD} and THREADS={THREADS}",
+        )
+        n_req = s // key.q
+        gt = lay.NV * (HD // key.vch)
+        nr = -(-n_req * gt // BLOCKS)
+        goff = BLOCKS - n_req * gt if n_req * gt < BLOCKS else 0
+    else:
+        nr = -(-s * P.gdn_tasks_of(lay) // BLOCKS)
+        goff = P.gdn_offset(s, key.tp)
+    # verify runs phase-major: one LDS slot a (round, token)
+    nr_lds = nr * key.q if key.verify else nr
+    vch = key.vch if key.verify else VCH
     nba = P.ba_tasks(lay)
     need(P.BA0 + nba <= BLOCKS, "in_proj_ba's CTAs")
     need(lay.QKVZ // ROWS == 2 * BLOCKS, "in_proj_qkvz: two row groups a CTA")
@@ -308,10 +337,10 @@ def build_gdn(key: GdnBuild):
 
     @fx.struct
     class GdnLds:
-        qkl: fx.Array[fx.Float32, nr * 2 * HD, 16]
-        vloc: fx.Array[fx.Float32, nr * VCH, 16]
-        ol: fx.Array[fx.Float32, nr * VCH, 16]
-        scal: fx.Array[fx.Float32, nr * 4, 16]
+        qkl: fx.Array[fx.Float32, nr_lds * 2 * HD, 16]
+        vloc: fx.Array[fx.Float32, nr_lds * vch, 16]
+        ol: fx.Array[fx.Float32, nr_lds * vch, 16]
+        scal: fx.Array[fx.Float32, nr_lds * 4, 16]
 
     @fx.union
     class StageLds:
@@ -323,11 +352,12 @@ def build_gdn(key: GdnBuild):
         red: fx.Array[fx.Float32, WAVES * 64 * 4, 16]
 
     keyed = key_tuple(key, digest())
-
-    @flyc.kernel(
-        name=f"flashnext_split_gdn_s{s}_t{key.tp}_w{int(key.shuffled)}",
-        known_block_size=[THREADS, 1, 1],
+    name = (
+        f"flashnext_split_gdn_s{s}_t{key.tp}_w{int(key.shuffled)}"
+        f"_v{int(key.verify)}_q{key.q}_vc{key.vch}"
     )
+
+    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def kgdn(
         x: Int64,
         w_qkvz: Int64,
@@ -350,6 +380,8 @@ def build_gdn(key: GdnBuild):
         health: Int64,
         alarm: Int64,
         layer: Int32,
+        spec_idx: Int64,
+        num_accepted: Int64,
     ):
         _ = keyed
         tid = fx.thread_idx.x
@@ -366,7 +398,7 @@ def build_gdn(key: GdnBuild):
             "shuffled": key.shuffled,
             "ba_of": P.ba_of,
             "z_gate": sigmoid,
-            "goff": P.gdn_offset(s, key.tp),
+            "goff": goff,
             "tid": tid,
             "bid": bid,
             "lane": tid % 64,
@@ -397,6 +429,8 @@ def build_gdn(key: GdnBuild):
                 "rs_seq": rs_seq,
                 "st_idx": st_idx,
                 "core": core,
+                "spec_idx": spec_idx,
+                "num_accepted": num_accepted,
             },
         }
         for region in ("proj", "qk", "onrm", "bapart"):
@@ -412,7 +446,10 @@ def build_gdn(key: GdnBuild):
         quant_x(c, H)
         for j in range_constexpr(2):
             P.stage_qkvz(c, bid + BLOCKS * j, qops[j])
-        gdn_tasks(c, nr)
+        if const_expr(key.verify):
+            gdn_tasks_verify(c, nr, n_req, key.q, vch)
+        else:
+            gdn_tasks(c, nr)
 
     @flyc.jit
     def launch(
@@ -437,6 +474,8 @@ def build_gdn(key: GdnBuild):
         health: Int64,
         alarm: Int64,
         layer: Int32,
+        spec_idx: Int64,
+        num_accepted: Int64,
         stream: fx.Stream = _STREAM,
     ):
         _ = keyed
@@ -462,6 +501,8 @@ def build_gdn(key: GdnBuild):
             health,
             alarm,
             layer,
+            spec_idx,
+            num_accepted,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     GDN_ABI.check(kgdn, launch)
@@ -482,23 +523,45 @@ def gdn_block(
     dt_bias,
     norm_w,
     rstate,
-    st_idx,
     core,
     scratch,
     epoch,
     health,
     alarm,
     layer,
+    st_idx=None,
+    spec_idx=None,
+    num_accepted=None,
 ):
     """A GDN layer's ``linear_attn`` up to out_proj's input: ``x`` [S, H] bf16
     (the block input) -> ``core`` [S, CORE] bf16. Every weight as vLLM holds
     it after loading (in_proj_qkvz online MXFP4 with e8m0 scales, in the
-    layout of the FP4 GEMM AITER picked: ``key.shuffled``). ``conv_state``
-    [slots, CONV, 3] or a transposed view of [slots, 3, CONV] (strides read);
-    ``rstate`` [slots, NV, 128, 128] fp32, a slot dense, slots strided;
-    ``st_idx`` [>= S] int32, <= 0 a pad row (no state written, a zero core
-    row); ``epoch`` a device int32 bumped once a step, ``layer`` this
-    launch's tag slot."""
+    layout of the FP4 GEMM AITER picked: ``key.shuffled``). ``rstate``
+    [slots, NV, 128, 128] fp32, a slot dense, slots strided; ``epoch`` a
+    device int32 bumped once a step, ``layer`` this launch's tag slot.
+
+    Without ``key.verify``: ``conv_state`` [slots, CONV, 3] or a transposed
+    view of [slots, 3, CONV] (strides read); ``st_idx`` [>= S] int32, <= 0 a
+    pad row (no state written, a zero core row).
+
+    With ``key.verify`` (P3): the HC front + in_proj_qkvz/ba + the GDN verify
+    core (conv rewound by ``num_accepted_tokens``, the delta rule with
+    per-draft-position state writes, the gated norm), replacing the stock
+    AITER conv + gated delta rule call a verify step otherwise makes. Only
+    usable on a *uniform* spec-decode batch: every live request has exactly
+    ``key.q`` tokens, laid out request-major (physical row
+    ``req * key.q + t``, ``key.tokens == n_req * key.q``) -- the caller must
+    check this before calling; this launcher does not re-derive row order.
+    ``spec_idx``: int32 ``[n_req, key.q]``, row-contiguous; column 0 is the
+    request's conv-state slot, column t the recurrent-state slot written
+    after this request's token t. A row whose column-0 slot is ``<= 0`` is a
+    whole padding request: no state read or written, a zero core for all
+    ``key.q`` of its rows. ``num_accepted``: int32 ``[n_req]``, this
+    request's accepted-draft count from the *previous* cycle (picks the conv
+    rewind offset and the checkpoint recurrent-state column, ``accepted -
+    1``). ``conv_state``: bf16 ``[slots, CONV, CONV_W - 1 + key.q - 1]`` --
+    the MTP deployment's wider conv-state allocation, not the plain decode
+    build's narrower one."""
     s = key.tokens
     lay = L.Layout(key.tp)
     bf = torch.bfloat16
@@ -521,9 +584,10 @@ def gdn_block(
         f"in_proj_ba: bf16 [{lay.BA}, {H}]",
     )
     need(conv_w.numel() == lay.CONV * L.CONV_W and conv_w.dtype == bf, "conv1d weight")
+    conv_entries = L.CONV_W - 1 + key.q - 1 if key.verify else P.SL
     need(
-        conv_state.dtype == bf and conv_state.shape[1:] == (lay.CONV, P.SL),
-        f"conv state: bf16 [slots, {lay.CONV}, 3]",
+        conv_state.dtype == bf and conv_state.shape[1:] == (lay.CONV, conv_entries),
+        f"conv state: bf16 [slots, {lay.CONV}, {conv_entries}]",
     )
     need(
         rstate.dtype == torch.float32 and rstate.shape[1:] == (lay.NV, HD, HD),
@@ -532,7 +596,28 @@ def gdn_block(
     need(rstate[0].is_contiguous(), "a recurrent state slot must be dense")
     need(a_log.dtype == torch.float32 and dt_bias.dtype == bf, "A_log / dt_bias dtype")
     need(norm_w.dtype == bf and norm_w.numel() == HD, "gated norm weight")
-    need(st_idx.dtype == torch.int32 and st_idx.numel() >= s, "state indices")
+    if key.verify:
+        n_req = s // key.q
+        need(
+            spec_idx is not None
+            and spec_idx.dtype == torch.int32
+            and spec_idx.shape == (n_req, key.q)
+            and spec_idx.stride(0) == key.q
+            and spec_idx.is_contiguous(),
+            f"spec_idx: int32 [{n_req}, {key.q}], row-contiguous",
+        )
+        need(
+            num_accepted is not None
+            and num_accepted.dtype == torch.int32
+            and num_accepted.numel() >= n_req
+            and num_accepted.is_contiguous(),
+            "num_accepted: int32 [n_req]",
+        )
+    else:
+        need(
+            st_idx is not None and st_idx.dtype == torch.int32 and st_idx.numel() >= s,
+            "state indices",
+        )
     need(
         all(t.is_contiguous() for t in (w_qkvz, w_qkvzs, w_ba, conv_w, core)),
         "a non-contiguous GDN input",
@@ -552,13 +637,15 @@ def gdn_block(
         "norm_w": norm_w.data_ptr(),
         "rstate": rstate.data_ptr(),
         "rs_seq": rstate.stride(0),
-        "st_idx": st_idx.data_ptr(),
+        "st_idx": 0 if key.verify else st_idx.data_ptr(),
         "core": core.data_ptr(),
         "scratch": scratch.data_ptr(),
         "epoch": epoch.data_ptr(),
         "health": health.data_ptr(),
         "alarm": alarm,
         "layer": layer,
+        "spec_idx": spec_idx.data_ptr() if key.verify else 0,
+        "num_accepted": num_accepted.data_ptr() if key.verify else 0,
     }
     build_gdn(key)(*GDN_ABI.pack(vals), stream=torch.cuda.current_stream())
 
