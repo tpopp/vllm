@@ -65,11 +65,13 @@ RUN apt-get update -y \
     && python3 --version
 
 ENV VIRTUAL_ENV=/opt/venv
-RUN python${PYTHON_VERSION} -m venv "${VIRTUAL_ENV}" && \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python${PYTHON_VERSION} -m venv "${VIRTUAL_ENV}" && \
     "${VIRTUAL_ENV}/bin/python" -m pip install --upgrade pip setuptools PyYAML
 ENV PATH=${VIRTUAL_ENV}/bin:$PATH
 
-RUN pip install -U packaging 'cmake<4' ninja wheel 'setuptools<80' pybind11 Cython
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -U packaging 'cmake<4' ninja wheel 'setuptools<80' pybind11 Cython
 RUN apt-get update && apt-get install -y libjpeg-dev libsox-dev libsox-fmt-all sox && rm -rf /var/lib/apt/lists/*
 
 # Install sccache if USE_SCCACHE is enabled (for release builds)
@@ -117,7 +119,8 @@ ENV PYTHONPATH=${SITE_PACKAGES}/_rocm_sdk_core/share/amd_smi
 # (same +rocm... suffix) or the C++ ops break at import (ABI skew). The rocm
 # sdk version is derived from torch's own dependency pin unless overridden,
 # which keeps the set consistent and avoids pip backtracking.
-RUN pip install --pre --index-url "${ROCM_WHEEL_INDEX}" \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --pre --index-url "${ROCM_WHEEL_INDEX}" \
     --extra-index-url https://pypi.org/simple \
     "torch[device-gfx1250]==${TORCH_VERSION}" \
     "torchvision==${TORCHVISION_VERSION}" \
@@ -127,7 +130,8 @@ RUN pip install --pre --index-url "${ROCM_WHEEL_INDEX}" \
  
 # Torch runtime deps that may not be published on the ROCm wheel index;
 # install them from PyPI afterwards.
-RUN pip install filelock "typing-extensions>=4.10.0" "sympy>=1.13.3" \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install filelock "typing-extensions>=4.10.0" "sympy>=1.13.3" \
     "networkx>=2.5.1" jinja2 "fsspec>=0.8.5"
 
 
@@ -248,10 +252,12 @@ ARG USE_SCCACHE
 RUN git clone ${AITER_REPO} \
     && cd aiter \
     && git checkout --detach ${AITER_BRANCH}
-RUN cd aiter \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd aiter \
     && git submodule update --init --recursive \
     && pip install -r requirements.txt
-RUN pip install pyyaml && cd aiter \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install pyyaml && cd aiter \
     && if [ "$USE_SCCACHE" = "1" ]; then \
     export HIP_CLANG_PATH=/opt/sccache-wrappers \
     && sccache --show-stats; \
@@ -287,7 +293,7 @@ RUN --mount=type=bind,from=build_mori,src=/app/install/,target=/install \
 
 FROM base AS final
 RUN --mount=type=bind,from=debs,src=/app/debs,target=/install \
-    pip install /install/*.whl
+    pip install --no-cache-dir /install/*.whl
 
 ARG BASE_IMAGE
 ARG ROCM_WHEEL_INDEX

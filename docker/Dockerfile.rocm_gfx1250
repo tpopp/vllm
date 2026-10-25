@@ -382,7 +382,8 @@ FROM base AS mori_base
 ARG NIC_BACKEND
 ARG AINIC_VERSION
 ARG UBUNTU_CODENAME
-RUN /bin/bash -lc 'set -euo pipefail; \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    /bin/bash -lc 'set -euo pipefail; \
  \
  install_ainic() { \
    apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg apt-transport-https; \
@@ -658,7 +659,8 @@ RUN mkdir src && mv vllm src/vllm
 FROM mori_base AS final
 ENV UV_COMPILE_BYTECODE=1
 
-RUN python3 -m pip install --upgrade pip && rm -rf /var/lib/apt/lists/*
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install --upgrade pip && rm -rf /var/lib/apt/lists/*
 
 # Clean up sccache from release image (not needed at runtime)
 # This removes the binary and wrappers that may have been installed during build
@@ -731,7 +733,8 @@ RUN curl -k -O https://raw.githubusercontent.com/ROCm/vllm/refs/heads/gfx1250_be
 
 
 ### Install triton from upstream for AITER Deps TODO: (JPVILLAM) If possible to get this on whls it would be better
-RUN pip3 uninstall -y triton && \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip3 uninstall -y triton && \
     git clone https://github.com/triton-lang/triton.git && \
     cd triton && \
     git checkout aedd1f6 && \
